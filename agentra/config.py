@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,7 +16,7 @@ class AgentConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENTRA_", env_file=".env", extra="ignore")
 
     # ── LLM provider ──────────────────────────────────────────────────────────
-    llm_provider: Literal["openai", "anthropic", "ollama"] = Field(
+    llm_provider: Literal["openai", "anthropic", "ollama", "gemini"] = Field(
         default="openai",
         description="Which LLM back-end to use.",
     )
@@ -33,6 +33,10 @@ class AgentConfig(BaseSettings):
     openai_api_key: Optional[str] = Field(default=None)
     anthropic_api_key: Optional[str] = Field(default=None)
     ollama_base_url: str = Field(default="http://localhost:11434")
+    gemini_api_key: Optional[str] = Field(default=None)
+    gemini_base_url: str = Field(
+        default="https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
 
     # ── Agent behaviour ────────────────────────────────────────────────────────
     max_iterations: int = Field(default=50, ge=1, le=500)
@@ -67,6 +71,12 @@ class AgentConfig(BaseSettings):
     @classmethod
     def _expand_path(cls, v: object) -> Path:
         return Path(str(v)).expanduser().resolve()
+
+    @model_validator(mode="after")
+    def _apply_provider_defaults(self) -> "AgentConfig":
+        if self.llm_provider == "gemini" and self.llm_model == "gpt-4o":
+            self.llm_model = "gemini-3-flash-preview"
+        return self
 
     @property
     def vision_model(self) -> str:
