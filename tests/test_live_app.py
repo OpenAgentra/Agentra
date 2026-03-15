@@ -11,6 +11,8 @@ import pytest
 
 from agentra.config import AgentConfig
 from agentra.live_app import create_live_app
+from agentra.runtime import ApprovalRequest, UserInputRequest
+from agentra.tools.base import ToolResult
 
 PNG_1X1_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
@@ -23,6 +25,7 @@ class FakeAgent:
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
         self.interrupted = False
+        self.paused = False
 
     async def run(self, goal: str):
         async def generator():
@@ -72,9 +75,11 @@ class FakeAgent:
                 "success": True,
                 "summary": "Page loaded",
             }
-            for _ in range(20):
+            for _ in range(100):
                 if self.interrupted:
                     break
+                while self.paused and not self.interrupted:
+                    await asyncio.sleep(0.01)
                 await asyncio.sleep(0.01)
             done_text = "DONE: interrupted" if self.interrupted else "DONE: complete"
             yield {"type": "done", "content": done_text}
@@ -83,6 +88,26 @@ class FakeAgent:
 
     def interrupt(self) -> None:
         self.interrupted = True
+
+    def pause(self) -> None:
+        self.paused = True
+
+    def resume(self) -> None:
+        self.paused = False
+
+    async def perform_human_action(self, tool_name: str, args: dict) -> ToolResult:
+        action = str(args.get("action", "manual"))
+        return ToolResult(
+            success=True,
+            output=f"{tool_name} {action} OK",
+            screenshot_b64=PNG_1X1_B64,
+            metadata={
+                "frame_label": f"{tool_name} · {action}",
+                "summary": "Kullanıcı browser aracını kullandı.",
+                "focus_x": 0.42,
+                "focus_y": 0.34,
+            },
+        )
 
 
 def _make_app(tmp_path: Path, created_agents: list[FakeAgent]):
@@ -136,8 +161,16 @@ async def test_live_app_root_renders_operator_console(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert "Otonom Ajan - Görev Paneli" in response.text
+    assert "Yeni Run" in response.text
+    assert "Threadler" in response.text
+    assert "Seçili Thread" in response.text
+    assert "Bekleyen Onaylar" in response.text
+    assert "Bekleyen Sorular" in response.text
+    assert "Manuel Browser Kontrolleri" in response.text
+    assert "Yeni thread'de başlat" in response.text
+    assert "Seçili thread'e ekle" in response.text
     assert "Yeni bir komut veya görev girin" in response.text
-    assert "Agentra Canlı Kumanda" in response.text
+    assert "Agentra Canlı Kumanda" not in response.text
     assert "Sağlayıcı" not in response.text
     assert "Model" not in response.text
 
@@ -223,3 +256,80 @@ async def test_live_app_exposes_thread_endpoints_and_parallel_runs(tmp_path: Pat
         thread_response = await client.get(f"/threads/{first_payload['thread_id']}")
         assert thread_response.status_code == 200
         assert thread_response.json()["thread_id"] == first_payload["thread_id"]
+        assert thread_response.json()["current_run_id"] == first_payload["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_live_app_supports_pause_approval_question_and_manual_action(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    manager = app.state.manager
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Pause and test controls"})
+        assert create_response.status_code == 200
+
+        payload = create_response.json()
+        thread_id = payload["thread_id"]
+
+        await _wait_for_agent_creation(created_agents)
+        thread = manager.get_thread(thread_id)
+
+        thread.approval_requests["approval-001"] = ApprovalRequest(
+            request_id="approval-001",
+            tool="browser",
+            args={"action": "click", "selector": "button.submit"},
+            reason="Publish benzeri bir işlem tespit edildi.",
+            summary="Gönder düğmesine basmadan önce onay gerekiyor.",
+        )
+        thread.question_requests["question-001"] = UserInputRequest(
+            request_id="question-001",
+            prompt="Hangi dosya adı kullanılsın?",
+            summary="Devam etmeden önce bir dosya adı gerekli.",
+        )
+        thread.status = "blocked_waiting_user"
+
+        approval_response = await client.post(
+            f"/threads/{thread_id}/approvals/approval-001",
+            json={"approved": True, "note": "Devam et"},
+        )
+        assert approval_response.status_code == 200
+        approval_payload = approval_response.json()
+        assert any(
+            item["request_id"] == "approval-001" and item["status"] == "approved"
+            for item in approval_payload["approval_requests"]
+        )
+
+        thread.status = "blocked_waiting_user"
+        question_response = await client.post(
+            f"/threads/{thread_id}/questions/question-001",
+            json={"answer": "report.md"},
+        )
+        assert question_response.status_code == 200
+        question_payload = question_response.json()
+        assert any(
+            item["request_id"] == "question-001" and item["status"] == "answered"
+            for item in question_payload["question_requests"]
+        )
+
+        pause_response = await client.post(f"/threads/{thread_id}/pause")
+        assert pause_response.status_code == 200
+        assert pause_response.json()["status"] == "paused_for_user"
+        assert created_agents[-1].paused is True
+
+        action_response = await client.post(
+            f"/threads/{thread_id}/actions",
+            json={"tool": "browser", "args": {"action": "back"}},
+        )
+        assert action_response.status_code == 200
+        action_payload = action_response.json()
+        event_types = [event["type"] for event in action_payload["active_run"]["events"]]
+        assert "human_action" in event_types
+        assert "tool_result" in event_types
+
+        resume_response = await client.post(f"/threads/{thread_id}/resume")
+        assert resume_response.status_code == 200
+        assert created_agents[-1].paused is False
+
+        await _wait_for_completion(client, payload["run_id"])
