@@ -9,6 +9,8 @@ from typing import Literal, Optional
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agentra.llm.registry import get_provider_spec, provider_ids
+
 
 class AgentConfig(BaseSettings):
     """Runtime configuration resolved from environment variables and/or explicit kwargs."""
@@ -16,7 +18,7 @@ class AgentConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENTRA_", env_file=".env", extra="ignore")
 
     # ── LLM provider ──────────────────────────────────────────────────────────
-    llm_provider: Literal["openai", "anthropic", "ollama", "gemini"] = Field(
+    llm_provider: str = Field(
         default="openai",
         description="Which LLM back-end to use.",
     )
@@ -28,6 +30,22 @@ class AgentConfig(BaseSettings):
         default=None,
         description="Separate vision model (defaults to llm_model when None).",
     )
+    executor_model: Optional[str] = Field(
+        default=None,
+        description="Model used for interactive tool execution loops.",
+    )
+    planner_model: Optional[str] = Field(
+        default=None,
+        description="Model used for planning and orchestration.",
+    )
+    summary_model: Optional[str] = Field(
+        default=None,
+        description="Model used for summarization/final answer generation.",
+    )
+    embedding_model: Optional[str] = Field(
+        default=None,
+        description="Model used for embeddings when the provider supports it.",
+    )
 
     # ── Provider credentials ───────────────────────────────────────────────────
     openai_api_key: Optional[str] = Field(default=None)
@@ -35,7 +53,7 @@ class AgentConfig(BaseSettings):
     ollama_base_url: str = Field(default="http://localhost:11434")
     gemini_api_key: Optional[str] = Field(default=None)
     gemini_base_url: str = Field(
-        default="https://generativelanguage.googleapis.com/v1beta/openai/"
+        default="https://generativelanguage.googleapis.com"
     )
 
     # ── Agent behaviour ────────────────────────────────────────────────────────
@@ -67,6 +85,14 @@ class AgentConfig(BaseSettings):
     allow_filesystem_write: bool = Field(default=True)
     allow_computer_control: bool = Field(default=True)
 
+    @field_validator("llm_provider")
+    @classmethod
+    def _validate_provider(cls, value: str) -> str:
+        if value not in provider_ids():
+            known = ", ".join(provider_ids())
+            raise ValueError(f"Unknown llm_provider: {value!r}. Expected one of: {known}")
+        return value
+
     @field_validator("workspace_dir", "memory_dir", mode="before")
     @classmethod
     def _expand_path(cls, v: object) -> Path:
@@ -74,10 +100,16 @@ class AgentConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _apply_provider_defaults(self) -> "AgentConfig":
-        if self.llm_provider == "gemini" and self.llm_model == "gpt-4o":
-            self.llm_model = "gemini-3-flash-preview"
+        provider_default = get_provider_spec(self.llm_provider).default_model
+        openai_default = get_provider_spec("openai").default_model
+        if not self.llm_model or (self.llm_provider != "openai" and self.llm_model == openai_default):
+            self.llm_model = provider_default
         return self
 
     @property
     def vision_model(self) -> str:
         return self.llm_vision_model or self.llm_model
+
+    @property
+    def threads_dir(self) -> Path:
+        return self.workspace_dir / ".threads"

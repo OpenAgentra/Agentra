@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from agentra.memory.providers import CallableEmbeddingProvider, EmbeddingProvider
+
 
 @dataclass
 class MemoryEntry:
@@ -47,6 +49,7 @@ class EmbeddingMemory:
     def __init__(
         self,
         memory_dir: Path,
+        embed_provider: Optional[EmbeddingProvider] = None,
         embed_fn: Optional[Any] = None,
         screenshot_history: int = 10,
     ) -> None:
@@ -55,7 +58,9 @@ class EmbeddingMemory:
         self._screenshots_dir = self._dir / "screenshots"
         self._screenshots_dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / "index.json"
-        self._embed_fn = embed_fn  # async callable: str -> list[float]
+        self._embed_provider = embed_provider
+        if self._embed_provider is None and embed_fn is not None:
+            self._embed_provider = CallableEmbeddingProvider(embed_fn)
         self._screenshot_history = screenshot_history
         self._entries: list[MemoryEntry] = []
         self._load()
@@ -149,10 +154,10 @@ class EmbeddingMemory:
         return path
 
     async def _embed(self, text: str) -> list[float]:
-        if self._embed_fn is None:
+        if self._embed_provider is None:
             return self._trivial_embed(text)
         try:
-            return await self._embed_fn(text)
+            return await self._embed_provider.embed(text)
         except Exception:  # noqa: BLE001
             return self._trivial_embed(text)
 

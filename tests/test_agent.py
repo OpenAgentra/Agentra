@@ -45,6 +45,18 @@ class EchoTool(BaseTool):
         return ToolResult(success=True, output=kwargs.get("text", ""))
 
 
+class PreviewTool(EchoTool):
+    """Echo tool with preview metadata for visual-intent tests."""
+
+    async def preview(self, **kwargs: Any) -> dict[str, Any] | None:
+        return {
+            "frame_label": "echo · preview",
+            "summary": "Preparing the echo action",
+            "focus_x": 0.4,
+            "focus_y": 0.5,
+        }
+
+
 @pytest.fixture
 def tmp_workspace(tmp_path):
     return tmp_path / "workspace"
@@ -83,6 +95,27 @@ async def test_agent_done_on_first_response(config, tmp_workspace):
 
 
 @pytest.mark.asyncio
+async def test_agent_done_when_done_marker_is_last_line(config, tmp_workspace):
+    """Agent should stop even when the model appends DONE after a richer summary."""
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="I opened the page and captured the screenshot.\n\nDONE: Task complete."
+            )
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[EchoTool()])
+
+    events = []
+    gen = await agent.run("Say hello")
+    async for event in gen:
+        events.append(event)
+
+    done_event = next(e for e in events if e["type"] == "done")
+    assert done_event["content"] == "DONE: Task complete."
+
+
+@pytest.mark.asyncio
 async def test_agent_calls_tool_then_finishes(config, tmp_workspace):
     """Agent should call a tool, get the result, then finish."""
     llm = FakeLLM(
@@ -117,6 +150,28 @@ async def test_agent_calls_tool_then_finishes(config, tmp_workspace):
     tool_result = next(e for e in events if e["type"] == "tool_result")
     assert tool_result["success"] is True
     assert tool_result["result"] == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_async_tools_on_exit(config, tmp_workspace):
+    """Async tool cleanup should run after the agent finishes."""
+
+    class ClosableTool(EchoTool):
+        def __init__(self) -> None:
+            self.stopped = False
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    tool = ClosableTool()
+    llm = FakeLLM([LLMResponse(content="DONE: Task complete.", finish_reason="stop")])
+    agent = AutonomousAgent(config=config, llm=llm, tools=[tool])
+
+    gen = await agent.run("Say hello")
+    async for _event in gen:
+        pass
+
+    assert tool.stopped is True
 
 
 @pytest.mark.asyncio
@@ -211,3 +266,35 @@ async def test_agent_handles_unknown_tool(config, tmp_workspace):
     errors = [e for e in events if e["type"] == "tool_result" and not e["success"]]
     assert len(errors) == 1
     assert "nonexistent" in errors[0]["result"]
+
+
+@pytest.mark.asyncio
+async def test_agent_emits_phase_and_visual_intent_for_previewable_tools(config, tmp_workspace):
+    """Preview-capable tools should emit waiting phases and visual intent metadata."""
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "1", "name": "echo", "arguments": {"text": "hello"}}],
+            ),
+            LLMResponse(content="DONE: Preview complete.", finish_reason="stop"),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[PreviewTool()])
+
+    events = []
+    gen = await agent.run("Echo hello")
+    async for event in gen:
+        events.append(event)
+
+    types = [event["type"] for event in events]
+    assert "phase" in types
+    assert "visual_intent" in types
+
+    first_phase = next(event for event in events if event["type"] == "phase")
+    assert first_phase["phase"] == "thinking"
+
+    visual_intent = next(event for event in events if event["type"] == "visual_intent")
+    assert visual_intent["summary"] == "Preparing the echo action"
+    assert visual_intent["focus_x"] == pytest.approx(0.4)
+    assert visual_intent["focus_y"] == pytest.approx(0.5)

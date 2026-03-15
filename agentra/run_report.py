@@ -1,96 +1,97 @@
-"""Generate a lightweight HTML timeline for agent runs."""
+"""Generate and persist HTML reports for agent runs."""
 
 from __future__ import annotations
 
-import base64
 import html
 import json
 import os
 import re
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from agentra.run_store import RunStore
+
 
 class RunReport:
-    """Persist run events as JSON plus a presentable HTML report."""
+    """Persist run events plus a presentable HTML report."""
 
-    def __init__(self, workspace_dir: Path, goal: str, provider: str, model: str) -> None:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        slug = _slugify(goal) or "run"
-        self.run_dir = (workspace_dir / ".runs" / f"{timestamp}-{slug[:48]}").resolve()
-        self.assets_dir = self.run_dir / "assets"
-        self.events_path = self.run_dir / "events.json"
-        self.html_path = self.run_dir / "index.html"
+    def __init__(
+        self,
+        workspace_dir: Path,
+        goal: str,
+        provider: str,
+        model: str,
+        *,
+        thread_id: str | None = None,
+        thread_title: str | None = None,
+    ) -> None:
+        self.store = RunStore(
+            workspace_dir,
+            goal,
+            provider,
+            model,
+            thread_id=thread_id,
+            thread_title=thread_title,
+        )
+        self.run_dir = self.store.run_dir
+        self.assets_dir = self.store.assets_dir
+        self.events_path = self.store.events_path
+        self.html_path = self.store.html_path
         self.goal = goal
         self.provider = provider
         self.model = model
-        self.started_at = datetime.now().isoformat(timespec="seconds")
-        self.finished_at: str | None = None
-        self.status = "running"
-        self._events: list[dict[str, Any]] = []
-        self._screenshot_index = 0
+        self._write_html()
 
-        self.assets_dir.mkdir(parents=True, exist_ok=True)
-        self._write()
+    @property
+    def events(self) -> list[dict[str, Any]]:
+        return self.store.events
+
+    @property
+    def frames(self) -> list[dict[str, Any]]:
+        return self.store.frames
+
+    def snapshot(self) -> dict[str, Any]:
+        return self.store.snapshot()
 
     def record(self, event: dict[str, Any]) -> dict[str, Any]:
-        """Append an event and refresh the HTML report."""
-        stored = dict(event)
-        stored["timestamp"] = datetime.now().isoformat(timespec="seconds")
-        if stored.get("type") == "screenshot" and stored.get("data"):
-            stored["image_path"] = self._save_screenshot(stored["data"])
-            stored.pop("data", None)
-        self._events.append(stored)
-        self._write()
+        stored = self.store.record(event)
+        self._write_html()
         return stored
 
     def finalize(self, status: str) -> None:
-        """Mark the run complete and write the final report."""
-        self.status = status
-        self.finished_at = datetime.now().isoformat(timespec="seconds")
-        self._write()
+        self.store.finalize(status)
+        self._write_html()
 
     def open(self) -> None:
-        """Open the HTML report in the default browser."""
+        """Open the report in the default browser."""
         if os.name == "nt":
             os.startfile(self.html_path)  # type: ignore[attr-defined]
             return
         if os.name == "posix":
-            opener = "open" if sys_platform() == "darwin" else "xdg-open"
+            opener = "open" if _sys_platform() == "darwin" else "xdg-open"
             subprocess.Popen([opener, str(self.html_path)])
 
-    @property
-    def events(self) -> list[dict[str, Any]]:
-        return list(self._events)
+    def _write_html(self) -> None:
+        self.html_path.write_text(self._render_html(self.snapshot()), encoding="utf-8")
 
-    def _save_screenshot(self, b64: str) -> str:
-        self._screenshot_index += 1
-        filename = f"screenshot-{self._screenshot_index:03d}.png"
-        path = self.assets_dir / filename
-        path.write_bytes(base64.b64decode(b64))
-        return f"assets/{filename}"
-
-    def _write(self) -> None:
-        payload = {
-            "goal": self.goal,
-            "provider": self.provider,
-            "model": self.model,
-            "status": self.status,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "events": self._events,
-        }
-        self.events_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        self.html_path.write_text(self._render_html(), encoding="utf-8")
-
-    def _render_html(self) -> str:
-        refresh = '<meta http-equiv="refresh" content="2" />' if self.status == "running" else ""
-        event_cards = "\n".join(self._render_event(event) for event in self._events) or (
+    def _render_html(self, snapshot: dict[str, Any]) -> str:
+        status = str(snapshot.get("status", "running"))
+        events = snapshot.get("events", [])
+        frames = snapshot.get("frames", [])
+        refresh = '<meta http-equiv="refresh" content="2" />' if status == "running" else ""
+        event_cards = "\n".join(self._render_event(event) for event in events) or (
             '<section class="card empty"><h2>Waiting for events</h2>'
             "<p>The report will update as the agent produces output.</p></section>"
         )
+        latest_frame = frames[-1] if frames else None
+        hero_media = (
+            f'<div class="hero-shot"><img src="{html.escape(str(latest_frame["image_path"]))}" alt="Latest run screenshot" /></div>'
+            if latest_frame
+            else ""
+        )
+        frame_strip = self._render_frame_strip(frames)
+
         return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -100,11 +101,11 @@ class RunReport:
   <title>Agentra Run Report</title>
   <style>
     :root {{
-      --bg: #0b1220;
-      --panel: rgba(12, 22, 42, 0.88);
-      --panel-2: rgba(18, 31, 58, 0.92);
+      --bg: #09111e;
+      --panel: rgba(12, 22, 42, 0.9);
+      --panel-2: rgba(18, 31, 58, 0.94);
       --line: rgba(148, 163, 184, 0.18);
-      --text: #e5eefb;
+      --text: #edf3ff;
       --muted: #9eb2cf;
       --blue: #68b3ff;
       --cyan: #65e0ff;
@@ -118,14 +119,14 @@ class RunReport:
       margin: 0;
       min-height: 100vh;
       color: var(--text);
-      font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+      font-family: "Trebuchet MS", "Aptos", "Segoe UI Variable", sans-serif;
       background:
         radial-gradient(circle at top left, rgba(104, 179, 255, 0.28), transparent 28%),
         radial-gradient(circle at top right, rgba(101, 240, 181, 0.18), transparent 24%),
         linear-gradient(160deg, #08111f 0%, #0b1220 46%, #12203a 100%);
     }}
     .shell {{
-      max-width: 1220px;
+      max-width: 1280px;
       margin: 32px auto;
       padding: 0 20px 32px;
     }}
@@ -149,6 +150,17 @@ class RunReport:
         linear-gradient(180deg, rgba(255,255,255,0.94), rgba(238,243,251,0.92) 10%, rgba(18,31,58,0.96) 10%, rgba(18,31,58,0.96) 100%);
       position: relative;
       overflow: hidden;
+    }}
+    .hero-shot {{
+      margin: 0 0 18px;
+      border-radius: 18px;
+      overflow: hidden;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      background: rgba(255, 255, 255, 0.05);
+    }}
+    .hero-shot img {{
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
     }}
     .window-bar {{
       color: #4f5d73;
@@ -218,6 +230,43 @@ class RunReport:
       color: var(--text);
       font-size: 15px;
       margin-top: 4px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }}
+    .frame-strip {{
+      display: grid;
+      gap: 12px;
+      grid-auto-flow: column;
+      grid-auto-columns: minmax(190px, 220px);
+      overflow-x: auto;
+      padding-bottom: 6px;
+    }}
+    .frame-thumb {{
+      background: rgba(8, 17, 31, 0.58);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 16px;
+      padding: 10px;
+    }}
+    .frame-thumb img {{
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      margin-bottom: 10px;
+    }}
+    .frame-thumb strong {{
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+      color: var(--text);
+    }}
+    .frame-thumb span {{
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }}
+    .frame-thumb p {{
+      font-size: 13px;
+      color: var(--text);
     }}
     .timeline {{
       display: grid;
@@ -301,28 +350,31 @@ class RunReport:
       <div class="frame">
         <div class="frame-inner">
           <div class="window-bar">Agentra Live Run</div>
-          <div class="goal">{html.escape(self.goal)}</div>
-          <div class="live">{self._live_badge()}</div>
+          {hero_media}
+          <div class="goal">{html.escape(str(snapshot["goal"]))}</div>
+          <div class="live">{status.upper() if status != "running" else "LIVE"}</div>
         </div>
       </div>
       <aside class="meta">
         <section class="card">
-          <div class="status {self.status}">{self.status.upper()}</div>
+          <div class="status {status}">{status.upper()}</div>
           <div class="meta-grid" style="margin-top: 14px;">
-            <div>Provider<strong>{html.escape(self.provider)}</strong></div>
-            <div>Model<strong>{html.escape(self.model)}</strong></div>
-            <div>Started<strong>{html.escape(self.started_at)}</strong></div>
-            <div>Finished<strong>{html.escape(self.finished_at or "Live")}</strong></div>
-            <div>Events<strong>{len(self._events)}</strong></div>
-            <div>Report<strong>{html.escape(str(self.html_path))}</strong></div>
+            <div>Provider<strong>{html.escape(str(snapshot["provider"]))}</strong></div>
+            <div>Model<strong>{html.escape(str(snapshot["model"]))}</strong></div>
+            <div>Started<strong>{html.escape(str(snapshot["started_at"]))}</strong></div>
+            <div>Finished<strong>{html.escape(str(snapshot.get("finished_at") or "Live"))}</strong></div>
+            <div>Events<strong>{len(events)}</strong></div>
+            <div>Frames<strong>{len(frames)}</strong></div>
+            <div>Report<strong>{html.escape(str(snapshot["report_path"]))}</strong></div>
           </div>
         </section>
         <section class="card">
           <h2>Demo Notes</h2>
-          <p class="muted">This standalone report is refreshed as the agent runs and keeps screenshots, tool calls, and model output in one shareable place.</p>
+          <p class="muted">This standalone report is refreshed as the agent runs and keeps screenshots, timeline frames, tool calls, and model output in one shareable place.</p>
         </section>
       </aside>
     </section>
+    {frame_strip}
     <section class="timeline">
       {event_cards}
     </section>
@@ -331,12 +383,46 @@ class RunReport:
 </html>
 """
 
+    def _render_frame_strip(self, frames: list[dict[str, Any]]) -> str:
+        if not frames:
+            return ""
+        cards = "\n".join(
+            (
+                '<article class="frame-thumb">'
+                f'<img src="{html.escape(str(frame["image_path"]))}" alt="{html.escape(str(frame["label"]))}" />'
+                f'<strong>{html.escape(str(frame["label"]))}</strong>'
+                f'<span>{html.escape(str(frame["timestamp"]))}</span>'
+                f'<p>{html.escape(str(frame.get("summary", "")))}</p>'
+                "</article>"
+            )
+            for frame in frames
+        )
+        return (
+            '<section class="card"><h2>Frame Timeline</h2>'
+            f'<div class="frame-strip">{cards}</div></section>'
+        )
+
     def _render_event(self, event: dict[str, Any]) -> str:
         event_type = str(event.get("type", "event"))
         timestamp = html.escape(str(event.get("timestamp", "")))
         title = event_type.replace("_", " ").title()
+        if event_type == "phase":
+            return self._event_shell(
+                event_type,
+                html.escape(str(event.get("phase", "Phase")).title()),
+                timestamp,
+                self._content_block(event.get("summary") or event.get("content", "")),
+            )
         if event_type == "thought":
-            return self._event_shell(event_type, title, timestamp, self._content_block(event.get("content", "")))
+            return self._event_shell(
+                event_type,
+                title,
+                timestamp,
+                self._content_block(event.get("content", "")),
+            )
+        if event_type == "visual_intent":
+            body = self._content_block(event.get("summary", "Pending visual action."))
+            return self._event_shell(event_type, "Visual Intent", timestamp, body)
         if event_type == "tool_call":
             tool = html.escape(str(event.get("tool", "tool")))
             args = html.escape(json.dumps(event.get("args", {}), indent=2))
@@ -346,24 +432,39 @@ class RunReport:
             success = "success" if event.get("success") else "error"
             tool = html.escape(str(event.get("tool", "tool")))
             result = self._content_block(event.get("result", ""))
-            return self._event_shell(f"{event_type} {success}", f"Tool Result: {tool}", timestamp, result)
+            return self._event_shell(
+                f"{event_type} {success}",
+                f"Tool Result: {tool}",
+                timestamp,
+                result,
+            )
         if event_type == "screenshot":
             image_path = html.escape(str(event.get("image_path", "")))
+            frame_label = html.escape(str(event.get("frame_label", "Screenshot")))
             body = (
-                f'<h3>Screenshot #{self._find_screenshot_number(image_path)}</h3>'
+                f"<h3>{frame_label}</h3>"
                 f'<img src="{image_path}" alt="Agent screenshot" />'
             )
             return self._event_shell(event_type, "Screenshot", timestamp, body)
         if event_type == "done":
-            return self._event_shell(event_type, "Done", timestamp, self._content_block(event.get("content", "")))
+            return self._event_shell(
+                event_type, "Done", timestamp, self._content_block(event.get("content", ""))
+            )
         if event_type == "error":
-            return self._event_shell(event_type, "Error", timestamp, self._content_block(event.get("content", "")))
+            return self._event_shell(
+                event_type, "Error", timestamp, self._content_block(event.get("content", ""))
+            )
         if event_type == "sub_task":
             success = "success" if event.get("success") else "error"
             label = html.escape(str(event.get("label", "Sub-task")))
             result = self._content_block(event.get("result", ""))
             return self._event_shell(f"{event_type} {success}", label, timestamp, result)
-        return self._event_shell(event_type, title, timestamp, self._content_block(json.dumps(event, indent=2)))
+        return self._event_shell(
+            event_type,
+            title,
+            timestamp,
+            self._content_block(json.dumps(event, indent=2)),
+        )
 
     def _event_shell(self, kind: str, title: str, timestamp: str, body: str) -> str:
         return (
@@ -379,18 +480,6 @@ class RunReport:
             return f"<pre>{text}</pre>"
         return f"<p>{text}</p>"
 
-    @staticmethod
-    def _find_screenshot_number(image_path: str) -> str:
-        match = re.search(r"(\d+)\.png$", image_path)
-        return match.group(1) if match else "?"
 
-    def _live_badge(self) -> str:
-        return "LIVE" if self.status == "running" else self.status.upper()
-
-
-def _slugify(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-
-
-def sys_platform() -> str:
+def _sys_platform() -> str:
     return os.uname().sysname.lower() if hasattr(os, "uname") else ""

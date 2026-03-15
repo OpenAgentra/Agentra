@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
@@ -179,7 +180,9 @@ async def test_terminal_empty_command(term_tool):
 @pytest.mark.asyncio
 async def test_terminal_timeout(tmp_path):
     tool = TerminalTool(cwd=tmp_path, allow=True, timeout=1)
-    result = await tool.execute(command="sleep 10")
+    result = await tool.execute(
+        command=f'"{sys.executable}" -c "import time; time.sleep(10)"'
+    )
     assert not result.success
     assert "timed out" in result.error.lower()
 

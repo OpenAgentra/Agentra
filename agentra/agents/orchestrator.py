@@ -84,7 +84,8 @@ class Orchestrator:
         llm: Optional[LLMProvider] = None,
     ) -> None:
         self.config = config or AgentConfig()
-        self.llm: LLMProvider = llm or get_provider(self.config)
+        self.llm: LLMProvider = llm or get_provider(self.config, role="planner")
+        self._summary_llm: LLMProvider = llm or get_provider(self.config, role="summary")
         # Agent factory — maps type names to agents (created lazily)
         self._agent_pool: dict[str, AutonomousAgent] = {}
         self._agent_types = {
@@ -209,7 +210,7 @@ class Orchestrator:
             f"Goal: {goal}\n\n{results_text}\n\n"
             "Provide a concise final summary for the user."
         )
-        response = await self.llm.complete(
+        response = await self._summary_llm.complete(
             messages=[LLMMessage(role="user", content=prompt)],
             temperature=0.3,
             max_tokens=512,
@@ -220,5 +221,5 @@ class Orchestrator:
 
     def _get_or_create_agent(self, agent_type: str) -> AutonomousAgent:
         if agent_type not in self._agent_pool:
-            self._agent_pool[agent_type] = AutonomousAgent(config=self.config, llm=self.llm)
+            self._agent_pool[agent_type] = AutonomousAgent(config=self.config)
         return self._agent_pool[agent_type]

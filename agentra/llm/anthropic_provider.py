@@ -30,13 +30,11 @@ class AnthropicProvider(LLMProvider):
         max_tokens: int = 4096,
     ) -> LLMResponse:
         system_prompt = ""
-        anthropic_messages: list[dict[str, Any]] = []
-
+        anthropic_messages = self._build_anthropic_messages(messages)
         for msg in messages:
             if msg.role == "system":
                 system_prompt = msg.content
-                continue
-            anthropic_messages.append(self._to_anthropic_message(msg))
+                break
 
         kwargs: dict[str, Any] = {
             "model": self._config.llm_model,
@@ -84,6 +82,20 @@ class AnthropicProvider(LLMProvider):
 
     @staticmethod
     def _to_anthropic_message(msg: LLMMessage) -> dict[str, Any]:
+        if msg.tool_calls:
+            content: list[dict[str, Any]] = []
+            if msg.content:
+                content.append({"type": "text", "text": msg.content})
+            for tool_call in msg.tool_calls:
+                content.append(
+                    {
+                        "type": "tool_use",
+                        "id": tool_call["id"],
+                        "name": tool_call["name"],
+                        "input": tool_call["arguments"],
+                    }
+                )
+            return {"role": "assistant", "content": content}
         if msg.images:
             content: list[dict[str, Any]] = [{"type": "text", "text": msg.content}]
             for img_b64 in msg.images:
@@ -106,10 +118,41 @@ class AnthropicProvider(LLMProvider):
                         "type": "tool_result",
                         "tool_use_id": msg.tool_call_id,
                         "content": msg.content,
+                        "is_error": not msg.tool_success,
                     }
                 ],
             }
         return {"role": msg.role, "content": msg.content}
+
+    @classmethod
+    def _build_anthropic_messages(cls, messages: list[LLMMessage]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        pending_tool_results: list[dict[str, Any]] = []
+
+        def flush_tool_results() -> None:
+            if pending_tool_results:
+                result.append({"role": "user", "content": list(pending_tool_results)})
+                pending_tool_results.clear()
+
+        for msg in messages:
+            if msg.role == "system":
+                continue
+            if msg.role == "tool" and msg.tool_call_id:
+                pending_tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": msg.tool_call_id,
+                        "content": msg.content,
+                        "is_error": not msg.tool_success,
+                    }
+                )
+                continue
+
+            flush_tool_results()
+            result.append(cls._to_anthropic_message(msg))
+
+        flush_tool_results()
+        return result
 
     @staticmethod
     def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

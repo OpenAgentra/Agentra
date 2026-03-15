@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 import click
+from agentra.llm.registry import get_provider_spec, provider_ids
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -30,6 +30,31 @@ def _enable_utf8_console() -> None:
 
 _enable_utf8_console()
 console = Console()
+
+
+def _runtime_overrides(
+    provider: Optional[str],
+    model: Optional[str],
+    headless: Optional[bool],
+    workspace: Optional[str],
+    max_iterations: Optional[int],
+) -> dict:
+    overrides: dict = {}
+    if provider:
+        overrides["llm_provider"] = provider
+        if not model:
+            overrides["llm_model"] = get_provider_spec(provider).default_model
+    if model:
+        overrides["llm_model"] = model
+    if headless is not None:
+        overrides["browser_headless"] = headless
+    if workspace:
+        workspace_path = Path(workspace)
+        overrides["workspace_dir"] = workspace_path
+        overrides["memory_dir"] = workspace_path / ".memory"
+    if max_iterations:
+        overrides["max_iterations"] = max_iterations
+    return overrides
 
 
 def _print_event(event: dict) -> None:
@@ -87,7 +112,7 @@ def main() -> None:
 @click.option(
     "--provider",
     default=None,
-    type=click.Choice(["openai", "anthropic", "ollama", "gemini"]),
+    type=click.Choice(provider_ids()),
     help="LLM provider (overrides AGENTRA_LLM_PROVIDER).",
 )
 @click.option("--model", default=None, help="Model name (overrides AGENTRA_LLM_MODEL).")
@@ -138,20 +163,7 @@ def run(
     from agentra.config import AgentConfig  # noqa: PLC0415
     from agentra.run_report import RunReport  # noqa: PLC0415
 
-    overrides: dict = {}
-    if provider:
-        overrides["llm_provider"] = provider
-        if provider == "gemini" and not model:
-            overrides["llm_model"] = "gemini-3-flash-preview"
-    if model:
-        overrides["llm_model"] = model
-    if headless is not None:
-        overrides["browser_headless"] = headless
-    if workspace:
-        overrides["workspace_dir"] = Path(workspace)
-    if max_iterations:
-        overrides["max_iterations"] = max_iterations
-
+    overrides = _runtime_overrides(provider, model, headless, workspace, max_iterations)
     config = AgentConfig(**overrides)
     reporter = RunReport(config.workspace_dir, goal, config.llm_provider, config.llm_model) if report else None
 
@@ -172,6 +184,76 @@ def run(
             reporter.open()
 
     asyncio.run(_async_run(goal, config, orchestrate, reporter))
+
+
+@main.command()
+@click.option("--host", default="127.0.0.1", show_default=True, help="Host for the local app.")
+@click.option("--port", default=8765, show_default=True, type=int, help="Port for the local app.")
+@click.option(
+    "--provider",
+    default=None,
+    type=click.Choice(provider_ids()),
+    help="LLM provider (overrides AGENTRA_LLM_PROVIDER).",
+)
+@click.option("--model", default=None, help="Model name (overrides AGENTRA_LLM_MODEL).")
+@click.option(
+    "--headless/--no-headless",
+    default=None,
+    help="Run browser in headless mode for app-triggered runs.",
+)
+@click.option(
+    "--workspace",
+    default=None,
+    type=click.Path(),
+    help="Workspace directory path.",
+)
+@click.option(
+    "--max-iterations",
+    default=None,
+    type=int,
+    help="Maximum agent iterations per run.",
+)
+@click.option(
+    "--open/--no-open",
+    "open_browser",
+    default=True,
+    help="Open the local app in your browser after startup.",
+)
+def app(
+    host: str,
+    port: int,
+    provider: Optional[str],
+    model: Optional[str],
+    headless: Optional[bool],
+    workspace: Optional[str],
+    max_iterations: Optional[int],
+    open_browser: bool,
+) -> None:
+    """Start the local live operator UI."""
+    from agentra.config import AgentConfig  # noqa: PLC0415
+    from agentra.live_app import create_live_app, open_live_app  # noqa: PLC0415
+
+    overrides = _runtime_overrides(provider, model, headless, workspace, max_iterations)
+    config = AgentConfig(**overrides)
+    web_app = create_live_app(config)
+    url = f"http://{host}:{port}/"
+
+    console.print(
+        Panel(
+            f"[bold]{url}[/]\n\n"
+            f"[dim]Provider: {config.llm_provider} / Model: {config.llm_model}[/]\n"
+            f"[dim]Workspace: {config.workspace_dir}[/]",
+            title="[bold blue]Agentra App[/]",
+            border_style="blue",
+        )
+    )
+
+    if open_browser:
+        open_live_app(url)
+
+    import uvicorn  # noqa: PLC0415
+
+    uvicorn.run(web_app, host=host, port=port, log_level="info")
 
 
 async def _async_run(goal: str, config: "AgentConfig", orchestrate: bool, reporter: Optional["RunReport"]) -> None:
@@ -261,9 +343,9 @@ def config_show() -> None:
     "--provider",
     prompt="LLM provider",
     default="openai",
-    type=click.Choice(["openai", "anthropic", "ollama", "gemini"]),
+    type=click.Choice(provider_ids()),
 )
-@click.option("--model", prompt="Model name", default="gpt-4o")
+@click.option("--model", prompt="Model name", default=get_provider_spec("openai").default_model)
 @click.option(
     "--api-key",
     prompt="API key (leave empty for local providers)",
@@ -273,20 +355,17 @@ def config_show() -> None:
 def config_init(provider: str, model: str, api_key: str) -> None:
     """Create a .env file with basic configuration."""
     env_path = Path(".env")
-    if provider == "gemini" and model == "gpt-4o":
-        model = "gemini-3-flash-preview"
+    spec = get_provider_spec(provider)
+    openai_default = get_provider_spec("openai").default_model
+    if provider != "openai" and model == openai_default:
+        model = spec.default_model
 
     lines = [
         f"AGENTRA_LLM_PROVIDER={provider}",
         f"AGENTRA_LLM_MODEL={model}",
     ]
-    if api_key:
-        if provider == "openai":
-            lines.append(f"AGENTRA_OPENAI_API_KEY={api_key}")
-        elif provider == "anthropic":
-            lines.append(f"AGENTRA_ANTHROPIC_API_KEY={api_key}")
-        elif provider == "gemini":
-            lines.append(f"AGENTRA_GEMINI_API_KEY={api_key}")
+    if api_key and spec.api_key_env:
+        lines.append(f"{spec.api_key_env}={api_key}")
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     console.print(f"[green]Configuration written to {env_path}[/]")
 

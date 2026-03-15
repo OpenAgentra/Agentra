@@ -10,6 +10,7 @@ together and every session is tracked in its own git workspace.
 from agentra.agents.autonomous import AutonomousAgent
 from agentra.agents.orchestrator import Orchestrator
 from agentra.config import AgentConfig
+from agentra.runtime import ExecutionScheduler, ThreadManager
 
 __version__ = "0.1.0"
-__all__ = ["AutonomousAgent", "Orchestrator", "AgentConfig"]
+__all__ = ["AutonomousAgent", "Orchestrator", "AgentConfig", "ExecutionScheduler", "ThreadManager"]
