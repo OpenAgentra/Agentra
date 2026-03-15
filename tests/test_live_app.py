@@ -1,0 +1,225 @@
+"""Tests for the live FastAPI operator UI."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+
+from agentra.config import AgentConfig
+from agentra.live_app import create_live_app
+
+PNG_1X1_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+class FakeAgent:
+    """Deterministic async agent used to exercise the live app routes."""
+
+    def __init__(self, config: AgentConfig) -> None:
+        self.config = config
+        self.interrupted = False
+
+    async def run(self, goal: str):
+        async def generator():
+            yield {
+                "type": "phase",
+                "phase": "thinking",
+                "content": "Sonraki adımı planlıyor...",
+                "summary": "Sonraki adımı planlıyor...",
+            }
+            yield {"type": "thought", "content": f"Planning for {goal}"}
+            await asyncio.sleep(0.01)
+            yield {
+                "type": "phase",
+                "phase": "acting",
+                "content": "İşlemi hazırlıyor...",
+                "summary": "İşlemi hazırlıyor...",
+            }
+            yield {
+                "type": "tool_call",
+                "tool": "browser",
+                "args": {"action": "navigate", "url": "https://www.python.org"},
+            }
+            await asyncio.sleep(0.01)
+            yield {
+                "type": "visual_intent",
+                "tool": "browser",
+                "args": {"action": "navigate", "url": "https://www.python.org"},
+                "focus_x": 0.5,
+                "focus_y": 0.4,
+                "frame_label": "browser · navigate",
+                "summary": "Opening python.org",
+            }
+            await asyncio.sleep(0.01)
+            yield {
+                "type": "screenshot",
+                "data": PNG_1X1_B64,
+                "focus_x": 0.5,
+                "focus_y": 0.4,
+                "frame_label": "browser · navigate",
+                "summary": "Opening python.org",
+            }
+            await asyncio.sleep(0.01)
+            yield {
+                "type": "tool_result",
+                "tool": "browser",
+                "result": "Navigated to python.org",
+                "success": True,
+                "summary": "Page loaded",
+            }
+            for _ in range(20):
+                if self.interrupted:
+                    break
+                await asyncio.sleep(0.01)
+            done_text = "DONE: interrupted" if self.interrupted else "DONE: complete"
+            yield {"type": "done", "content": done_text}
+
+        return generator()
+
+    def interrupt(self) -> None:
+        self.interrupted = True
+
+
+def _make_app(tmp_path: Path, created_agents: list[FakeAgent]):
+    config = AgentConfig(
+        llm_provider="gemini",
+        llm_model="gemini-3-flash-preview",
+        workspace_dir=tmp_path / "workspace",
+        memory_dir=tmp_path / "workspace" / ".memory",
+    )
+
+    def factory(cfg: AgentConfig) -> FakeAgent:
+        agent = FakeAgent(cfg)
+        created_agents.append(agent)
+        return agent
+
+    return create_live_app(config, agent_factory=factory)
+
+
+async def _wait_for_completion(
+    client: httpx.AsyncClient,
+    run_id: str,
+    timeout: float = 3.0,
+) -> dict:
+    deadline = asyncio.get_running_loop().time() + timeout
+    last: dict = {}
+    while asyncio.get_running_loop().time() < deadline:
+        response = await client.get(f"/runs/{run_id}")
+        response.raise_for_status()
+        last = response.json()
+        if last["status"] != "running":
+            return last
+        await asyncio.sleep(0.05)
+    raise AssertionError("Run did not finish in time.")
+
+
+async def _wait_for_agent_creation(created_agents: list[FakeAgent], timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if created_agents:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("Agent was not created in time.")
+
+
+@pytest.mark.asyncio
+async def test_live_app_root_renders_operator_console(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, [])
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/")
+
+    assert response.status_code == 200
+    assert "Otonom Ajan - Görev Paneli" in response.text
+    assert "Yeni bir komut veya görev girin" in response.text
+    assert "Agentra Canlı Kumanda" in response.text
+    assert "Sağlayıcı" not in response.text
+    assert "Model" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_live_app_run_state_exposes_frames_assets_and_report(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Open python.org and explain it"})
+        assert create_response.status_code == 200
+        run_id = create_response.json()["run_id"]
+
+        snapshot = await _wait_for_completion(client, run_id)
+
+        assert snapshot["status"] == "completed"
+        assert snapshot["frames"][0]["label"] == "browser · navigate"
+        assert snapshot["frames"][0]["image_url"].startswith(f"/runs/{run_id}/assets/")
+        assert snapshot["report_url"] == f"/runs/{run_id}/report"
+        assert snapshot["events"][-1]["type"] == "done"
+        assert snapshot["steps"]
+        assert any(step["kind"] == "tool" for step in snapshot["steps"])
+
+        asset_response = await client.get(snapshot["frames"][0]["image_url"])
+        report_response = await client.get(snapshot["report_url"])
+
+    assert asset_response.status_code == 200
+    assert asset_response.content
+    assert report_response.status_code == 200
+    assert "Agentra Run Report" in report_response.text
+
+
+@pytest.mark.asyncio
+async def test_live_app_event_stream_and_stop_endpoint(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Open python.org and stop when asked"})
+        run_id = create_response.json()["run_id"]
+
+        await _wait_for_agent_creation(created_agents)
+        stop_response = await client.post(f"/runs/{run_id}/stop")
+        assert stop_response.status_code == 200
+        assert created_agents[-1].interrupted is True
+
+        await _wait_for_completion(client, run_id)
+
+        payloads = []
+        async with client.stream("GET", f"/runs/{run_id}/events") as response:
+            async for line in response.aiter_lines():
+                if not line or line.startswith(":"):
+                    continue
+                payloads.append(json.loads(line.removeprefix("data: ")))
+
+    assert payloads[0]["kind"] == "snapshot"
+    assert payloads[-1]["kind"] == "complete"
+    assert any(event["type"] == "phase" for event in payloads[0]["snapshot"]["events"])
+
+
+@pytest.mark.asyncio
+async def test_live_app_exposes_thread_endpoints_and_parallel_runs(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post("/runs", json={"goal": "First run"})
+        second = await client.post("/runs", json={"goal": "Second run"})
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        first_payload = first.json()
+        second_payload = second.json()
+        assert first_payload["thread_id"] != second_payload["thread_id"]
+
+        threads_response = await client.get("/threads")
+        assert threads_response.status_code == 200
+        threads = threads_response.json()["threads"]
+        assert len(threads) == 2
+
+        thread_response = await client.get(f"/threads/{first_payload['thread_id']}")
+        assert thread_response.status_code == 200
+        assert thread_response.json()["thread_id"] == first_payload["thread_id"]

@@ -87,4 +87,21 @@ class OllamaProvider(LLMProvider):
         payload: dict[str, Any] = {"role": msg.role, "content": msg.content}
         if msg.images:
             payload["images"] = msg.images  # Ollama accepts base64 images
+        if msg.tool_calls:
+            payload["tool_calls"] = [
+                {
+                    "id": tc.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+        if msg.tool_call_id:
+            payload["role"] = "tool"
+            payload["tool_call_id"] = msg.tool_call_id
+            if msg.tool_name:
+                payload["name"] = msg.tool_name
         return payload

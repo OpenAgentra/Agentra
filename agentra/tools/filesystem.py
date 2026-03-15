@@ -16,6 +16,7 @@ class FilesystemTool(BaseTool):
     """
 
     name = "filesystem"
+    tool_capabilities = ("filesystem",)
     description = (
         "Access the local filesystem: read file contents, write or append to files, "
         "list directory contents, create directories, copy/move/delete files. "

@@ -26,6 +26,8 @@ class ToolResult:
 class BaseTool(ABC):
     """Abstract base class every tool must implement."""
 
+    tool_capabilities: tuple[str, ...] = ()
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -37,6 +39,11 @@ class BaseTool(ABC):
         """Human-readable description used in the LLM system prompt."""
 
     @property
+    def capabilities(self) -> tuple[str, ...]:
+        """Execution capabilities required by this tool call."""
+        return self.tool_capabilities or (self.name,)
+
+    @property
     @abstractmethod
     def schema(self) -> dict[str, Any]:
         """JSON Schema for this tool's parameters (OpenAI tool format)."""
@@ -44,6 +51,10 @@ class BaseTool(ABC):
     @abstractmethod
     async def execute(self, **kwargs: Any) -> ToolResult:
         """Execute the tool with the given keyword arguments."""
+
+    async def preview(self, **kwargs: Any) -> dict[str, Any] | None:
+        """Return optional non-mutating preview metadata for the pending action."""
+        return None
 
     def to_openai_tool(self) -> dict[str, Any]:
         """Return the OpenAI function-calling schema for this tool."""

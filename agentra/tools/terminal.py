@@ -21,6 +21,7 @@ class TerminalTool(BaseTool):
     """
 
     name = "terminal"
+    tool_capabilities = ("terminal",)
     description = (
         "Execute shell commands on the local computer. "
         "You can run scripts, install packages, compile code, manage files, "

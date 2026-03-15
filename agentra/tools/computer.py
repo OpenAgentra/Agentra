@@ -17,6 +17,7 @@ class ComputerTool(BaseTool):
     """
 
     name = "computer"
+    tool_capabilities = ("computer",)
     description = (
         "Control the computer: move the mouse, click, type keyboard input, "
         "take a screenshot of the entire screen, and read what is visible. "

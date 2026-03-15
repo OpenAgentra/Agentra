@@ -16,6 +16,7 @@ class GitTool(BaseTool):
     """
 
     name = "git"
+    tool_capabilities = ("git", "filesystem")
     description = (
         "Perform Git version-control operations inside the workspace: "
         "init, status, diff, add, commit, log, checkout, and clone. "

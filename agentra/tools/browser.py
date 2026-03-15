@@ -8,6 +8,8 @@ from typing import Any, Literal, Optional
 
 from agentra.tools.base import BaseTool, ToolResult
 
+_DEFAULT_FOCUS = (0.74, 0.2)
+
 
 class BrowserTool(BaseTool):
     """
@@ -16,6 +18,7 @@ class BrowserTool(BaseTool):
     """
 
     name = "browser"
+    tool_capabilities = ("browser",)
     description = (
         "Control a web browser. You can navigate to URLs, click elements, "
         "type text, scroll, extract page content, and take screenshots. "
@@ -130,20 +133,119 @@ class BrowserTool(BaseTool):
                 return ToolResult(success=True, output="Waited.")
             if action == "back":
                 await self._page.go_back()
-                return ToolResult(success=True, output="Navigated back.")
+                return await self._capture_visual_state(
+                    output="Navigated back.",
+                    frame_label="browser · back",
+                    summary="Going back",
+                    focus=self._default_focus(),
+                )
             if action == "forward":
                 await self._page.go_forward()
-                return ToolResult(success=True, output="Navigated forward.")
+                return await self._capture_visual_state(
+                    output="Navigated forward.",
+                    frame_label="browser · forward",
+                    summary="Going forward",
+                    focus=self._default_focus(),
+                )
             if action == "new_tab":
                 self._page = await self._browser.new_page()
-                return ToolResult(success=True, output="Opened new tab.")
+                return await self._capture_visual_state(
+                    output="Opened new tab.",
+                    frame_label="browser · new_tab",
+                    summary="Opening a new tab",
+                    focus=self._default_focus(),
+                )
             if action == "close_tab":
                 await self._page.close()
                 self._page = await self._browser.new_page()
-                return ToolResult(success=True, output="Closed tab.")
+                return await self._capture_visual_state(
+                    output="Closed tab.",
+                    frame_label="browser · close_tab",
+                    summary="Closing the tab",
+                    focus=self._default_focus(),
+                )
             return ToolResult(success=False, error=f"Unknown action: {action!r}")
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, error=str(exc))
+
+    async def preview(self, **kwargs: Any) -> dict[str, Any] | None:
+        """Return visual metadata before a browser action is executed."""
+        action: str = kwargs.get("action", "")
+        if action == "navigate":
+            return self._preview_payload(
+                frame_label="browser · navigate",
+                summary=f"Opening {self._short_url(kwargs.get('url', 'the page'))}",
+                focus=self._default_focus_normalized(),
+            )
+        if action == "click":
+            selector = kwargs.get("selector")
+            if selector:
+                return self._preview_payload(
+                    frame_label="browser · click",
+                    summary=f"Clicking {selector}",
+                    focus=await self._selector_focus_normalized(selector),
+                )
+            x = kwargs.get("x")
+            y = kwargs.get("y")
+            focus = self._normalize_preview_focus(x, y) if x is not None and y is not None else self._default_focus_normalized()
+            return self._preview_payload(
+                frame_label="browser · click",
+                summary="Clicking the page",
+                focus=focus,
+            )
+        if action == "type":
+            selector = kwargs.get("selector")
+            if selector:
+                return self._preview_payload(
+                    frame_label="browser · type",
+                    summary=f"Typing into {selector}",
+                    focus=await self._selector_focus_normalized(selector),
+                )
+            return self._preview_payload(
+                frame_label="browser · type",
+                summary="Typing text",
+                focus=self._default_focus_normalized(y=0.56),
+            )
+        if action == "scroll":
+            x = kwargs.get("x")
+            y = kwargs.get("y")
+            focus = self._normalize_preview_focus(x, y) if x or y else self._default_focus_normalized(y=0.78)
+            return self._preview_payload(
+                frame_label="browser · scroll",
+                summary="Scrolling the page",
+                focus=focus,
+            )
+        if action == "screenshot":
+            return self._preview_payload(
+                frame_label="browser · screenshot",
+                summary="Capturing a screenshot",
+                focus=self._default_focus_normalized(),
+            )
+        if action == "back":
+            return self._preview_payload(
+                frame_label="browser · back",
+                summary="Going back",
+                focus=self._default_focus_normalized(),
+            )
+        if action == "forward":
+            return self._preview_payload(
+                frame_label="browser · forward",
+                summary="Going forward",
+                focus=self._default_focus_normalized(),
+            )
+        if action == "new_tab":
+            return self._preview_payload(
+                frame_label="browser · new_tab",
+                summary="Opening a new tab",
+                focus=self._default_focus_normalized(),
+            )
+        if action == "close_tab":
+            return self._preview_payload(
+                frame_label="browser · close_tab",
+                summary="Closing the tab",
+                focus=self._default_focus_normalized(),
+            )
+        return None
 
     # ── private actions ────────────────────────────────────────────────────────
 
@@ -152,7 +254,12 @@ class BrowserTool(BaseTool):
             return ToolResult(success=False, error="url is required for 'navigate'")
         await self._page.goto(url, timeout=30000)
         title = await self._page.title()
-        return ToolResult(success=True, output=f"Navigated to {url!r}. Page title: {title!r}")
+        return await self._capture_visual_state(
+            output=f"Navigated to {url!r}. Page title: {title!r}",
+            frame_label="browser · navigate",
+            summary=f"Opening {self._short_url(url)}",
+            focus=self._default_focus(),
+        )
 
     async def _click(
         self,
@@ -161,32 +268,58 @@ class BrowserTool(BaseTool):
         y: Optional[float],
     ) -> ToolResult:
         if selector:
+            focus = await self._selector_focus(selector)
             await self._page.click(selector, timeout=5000)
-            return ToolResult(success=True, output=f"Clicked {selector!r}")
+            return await self._capture_visual_state(
+                output=f"Clicked {selector!r}",
+                frame_label="browser · click",
+                summary=f"Clicking {selector}",
+                focus=focus,
+            )
         if x is not None and y is not None:
             await self._page.mouse.click(x, y)
-            return ToolResult(success=True, output=f"Clicked ({x}, {y})")
+            return await self._capture_visual_state(
+                output=f"Clicked ({x}, {y})",
+                frame_label="browser · click",
+                summary="Clicking the page",
+                focus=(x, y),
+            )
         return ToolResult(success=False, error="Provide selector or x,y coordinates.")
 
     async def _type(self, selector: Optional[str], text: str) -> ToolResult:
         if selector:
+            focus = await self._selector_focus(selector)
             await self._page.fill(selector, text)
-            return ToolResult(success=True, output=f"Typed into {selector!r}")
+            return await self._capture_visual_state(
+                output=f"Typed into {selector!r}",
+                frame_label="browser · type",
+                summary=f"Typing into {selector}",
+                focus=focus,
+            )
         await self._page.keyboard.type(text)
-        return ToolResult(success=True, output="Typed text.")
+        return await self._capture_visual_state(
+            output="Typed text.",
+            frame_label="browser · type",
+            summary="Typing text",
+            focus=self._default_focus(y=0.56),
+        )
 
     async def _scroll(self, x: float, y: float, delta_y: float) -> ToolResult:
         await self._page.mouse.wheel(delta_x=0, delta_y=delta_y)
-        return ToolResult(success=True, output=f"Scrolled {delta_y}px")
+        focus = (x, y) if x or y else self._default_focus(y=0.78)
+        return await self._capture_visual_state(
+            output=f"Scrolled {delta_y}px",
+            frame_label="browser · scroll",
+            summary="Scrolling the page",
+            focus=focus,
+        )
 
     async def _screenshot(self) -> ToolResult:
-        png_bytes = await self._page.screenshot(type="png")
-        b64 = base64.b64encode(png_bytes).decode()
-        url = self._page.url
-        return ToolResult(
-            success=True,
-            output=f"Screenshot captured. Current URL: {url}",
-            screenshot_b64=b64,
+        return await self._capture_visual_state(
+            output=f"Screenshot captured. Current URL: {self._page.url}",
+            frame_label="browser · screenshot",
+            summary="Capturing a screenshot",
+            focus=self._default_focus(),
         )
 
     async def _get_text(self, selector: Optional[str]) -> ToolResult:
@@ -202,3 +335,99 @@ class BrowserTool(BaseTool):
         else:
             html = await self._page.content()
         return ToolResult(success=True, output=html[:8000])
+
+    async def _capture_visual_state(
+        self,
+        *,
+        output: str,
+        frame_label: str,
+        summary: str,
+        focus: tuple[float, float],
+    ) -> ToolResult:
+        png_bytes = await self._page.screenshot(type="png")
+        focus_x, focus_y = self._normalize_focus(*focus)
+        return ToolResult(
+            success=True,
+            output=output,
+            screenshot_b64=base64.b64encode(png_bytes).decode(),
+            metadata={
+                "focus_x": focus_x,
+                "focus_y": focus_y,
+                "frame_label": frame_label,
+                "summary": summary,
+            },
+        )
+
+    async def _selector_focus(self, selector: str) -> tuple[float, float]:
+        locator = self._page.locator(selector).first
+        box = await locator.bounding_box()
+        if box:
+            return (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        return self._default_focus()
+
+    async def _selector_focus_normalized(self, selector: str) -> tuple[float, float]:
+        if self._page is None:
+            return self._default_focus_normalized()
+        locator = self._page.locator(selector).first
+        box = await locator.bounding_box()
+        if box:
+            return self._normalize_focus(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        return self._default_focus_normalized()
+
+    def _normalize_focus(self, x: float, y: float) -> tuple[float, float]:
+        size = self._page.viewport_size or {"width": 1280, "height": 720}
+        width = max(float(size.get("width", 1280)), 1.0)
+        height = max(float(size.get("height", 720)), 1.0)
+        return (
+            max(0.0, min(1.0, float(x) / width)),
+            max(0.0, min(1.0, float(y) / height)),
+        )
+
+    def _default_focus(
+        self,
+        *,
+        x: float = _DEFAULT_FOCUS[0],
+        y: float = _DEFAULT_FOCUS[1],
+    ) -> tuple[float, float]:
+        size = self._page.viewport_size or {"width": 1280, "height": 720}
+        width = float(size.get("width", 1280))
+        height = float(size.get("height", 720))
+        return (x * width, y * height)
+
+    @staticmethod
+    def _default_focus_normalized(
+        *,
+        x: float = _DEFAULT_FOCUS[0],
+        y: float = _DEFAULT_FOCUS[1],
+    ) -> tuple[float, float]:
+        return (
+            max(0.0, min(1.0, float(x))),
+            max(0.0, min(1.0, float(y))),
+        )
+
+    def _normalize_preview_focus(self, x: float | None, y: float | None) -> tuple[float, float]:
+        if x is None or y is None:
+            return self._default_focus_normalized()
+        if self._page is None:
+            return self._default_focus_normalized()
+        return self._normalize_focus(float(x), float(y))
+
+    @staticmethod
+    def _preview_payload(
+        *,
+        frame_label: str,
+        summary: str,
+        focus: tuple[float, float],
+    ) -> dict[str, Any]:
+        focus_x, focus_y = focus
+        return {
+            "frame_label": frame_label,
+            "summary": summary,
+            "focus_x": max(0.0, min(1.0, float(focus_x))),
+            "focus_y": max(0.0, min(1.0, float(focus_y))),
+        }
+
+    @staticmethod
+    def _short_url(url: str) -> str:
+        compact = url.replace("https://", "").replace("http://", "").rstrip("/")
+        return compact.removeprefix("www.") or url
