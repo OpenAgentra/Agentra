@@ -52,3 +52,24 @@ def test_run_report_keeps_event_history(tmp_path):
 
     assert report.events[0]["tool"] == "terminal"
     assert report.events[0]["success"] is True
+
+
+def test_run_report_no_double_escaping(tmp_path):
+    """Tool names and sub-task labels with special chars must not be double-escaped."""
+    report = RunReport(
+        workspace_dir=tmp_path,
+        goal="Escaping test",
+        provider="openai",
+        model="gpt-4o",
+    )
+    report.record({"type": "tool_result", "tool": "a&b", "result": "ok", "success": True})
+    report.record({"type": "sub_task", "label": "step <1>", "result": "done", "success": True})
+    report.finalize("completed")
+
+    html_text = report.html_path.read_text(encoding="utf-8")
+
+    # Should appear escaped once, not double-escaped (&amp;amp; or &amp;lt;)
+    assert "a&amp;b" in html_text
+    assert "&amp;amp;" not in html_text
+    assert "step &lt;1&gt;" in html_text
+    assert "&amp;lt;" not in html_text

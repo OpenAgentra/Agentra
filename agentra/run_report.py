@@ -344,7 +344,7 @@ class RunReport:
             return self._event_shell(event_type, "Tool Call", timestamp, body)
         if event_type == "tool_result":
             success = "success" if event.get("success") else "error"
-            tool = html.escape(str(event.get("tool", "tool")))
+            tool = str(event.get("tool", "tool"))
             result = self._content_block(event.get("result", ""))
             return self._event_shell(f"{event_type} {success}", f"Tool Result: {tool}", timestamp, result)
         if event_type == "screenshot":
@@ -360,7 +360,7 @@ class RunReport:
             return self._event_shell(event_type, "Error", timestamp, self._content_block(event.get("content", "")))
         if event_type == "sub_task":
             success = "success" if event.get("success") else "error"
-            label = html.escape(str(event.get("label", "Sub-task")))
+            label = str(event.get("label", "Sub-task"))
             result = self._content_block(event.get("result", ""))
             return self._event_shell(f"{event_type} {success}", label, timestamp, result)
         return self._event_shell(event_type, title, timestamp, self._content_block(json.dumps(event, indent=2)))
