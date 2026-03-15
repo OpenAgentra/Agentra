@@ -73,9 +73,17 @@ agentra config init
 Or create a `.env` file manually:
 
 ```env
-AGENTRA_LLM_PROVIDER=openai          # openai | anthropic | ollama
+AGENTRA_LLM_PROVIDER=openai          # openai | anthropic | ollama | gemini
 AGENTRA_LLM_MODEL=gpt-4o
 AGENTRA_OPENAI_API_KEY=sk-...
+```
+
+For a quick Gemini MVP using Google's OpenAI-compatible API:
+
+```env
+AGENTRA_LLM_PROVIDER=gemini
+AGENTRA_LLM_MODEL=gemini-3-flash-preview
+AGENTRA_GEMINI_API_KEY=your-api-key
 ```
 
 For a **completely free, local** setup using Ollama:
@@ -99,6 +107,9 @@ agentra run --orchestrate "Research the top 5 Python web frameworks and write a 
 
 # Control the browser visually
 agentra run --no-headless "Search LinkedIn for Python jobs in Istanbul and list them"
+
+# Save a visual HTML timeline for a demo
+agentra run --open-report "Open python.org, take a screenshot, and describe the page"
 
 # Use a specific model
 agentra run --provider ollama --model llava "Take a screenshot and describe what you see"
@@ -170,12 +181,14 @@ All settings can be set via environment variables (prefix `AGENTRA_`) or a `.env
 
 | Variable | Default | Description |
 |---|---|---|
-| `AGENTRA_LLM_PROVIDER` | `openai` | `openai` \| `anthropic` \| `ollama` |
+| `AGENTRA_LLM_PROVIDER` | `openai` | `openai` \| `anthropic` \| `ollama` \| `gemini` |
 | `AGENTRA_LLM_MODEL` | `gpt-4o` | Model name for the chosen provider |
 | `AGENTRA_LLM_VISION_MODEL` | _(same as model)_ | Separate vision model if needed |
 | `AGENTRA_OPENAI_API_KEY` | — | OpenAI API key |
 | `AGENTRA_ANTHROPIC_API_KEY` | — | Anthropic API key |
 | `AGENTRA_OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `AGENTRA_GEMINI_API_KEY` | — | Google Gemini API key |
+| `AGENTRA_GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai/` | Gemini OpenAI-compatible base URL |
 | `AGENTRA_MAX_ITERATIONS` | `50` | Maximum agent loop iterations |
 | `AGENTRA_MAX_TOKENS` | `4096` | Max tokens per LLM call |
 | `AGENTRA_TEMPERATURE` | `0.2` | LLM sampling temperature |

@@ -20,4 +20,8 @@ def get_provider(config: AgentConfig) -> LLMProvider:
         from agentra.llm.ollama_provider import OllamaProvider
 
         return OllamaProvider(config)
+    if config.llm_provider == "gemini":
+        from agentra.llm.gemini_provider import GeminiProvider
+
+        return GeminiProvider(config)
     raise ValueError(f"Unknown llm_provider: {config.llm_provider!r}")
