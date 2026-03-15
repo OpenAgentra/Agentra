@@ -8,12 +8,12 @@ version = "0.1.0"
 description = "Open-source autonomous AI agent with full computer access — browser, desktop, filesystem, terminal"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "BUSL-1.1" }
 keywords = ["ai", "agent", "autonomous", "computer-use", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

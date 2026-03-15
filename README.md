@@ -3,7 +3,7 @@
 > **Open-source autonomous AI agent with full computer access** — browse the web, control the desktop, manage files, run terminal commands — all orchestrated by an LLM you choose.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE)
 
 ---
 
@@ -254,4 +254,20 @@ pytest tests/ -v
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Agentra is released under the **[Business Source License 1.1 (BUSL-1.1)](LICENSE)**.
+
+**What this means:**
+
+| Use case | Allowed? |
+|---|---|
+| Reading / studying the source code | ✅ |
+| Personal, non-commercial use | ✅ |
+| Research & evaluation | ✅ |
+| Contributing back to this repo | ✅ |
+| Running in production for your own non-commercial projects | ✅ |
+| Offering Agentra as a commercial SaaS / managed service | ❌ (requires a commercial license) |
+| Embedding in a commercial product for redistribution | ❌ (requires a commercial license) |
+
+**Open-source transition:** On **2030-03-16** (or four years after any given version's first public release, whichever is earlier) the license automatically converts to the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) for that version, making Agentra fully open-source over time.
+
+For commercial licensing inquiries, please open an issue or contact the maintainers.
