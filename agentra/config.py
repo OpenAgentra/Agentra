@@ -70,6 +70,10 @@ class AgentConfig(BaseSettings):
         default_factory=lambda: Path(os.getcwd()) / "workspace" / ".memory",
         description="Directory used to persist embeddings and screenshots.",
     )
+    long_term_memory_dir: Path = Field(
+        default_factory=lambda: Path(os.getcwd()) / "workspace" / ".memory-global",
+        description="Directory used for project-wide long-term searchable memory.",
+    )
     screenshot_history: int = Field(
         default=10,
         ge=0,
@@ -93,7 +97,7 @@ class AgentConfig(BaseSettings):
             raise ValueError(f"Unknown llm_provider: {value!r}. Expected one of: {known}")
         return value
 
-    @field_validator("workspace_dir", "memory_dir", mode="before")
+    @field_validator("workspace_dir", "memory_dir", "long_term_memory_dir", mode="before")
     @classmethod
     def _expand_path(cls, v: object) -> Path:
         return Path(str(v)).expanduser().resolve()

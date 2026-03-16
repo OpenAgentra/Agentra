@@ -8,8 +8,20 @@ any state and the user has a full audit trail of what was done.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+
+@dataclass
+class WorkspaceChangeSummary:
+    """Serializable summary of a workspace checkpoint."""
+
+    before_sha: str | None = None
+    after_sha: str | None = None
+    changed_files: list[str] = field(default_factory=list)
+    diff_stats: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "unchanged"
 
 
 class WorkspaceManager:
@@ -59,7 +71,27 @@ class WorkspaceManager:
         if self._repo is None:
             return False
         msg = message or f"chore: agent snapshot {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        return self._commit(msg)
+        summary = self.checkpoint(msg)
+        return summary.status == "committed"
+
+    def checkpoint(self, message: Optional[str] = None) -> WorkspaceChangeSummary:
+        """Create a git checkpoint and return a structured diff summary."""
+        if self._repo is None:
+            return WorkspaceChangeSummary(status="git_unavailable")
+        msg = message or f"chore: agent snapshot {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        before_sha = self.current_sha()
+        changed_files = self._pending_changed_files()
+        committed = self._commit(msg)
+        after_sha = self.current_sha()
+        diff_stats = self._diff_stats(before_sha, after_sha)
+        status = "committed" if committed else "unchanged"
+        return WorkspaceChangeSummary(
+            before_sha=before_sha,
+            after_sha=after_sha,
+            changed_files=changed_files,
+            diff_stats=diff_stats,
+            status=status,
+        )
 
     def history(self, n: int = 20) -> list[dict[str, str]]:
         """Return the last *n* commits as a list of dicts."""
@@ -85,6 +117,14 @@ class WorkspaceManager:
             return False
         self._repo.git.reset("--hard", sha)
         return True
+
+    def current_sha(self) -> str | None:
+        if self._repo is None:
+            return None
+        try:
+            return self._repo.head.commit.hexsha[:8]
+        except Exception:  # noqa: BLE001
+            return None
 
     # ── private ────────────────────────────────────────────────────────────────
 
@@ -113,3 +153,51 @@ class WorkspaceManager:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    def _pending_changed_files(self) -> list[str]:
+        if self._repo is None:
+            return []
+        try:
+            output = self._repo.git.status("--porcelain")
+        except Exception:  # noqa: BLE001
+            return []
+        files: list[str] = []
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            candidate = line[3:].strip() if len(line) > 3 else line.strip()
+            if candidate:
+                files.append(candidate)
+        return sorted(set(files))
+
+    def _diff_stats(self, before_sha: str | None, after_sha: str | None) -> list[dict[str, Any]]:
+        if self._repo is None or after_sha is None:
+            return []
+        try:
+            if before_sha and before_sha != after_sha:
+                output = self._repo.git.diff("--numstat", before_sha, after_sha)
+            else:
+                output = self._repo.git.show("--numstat", "--format=", after_sha)
+        except Exception:  # noqa: BLE001
+            return []
+        stats: list[dict[str, Any]] = []
+        for line in output.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            added, deleted, path = parts
+            stats.append(
+                {
+                    "path": path,
+                    "added": _safe_int(added),
+                    "deleted": _safe_int(deleted),
+                }
+            )
+        return stats
+
+
+def _safe_int(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        return 0

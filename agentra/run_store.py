@@ -41,6 +41,7 @@ class RunStore:
         self.status = "running"
         self._events: list[dict[str, Any]] = []
         self._frames: list[dict[str, Any]] = []
+        self._audit: list[dict[str, Any]] = []
         self._screenshot_index = 0
         self._pending_frame_id: str | None = None
         self._last_tool_call: dict[str, Any] | None = None
@@ -55,6 +56,10 @@ class RunStore:
     @property
     def frames(self) -> list[dict[str, Any]]:
         return list(self._frames)
+
+    @property
+    def audit(self) -> list[dict[str, Any]]:
+        return list(self._audit)
 
     def record(self, event: dict[str, Any]) -> dict[str, Any]:
         """Append *event* to the run history and persist the updated state."""
@@ -134,6 +139,13 @@ class RunStore:
         self.finished_at = datetime.now().isoformat(timespec="seconds")
         self._write_events()
 
+    def record_audit(self, entry: dict[str, Any]) -> dict[str, Any]:
+        stored = self._sanitize(entry)
+        stored.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
+        self._audit.append(stored)
+        self._write_events()
+        return stored
+
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-serializable snapshot of the run."""
         return {
@@ -149,6 +161,7 @@ class RunStore:
             "report_path": str(self.html_path),
             "events": self.events,
             "frames": self.frames,
+            "audit": self.audit,
         }
 
     def _apply_summary_to_pending_frame(self, summary: str) -> None:

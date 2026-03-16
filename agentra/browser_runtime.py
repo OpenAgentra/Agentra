@@ -1,162 +1,87 @@
-"""Browser tool — autonomous web browsing via Playwright."""
+"""Shared browser runtime and thread-scoped browser sessions."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
-from typing import Any, Literal, Optional
+from dataclasses import asdict, dataclass
+from typing import Any, Literal
 
-from agentra.browser_runtime import BrowserSessionManager
-from agentra.tools.base import BaseTool, ToolResult
+from agentra.tools.base import ToolResult
 
 _DEFAULT_FOCUS = (0.74, 0.2)
 
 
-class BrowserTool(BaseTool):
-    """
-    Lets the agent open a browser, navigate to URLs, click elements,
-    fill forms, take screenshots, and extract page content.
-    """
+@dataclass
+class BrowserSnapshot:
+    """Serializable summary of the current browser session."""
 
-    name = "browser"
-    tool_capabilities = ("browser",)
-    description = (
-        "Control a web browser. You can navigate to URLs, click elements, "
-        "type text, scroll, extract page content, and take screenshots. "
-        "Use this to browse websites, log in to accounts, fill forms, and "
-        "perform any web-based task on behalf of the user."
-    )
+    active: bool = False
+    active_url: str = ""
+    active_title: str = ""
+    tab_count: int = 0
+
+
+class BrowserRuntime:
+    """Owns a Playwright runtime plus a launched browser instance."""
 
     def __init__(
         self,
-        headless: bool = False,
+        *,
         browser_type: Literal["chromium", "firefox", "webkit"] = "chromium",
+        headless: bool = False,
     ) -> None:
-        self._headless = headless
-        self._browser_type = browser_type
+        self.browser_type = browser_type
+        self.headless = headless
         self._playwright: Any = None
         self._browser: Any = None
-        self._page: Any = None
-        self._browser_sessions: BrowserSessionManager | None = None
-        self._thread_id: str | None = None
+        self._lock = asyncio.Lock()
 
-    def bind_runtime(
-        self,
-        *,
-        browser_sessions: BrowserSessionManager | None = None,
-        thread_id: str | None = None,
-    ) -> None:
-        """Attach a shared browser session manager for thread-scoped browsing."""
-        self._browser_sessions = browser_sessions
-        self._thread_id = thread_id
+    async def browser(self) -> Any:
+        async with self._lock:
+            if self._browser is not None:
+                return self._browser
+            from playwright.async_api import async_playwright  # noqa: PLC0415
 
-    # ── lifecycle ──────────────────────────────────────────────────────────────
+            self._playwright = await async_playwright().start()
+            launcher = getattr(self._playwright, self.browser_type)
+            self._browser = await launcher.launch(headless=self.headless)
+            return self._browser
 
-    async def start(self) -> None:
-        """Launch the browser. Called automatically on first use."""
-        from playwright.async_api import async_playwright  # noqa: PLC0415
-
-        self._playwright = await async_playwright().start()
-        launcher = getattr(self._playwright, self._browser_type)
-        self._browser = await launcher.launch(headless=self._headless)
-        self._page = await self._browser.new_page()
-
-    async def stop(self) -> None:
-        """Close the browser and Playwright context."""
-        if self._browser_sessions is not None and self._thread_id is not None:
-            self._page = None
+    async def close(self) -> None:
+        async with self._lock:
+            if self._browser is not None:
+                await self._browser.close()
+            if self._playwright is not None:
+                await self._playwright.stop()
             self._browser = None
             self._playwright = None
-            return
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
-        self._browser = None
-        self._page = None
-        self._playwright = None
 
-    async def _ensure_started(self) -> None:
-        if self._browser_sessions is not None and self._thread_id is not None:
-            session = await self._browser_sessions.session_for(
-                thread_id=self._thread_id,
-                browser_type=self._browser_type,
-                headless=self._headless,
-            )
-            snapshot = session.snapshot()
-            if snapshot.active:
-                self._page = object()
-            return
-        if self._page is None:
-            await self.start()
 
-    # ── schema ─────────────────────────────────────────────────────────────────
+class BrowserSession:
+    """A single thread-scoped browser context shared by agent and user."""
 
-    @property
-    def schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "navigate",
-                        "click",
-                        "type",
-                        "scroll",
-                        "screenshot",
-                        "get_text",
-                        "get_html",
-                        "wait",
-                        "back",
-                        "forward",
-                        "new_tab",
-                        "close_tab",
-                    ],
-                    "description": "Browser action to perform.",
-                },
-                "url": {"type": "string", "description": "URL to navigate to."},
-                "selector": {
-                    "type": "string",
-                    "description": "CSS selector or text content (prefixed with 'text=').",
-                },
-                "text": {"type": "string", "description": "Text to type."},
-                "x": {"type": "number", "description": "X coordinate for click/scroll."},
-                "y": {"type": "number", "description": "Y coordinate for click/scroll."},
-                "delta_y": {"type": "number", "description": "Pixels to scroll vertically."},
-                "timeout": {
-                    "type": "number",
-                    "description": "Timeout in milliseconds (default 5000).",
-                },
-            },
-            "required": ["action"],
-        }
-
-    # ── execute ────────────────────────────────────────────────────────────────
+    def __init__(self, thread_id: str, runtime: BrowserRuntime) -> None:
+        self.thread_id = thread_id
+        self.runtime = runtime
+        self._context: Any = None
+        self._pages: list[Any] = []
+        self._page: Any = None
+        self._snapshot = BrowserSnapshot()
 
     async def execute(self, **kwargs: Any) -> ToolResult:
-        if self._browser_sessions is not None and self._thread_id is not None:
-            session = await self._browser_sessions.session_for(
-                thread_id=self._thread_id,
-                browser_type=self._browser_type,
-                headless=self._headless,
-            )
-            return await session.execute(**kwargs)
         await self._ensure_started()
         action: str = kwargs.get("action", "")
         try:
             if action == "navigate":
                 return await self._navigate(kwargs.get("url", ""))
             if action == "click":
-                return await self._click(
-                    kwargs.get("selector"), kwargs.get("x"), kwargs.get("y")
-                )
+                return await self._click(kwargs.get("selector"), kwargs.get("x"), kwargs.get("y"))
             if action == "type":
                 return await self._type(kwargs.get("selector"), kwargs.get("text", ""))
             if action == "scroll":
-                return await self._scroll(
-                    kwargs.get("x", 0), kwargs.get("y", 0), kwargs.get("delta_y", 500)
-                )
+                delta_y = kwargs.get("delta_y", kwargs.get("amount", 500))
+                return await self._scroll(kwargs.get("x", 0), kwargs.get("y", 0), delta_y)
             if action == "screenshot":
                 return await self._screenshot()
             if action == "get_text":
@@ -165,7 +90,8 @@ class BrowserTool(BaseTool):
                 return await self._get_html(kwargs.get("selector"))
             if action == "wait":
                 await asyncio.sleep(kwargs.get("timeout", 1000) / 1000)
-                return ToolResult(success=True, output="Waited.")
+                await self._refresh_snapshot()
+                return self._plain_result("Waited.")
             if action == "back":
                 await self._page.go_back()
                 return await self._capture_visual_state(
@@ -183,7 +109,8 @@ class BrowserTool(BaseTool):
                     focus=self._default_focus(),
                 )
             if action == "new_tab":
-                self._page = await self._browser.new_page()
+                page = await self._context.new_page()
+                self._set_active_page(page)
                 return await self._capture_visual_state(
                     output="Opened new tab.",
                     frame_label="browser · new_tab",
@@ -191,8 +118,13 @@ class BrowserTool(BaseTool):
                     focus=self._default_focus(),
                 )
             if action == "close_tab":
-                await self._page.close()
-                self._page = await self._browser.new_page()
+                if self._page is not None:
+                    await self._page.close()
+                    self._pages = [page for page in self._pages if not getattr(page, "is_closed", lambda: False)()]
+                if not self._pages:
+                    page = await self._context.new_page()
+                    self._pages = [page]
+                self._set_active_page(self._pages[-1])
                 return await self._capture_visual_state(
                     output="Closed tab.",
                     frame_label="browser · close_tab",
@@ -204,14 +136,6 @@ class BrowserTool(BaseTool):
             return ToolResult(success=False, error=str(exc))
 
     async def preview(self, **kwargs: Any) -> dict[str, Any] | None:
-        if self._browser_sessions is not None and self._thread_id is not None:
-            session = await self._browser_sessions.session_for(
-                thread_id=self._thread_id,
-                browser_type=self._browser_type,
-                headless=self._headless,
-            )
-            return await session.preview(**kwargs)
-        """Return visual metadata before a browser action is executed."""
         action: str = kwargs.get("action", "")
         if action == "navigate":
             return self._preview_payload(
@@ -230,11 +154,7 @@ class BrowserTool(BaseTool):
             x = kwargs.get("x")
             y = kwargs.get("y")
             focus = self._normalize_preview_focus(x, y) if x is not None and y is not None else self._default_focus_normalized()
-            return self._preview_payload(
-                frame_label="browser · click",
-                summary="Clicking the page",
-                focus=focus,
-            )
+            return self._preview_payload(frame_label="browser · click", summary="Clicking the page", focus=focus)
         if action == "type":
             selector = kwargs.get("selector")
             if selector:
@@ -252,44 +172,48 @@ class BrowserTool(BaseTool):
             x = kwargs.get("x")
             y = kwargs.get("y")
             focus = self._normalize_preview_focus(x, y) if x or y else self._default_focus_normalized(y=0.78)
-            return self._preview_payload(
-                frame_label="browser · scroll",
-                summary="Scrolling the page",
-                focus=focus,
-            )
+            return self._preview_payload(frame_label="browser · scroll", summary="Scrolling the page", focus=focus)
         if action == "screenshot":
             return self._preview_payload(
                 frame_label="browser · screenshot",
                 summary="Capturing a screenshot",
                 focus=self._default_focus_normalized(),
             )
-        if action == "back":
+        if action in {"back", "forward", "new_tab", "close_tab"}:
             return self._preview_payload(
-                frame_label="browser · back",
-                summary="Going back",
-                focus=self._default_focus_normalized(),
-            )
-        if action == "forward":
-            return self._preview_payload(
-                frame_label="browser · forward",
-                summary="Going forward",
-                focus=self._default_focus_normalized(),
-            )
-        if action == "new_tab":
-            return self._preview_payload(
-                frame_label="browser · new_tab",
-                summary="Opening a new tab",
-                focus=self._default_focus_normalized(),
-            )
-        if action == "close_tab":
-            return self._preview_payload(
-                frame_label="browser · close_tab",
-                summary="Closing the tab",
+                frame_label=f"browser · {action}",
+                summary={
+                    "back": "Going back",
+                    "forward": "Going forward",
+                    "new_tab": "Opening a new tab",
+                    "close_tab": "Closing the tab",
+                }[action],
                 focus=self._default_focus_normalized(),
             )
         return None
 
-    # ── private actions ────────────────────────────────────────────────────────
+    def snapshot(self) -> BrowserSnapshot:
+        return BrowserSnapshot(
+            active=self._snapshot.active,
+            active_url=self._snapshot.active_url,
+            active_title=self._snapshot.active_title,
+            tab_count=self._snapshot.tab_count,
+        )
+
+    async def _ensure_started(self) -> None:
+        if self._page is not None:
+            return
+        browser = await self.runtime.browser()
+        self._context = await browser.new_context()
+        page = await self._context.new_page()
+        self._pages = [page]
+        self._set_active_page(page)
+        await self._refresh_snapshot()
+
+    def _set_active_page(self, page: Any) -> None:
+        if page not in self._pages:
+            self._pages.append(page)
+        self._page = page
 
     async def _navigate(self, url: str) -> ToolResult:
         if not url:
@@ -303,12 +227,7 @@ class BrowserTool(BaseTool):
             focus=self._default_focus(),
         )
 
-    async def _click(
-        self,
-        selector: Optional[str],
-        x: Optional[float],
-        y: Optional[float],
-    ) -> ToolResult:
+    async def _click(self, selector: str | None, x: float | None, y: float | None) -> ToolResult:
         if selector:
             focus = await self._selector_focus(selector)
             await self._page.click(selector, timeout=5000)
@@ -328,7 +247,7 @@ class BrowserTool(BaseTool):
             )
         return ToolResult(success=False, error="Provide selector or x,y coordinates.")
 
-    async def _type(self, selector: Optional[str], text: str) -> ToolResult:
+    async def _type(self, selector: str | None, text: str) -> ToolResult:
         if selector:
             focus = await self._selector_focus(selector)
             await self._page.fill(selector, text)
@@ -364,19 +283,19 @@ class BrowserTool(BaseTool):
             focus=self._default_focus(),
         )
 
-    async def _get_text(self, selector: Optional[str]) -> ToolResult:
-        if selector:
-            text = await self._page.inner_text(selector)
-        else:
-            text = await self._page.inner_text("body")
-        return ToolResult(success=True, output=text[:8000])
+    async def _get_text(self, selector: str | None) -> ToolResult:
+        text = await self._page.inner_text(selector or "body")
+        await self._refresh_snapshot()
+        return self._plain_result(text[:8000], extracted_text=text[:8000])
 
-    async def _get_html(self, selector: Optional[str]) -> ToolResult:
-        if selector:
-            html = await self._page.inner_html(selector)
-        else:
-            html = await self._page.content()
-        return ToolResult(success=True, output=html[:8000])
+    async def _get_html(self, selector: str | None) -> ToolResult:
+        html = await self._page.inner_html(selector) if selector else await self._page.content()
+        await self._refresh_snapshot()
+        return self._plain_result(html[:8000], extracted_text=html[:8000])
+
+    def _plain_result(self, output: str, *, extracted_text: str | None = None) -> ToolResult:
+        metadata = self._metadata(summary="", extracted_text=extracted_text)
+        return ToolResult(success=True, output=output, metadata=metadata)
 
     async def _capture_visual_state(
         self,
@@ -387,17 +306,62 @@ class BrowserTool(BaseTool):
         focus: tuple[float, float],
     ) -> ToolResult:
         png_bytes = await self._page.screenshot(type="png")
+        await self._refresh_snapshot()
         focus_x, focus_y = self._normalize_focus(*focus)
         return ToolResult(
             success=True,
             output=output,
             screenshot_b64=base64.b64encode(png_bytes).decode(),
-            metadata={
-                "focus_x": focus_x,
-                "focus_y": focus_y,
-                "frame_label": frame_label,
-                "summary": summary,
-            },
+            metadata=self._metadata(
+                summary=summary,
+                frame_label=frame_label,
+                focus_x=focus_x,
+                focus_y=focus_y,
+            ),
+        )
+
+    def _metadata(
+        self,
+        *,
+        summary: str,
+        frame_label: str | None = None,
+        focus_x: float | None = None,
+        focus_y: float | None = None,
+        extracted_text: str | None = None,
+    ) -> dict[str, Any]:
+        snapshot = self.snapshot()
+        metadata: dict[str, Any] = {
+            "summary": summary,
+            "active_url": snapshot.active_url,
+            "active_title": snapshot.active_title,
+            "tab_count": snapshot.tab_count,
+        }
+        if frame_label:
+            metadata["frame_label"] = frame_label
+        if focus_x is not None:
+            metadata["focus_x"] = focus_x
+        if focus_y is not None:
+            metadata["focus_y"] = focus_y
+        if extracted_text:
+            metadata["extracted_text"] = extracted_text
+        return metadata
+
+    async def _refresh_snapshot(self) -> None:
+        if self._page is None:
+            self._snapshot = BrowserSnapshot()
+            return
+        pages = [page for page in self._pages if not getattr(page, "is_closed", lambda: False)()]
+        self._pages = pages or [self._page]
+        title = ""
+        try:
+            title = await self._page.title()
+        except Exception:  # noqa: BLE001
+            title = ""
+        self._snapshot = BrowserSnapshot(
+            active=True,
+            active_url=str(getattr(self._page, "url", "") or ""),
+            active_title=title,
+            tab_count=len(self._pages),
         )
 
     async def _selector_focus(self, selector: str) -> tuple[float, float]:
@@ -425,42 +389,26 @@ class BrowserTool(BaseTool):
             max(0.0, min(1.0, float(y) / height)),
         )
 
-    def _default_focus(
-        self,
-        *,
-        x: float = _DEFAULT_FOCUS[0],
-        y: float = _DEFAULT_FOCUS[1],
-    ) -> tuple[float, float]:
+    def _default_focus(self, *, x: float = _DEFAULT_FOCUS[0], y: float = _DEFAULT_FOCUS[1]) -> tuple[float, float]:
         size = self._page.viewport_size or {"width": 1280, "height": 720}
         width = float(size.get("width", 1280))
         height = float(size.get("height", 720))
         return (x * width, y * height)
 
     @staticmethod
-    def _default_focus_normalized(
-        *,
-        x: float = _DEFAULT_FOCUS[0],
-        y: float = _DEFAULT_FOCUS[1],
-    ) -> tuple[float, float]:
+    def _default_focus_normalized(*, x: float = _DEFAULT_FOCUS[0], y: float = _DEFAULT_FOCUS[1]) -> tuple[float, float]:
         return (
             max(0.0, min(1.0, float(x))),
             max(0.0, min(1.0, float(y))),
         )
 
     def _normalize_preview_focus(self, x: float | None, y: float | None) -> tuple[float, float]:
-        if x is None or y is None:
-            return self._default_focus_normalized()
-        if self._page is None:
+        if x is None or y is None or self._page is None:
             return self._default_focus_normalized()
         return self._normalize_focus(float(x), float(y))
 
     @staticmethod
-    def _preview_payload(
-        *,
-        frame_label: str,
-        summary: str,
-        focus: tuple[float, float],
-    ) -> dict[str, Any]:
+    def _preview_payload(*, frame_label: str, summary: str, focus: tuple[float, float]) -> dict[str, Any]:
         focus_x, focus_y = focus
         return {
             "frame_label": frame_label,
@@ -473,3 +421,58 @@ class BrowserTool(BaseTool):
     def _short_url(url: str) -> str:
         compact = url.replace("https://", "").replace("http://", "").rstrip("/")
         return compact.removeprefix("www.") or url
+
+
+class BrowserSessionManager:
+    """Creates and reuses thread-scoped browser sessions."""
+
+    def __init__(self) -> None:
+        self._runtimes: dict[tuple[str, bool], BrowserRuntime] = {}
+        self._sessions: dict[str, BrowserSession] = {}
+        self._session_runtime_key: dict[str, tuple[str, bool]] = {}
+        self._lock = asyncio.Lock()
+
+    async def session_for(
+        self,
+        *,
+        thread_id: str,
+        browser_type: Literal["chromium", "firefox", "webkit"] = "chromium",
+        headless: bool = False,
+    ) -> BrowserSession:
+        async with self._lock:
+            existing = self._sessions.get(thread_id)
+            if existing is not None:
+                return existing
+            runtime_key = (browser_type, bool(headless))
+            runtime = self._runtimes.get(runtime_key)
+            if runtime is None:
+                runtime = BrowserRuntime(browser_type=browser_type, headless=headless)
+                self._runtimes[runtime_key] = runtime
+            session = BrowserSession(thread_id=thread_id, runtime=runtime)
+            self._sessions[thread_id] = session
+            self._session_runtime_key[thread_id] = runtime_key
+            return session
+
+    def snapshot(self, thread_id: str) -> BrowserSnapshot:
+        session = self._sessions.get(thread_id)
+        if session is None:
+            return BrowserSnapshot()
+        return session.snapshot()
+
+    async def close(self) -> None:
+        runtimes = list(self._runtimes.values())
+        self._sessions.clear()
+        self._session_runtime_key.clear()
+        self._runtimes.clear()
+        for runtime in runtimes:
+            await runtime.close()
+
+    def snapshot_payload(self, thread_id: str) -> dict[str, Any]:
+        snapshot = self.snapshot(thread_id)
+        return {
+            "browser_session_active": snapshot.active,
+            "active_url": snapshot.active_url,
+            "active_title": snapshot.active_title,
+            "tab_count": snapshot.tab_count,
+            "browser": asdict(snapshot),
+        }

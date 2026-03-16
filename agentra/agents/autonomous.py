@@ -14,10 +14,11 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
 
+from agentra.approval_policy import ApprovalPolicyContext, ApprovalPolicyEngine
 from agentra.config import AgentConfig
 from agentra.llm.base import LLMMessage, LLMProvider, LLMSession, LLMToolResult
 from agentra.llm.factory import get_embedding_provider, get_provider
-from agentra.memory.embedding_memory import EmbeddingMemory
+from agentra.memory.embedding_memory import LongTermMemoryStore, ThreadWorkingMemory
 from agentra.memory.workspace import WorkspaceManager
 from agentra.tools.base import BaseTool, ToolResult
 from agentra.tools.browser import BrowserTool
@@ -74,11 +75,17 @@ class AutonomousAgent:
             self.embedding_provider = get_embedding_provider(self.config)
 
         self.workspace = WorkspaceManager(self.config.workspace_dir)
-        self.memory = EmbeddingMemory(
+        self.working_memory = ThreadWorkingMemory(
             memory_dir=self.config.memory_dir,
             embed_provider=self.embedding_provider,
             screenshot_history=self.config.screenshot_history,
         )
+        self.long_term_memory = LongTermMemoryStore(
+            memory_dir=self.config.long_term_memory_dir,
+            embed_provider=self.embedding_provider,
+            screenshot_history=self.config.screenshot_history,
+        )
+        self.memory = self.working_memory
 
         self.tools: dict[str, BaseTool] = {}
         if tools is not None:
@@ -95,6 +102,9 @@ class AutonomousAgent:
         self._runtime_controller: Any = None
         self._execution_scheduler: Any = None
         self._thread_id: str | None = None
+        self._run_id: str | None = None
+        self._goal: str = ""
+        self._approval_engine = ApprovalPolicyEngine.default()
 
     async def run(self, goal: str) -> AsyncIterator[dict[str, Any]]:
         """
@@ -106,13 +116,14 @@ class AutonomousAgent:
         self._interrupt.clear()
         self._resume_event.set()
         self._running = True
+        self._goal = goal
         self._session = self.llm.start_session(
             system_message=self._system_message(),
             tools=self._tool_schemas(),
         )
 
         self._session.append(LLMMessage(role="user", content=goal))
-        await self.memory.add(goal, role="user")
+        await self._remember(goal, role="user", source_type="goal")
 
         iteration = 0
 
@@ -131,7 +142,7 @@ class AutonomousAgent:
                     }
 
                     extra_messages: list[LLMMessage] = []
-                    screenshots = self.memory.recent_screenshots()
+                    screenshots = self.working_memory.recent_screenshots()
                     if screenshots:
                         extra_messages.append(
                             LLMMessage(
@@ -140,6 +151,9 @@ class AutonomousAgent:
                                 images=screenshots,
                             )
                         )
+                    memory_message = await self._long_term_memory_message(goal)
+                    if memory_message is not None:
+                        extra_messages.append(memory_message)
 
                     response = await self._session.complete(
                         extra_messages=extra_messages or None,
@@ -149,10 +163,15 @@ class AutonomousAgent:
 
                     if response.content:
                         yield {"type": "thought", "content": response.content}
-                        await self.memory.add(response.content, role="assistant")
+                        await self._remember(
+                            response.content,
+                            role="assistant",
+                            source_type="assistant_thought",
+                        )
                         done_content = self._extract_done_content(response.content)
                         if done_content is not None:
-                            self.workspace.snapshot(f"task: {goal[:60]}")
+                            if self._thread_id is None:
+                                self.workspace.snapshot(f"task: {goal[:60]}")
                             yield {"type": "done", "content": done_content}
                             return
                         if not response.tool_calls:
@@ -161,7 +180,7 @@ class AutonomousAgent:
                                 yield question_event
                                 answer = await self._wait_for_user_answer(str(question_event["request_id"]))
                                 self._session.append(LLMMessage(role="user", content=answer))
-                                await self.memory.add(answer, role="user")
+                                await self._remember(answer, role="user", source_type="user_answer")
                                 continue
 
                     if response.tool_calls:
@@ -187,7 +206,12 @@ class AutonomousAgent:
                                 if not approved:
                                     result = ToolResult(success=False, error="User rejected this action.")
                                     result_text = str(result)
-                                    await self.memory.add(result_text, role="observation")
+                                    await self._remember(
+                                        result_text,
+                                        role="observation",
+                                        source_type="tool_result",
+                                        metadata={"tool": tool_name, "summary": "User rejected this action."},
+                                    )
                                     yield {
                                         "type": "tool_result",
                                         "tool": tool_name,
@@ -237,7 +261,8 @@ class AutonomousAgent:
                         }
                         return
 
-                self.workspace.snapshot("chore: iteration limit reached")
+                if self._thread_id is None:
+                    self.workspace.snapshot("chore: iteration limit reached")
                 yield {
                     "type": "done",
                     "content": (
@@ -289,11 +314,21 @@ class AutonomousAgent:
         controller: Any = None,
         scheduler: Any = None,
         thread_id: str | None = None,
+        run_id: str | None = None,
+        browser_sessions: Any = None,
+        approval_engine: ApprovalPolicyEngine | None = None,
     ) -> None:
         """Attach thread-aware runtime primitives to the agent."""
         self._runtime_controller = controller
         self._execution_scheduler = scheduler
         self._thread_id = thread_id
+        self._run_id = run_id
+        if approval_engine is not None:
+            self._approval_engine = approval_engine
+        for tool in self.tools.values():
+            binder = getattr(tool, "bind_runtime", None)
+            if callable(binder):
+                binder(browser_sessions=browser_sessions, thread_id=thread_id)
 
     async def take_control(self) -> None:
         """Pause the agent and let the user take over."""
@@ -517,6 +552,136 @@ class AutonomousAgent:
             if str(tool_args.get("action", "")).lower() != "screenshot":
                 return "Direct desktop control requires explicit user approval."
         return None
+
+    def _prepare_approval_event(self, tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any] | None:
+        if self._runtime_controller is None:
+            return None
+        decision = self._approval_engine.evaluate(
+            ApprovalPolicyContext(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                goal=self._goal,
+                thread_id=self._thread_id,
+                run_id=self._run_id,
+            )
+        )
+        if decision.action != "require_approval":
+            return None
+        creator = getattr(self._runtime_controller, "create_approval", None)
+        if not callable(creator):
+            return None
+        request = creator(
+            tool_name,
+            tool_args,
+            decision.summary,
+            decision.reason,
+            rule_id=decision.rule_id,
+            risk_level=decision.risk_level,
+        )
+        return {
+            "type": "approval_requested",
+            "request_id": request.request_id,
+            "tool": tool_name,
+            "args": tool_args,
+            "reason": decision.reason,
+            "summary": decision.summary,
+            "rule_id": decision.rule_id,
+            "risk_level": decision.risk_level,
+        }
+
+    async def _emit_tool_result_events(self, tool_name: str, result: ToolResult) -> AsyncIterator[dict[str, Any]]:
+        if result.screenshot_b64:
+            screenshot_event = {"type": "screenshot", "data": result.screenshot_b64}
+            screenshot_event.update(
+                {
+                    key: value
+                    for key, value in result.metadata.items()
+                    if key in {"focus_x", "focus_y", "frame_label", "summary"}
+                }
+            )
+            await self._remember(
+                f"Screenshot after {tool_name}",
+                role="observation",
+                screenshot_b64=result.screenshot_b64,
+                source_type="screenshot",
+                metadata={
+                    "tool": tool_name,
+                    "summary": result.metadata.get("summary", ""),
+                    "url": result.metadata.get("active_url", ""),
+                    "active_title": result.metadata.get("active_title", ""),
+                    "extracted_text": result.metadata.get("extracted_text", ""),
+                },
+            )
+            yield screenshot_event
+
+        result_text = str(result)
+        await self._remember(
+            result_text,
+            role="observation",
+            source_type="tool_result",
+            metadata={
+                "tool": tool_name,
+                "summary": result.metadata.get("summary", ""),
+                "url": result.metadata.get("active_url", ""),
+                "active_title": result.metadata.get("active_title", ""),
+                "extracted_text": result.metadata.get("extracted_text", ""),
+            },
+        )
+        tool_result_event = {
+            "type": "tool_result",
+            "tool": tool_name,
+            "result": result_text,
+            "success": result.success,
+        }
+        if result.metadata:
+            tool_result_event["metadata"] = result.metadata
+            if result.metadata.get("summary"):
+                tool_result_event["summary"] = result.metadata["summary"]
+        yield tool_result_event
+
+    async def _remember(
+        self,
+        text: str,
+        *,
+        role: str,
+        source_type: str,
+        screenshot_b64: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "thread_id": self._thread_id or "",
+            "run_id": self._run_id or "",
+            "source_type": source_type,
+        }
+        if metadata:
+            payload.update({key: value for key, value in metadata.items() if value not in (None, "")})
+        await self.working_memory.add(text, role=role, screenshot_b64=screenshot_b64, metadata=payload)
+        await self.long_term_memory.add(text, role=role, screenshot_b64=screenshot_b64, metadata=payload)
+
+    async def _long_term_memory_message(self, goal: str) -> LLMMessage | None:
+        try:
+            results = await self.long_term_memory.search(goal, top_k=3)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Long-term memory search failed: %s", exc)
+            return None
+
+        lines: list[str] = []
+        seen: set[str] = set()
+        for item in results:
+            if item.metadata.get("run_id") == self._run_id:
+                continue
+            snippet = item.text.strip()
+            if not snippet:
+                continue
+            compact = snippet[:220]
+            if compact in seen:
+                continue
+            seen.add(compact)
+            label = item.metadata.get("summary") or item.metadata.get("source_type") or item.role
+            lines.append(f"- {label}: {compact}")
+        if not lines:
+            return None
+        return LLMMessage(role="user", content="Relevant memory from previous runs:\n" + "\n".join(lines))
 
     async def _shutdown_tools(self) -> None:
         for tool in self.tools.values():

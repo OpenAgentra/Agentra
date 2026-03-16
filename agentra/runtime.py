@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from agentra.approval_policy import ApprovalPolicyEngine
+from agentra.browser_runtime import BrowserSessionManager
 from agentra.config import AgentConfig
 from agentra.llm.registry import get_provider_spec
 from agentra.run_report import RunReport
@@ -39,6 +41,8 @@ class ApprovalRequest:
     reason: str
     summary: str
     status: str = "pending"
+    rule_id: str | None = None
+    risk_level: str = "medium"
     created_at: str = field(default_factory=_now_iso)
     responded_at: str | None = None
     decision_note: str | None = None
@@ -95,6 +99,7 @@ class ThreadSession:
     thread_dir: Path
     workspace_dir: Path
     memory_dir: Path
+    long_term_memory_dir: Path
     config: AgentConfig
     ledger: "WorkspaceLedger"
     status: str = "idle"
@@ -141,9 +146,10 @@ class WorkspaceLedger:
     def __init__(self, thread_dir: Path) -> None:
         self.thread_dir = thread_dir
         self.path = thread_dir / "ledger.json"
+        self.audit_path = thread_dir / "audit.jsonl"
         self.thread_dir.mkdir(parents=True, exist_ok=True)
 
-    def write_snapshot(self, thread: ThreadSession, runs: list[RunSession]) -> None:
+    def write_snapshot(self, thread: ThreadSession, runs: list[RunSession], *, browser: dict[str, Any] | None = None) -> None:
         payload = {
             "thread_id": thread.thread_id,
             "title": thread.title,
@@ -153,6 +159,7 @@ class WorkspaceLedger:
             "current_run_id": thread.current_run_id,
             "workspace_dir": str(thread.workspace_dir),
             "memory_dir": str(thread.memory_dir),
+            "long_term_memory_dir": str(thread.long_term_memory_dir),
             "runs": [
                 {
                     "run_id": run.run_id,
@@ -167,8 +174,41 @@ class WorkspaceLedger:
             "approvals": [asdict(item) for item in thread.approval_requests.values()],
             "questions": [asdict(item) for item in thread.question_requests.values()],
             "human_actions": [asdict(item) for item in thread.human_actions],
+            "browser": browser or {},
+            "audit": self.entries(),
         }
         self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def append_entry(
+        self,
+        entry_type: str,
+        *,
+        run_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "entry_id": f"{entry_type}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+            "entry_type": entry_type,
+            "timestamp": _now_iso(),
+            "run_id": run_id,
+            "details": details or {},
+        }
+        with self.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return payload
+
+    def entries(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
+        if not self.audit_path.exists():
+            return []
+        entries: list[dict[str, Any]] = []
+        for raw_line in self.audit_path.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            if run_id is not None and item.get("run_id") != run_id:
+                continue
+            entries.append(item)
+        return entries
 
 
 class ThreadRuntimeController:
@@ -190,7 +230,16 @@ class ThreadRuntimeController:
     def resume(self) -> None:
         self._resume_event.set()
 
-    def create_approval(self, tool: str, args: dict[str, Any], summary: str, reason: str) -> ApprovalRequest:
+    def create_approval(
+        self,
+        tool: str,
+        args: dict[str, Any],
+        summary: str,
+        reason: str,
+        *,
+        rule_id: str | None = None,
+        risk_level: str = "medium",
+    ) -> ApprovalRequest:
         request_id = f"approval-{self.thread_id}-{len(self._approval_futures) + 1:03d}"
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self._approval_futures[request_id] = future
@@ -200,6 +249,8 @@ class ThreadRuntimeController:
             args=args,
             summary=summary,
             reason=reason,
+            rule_id=rule_id,
+            risk_level=risk_level,
         )
 
     async def wait_for_approval(self, request_id: str) -> bool:
@@ -244,6 +295,8 @@ class ThreadManager:
         self.base_config = base_config
         self._agent_factory = agent_factory or _default_agent_factory
         self.scheduler = ExecutionScheduler()
+        self.approval_engine = ApprovalPolicyEngine.default()
+        self.browser_sessions = BrowserSessionManager()
         self._threads: dict[str, ThreadSession] = {}
         self._runs: dict[str, RunSession] = {}
         self._run_to_thread: dict[str, str] = {}
@@ -295,6 +348,11 @@ class ThreadManager:
             if thread.controller is None:
                 thread.controller = ThreadRuntimeController(thread.thread_id)
             thread.controller.resume()
+            thread.ledger.append_entry(
+                "run_started",
+                run_id=run.run_id,
+                details={"goal": request.goal, "status": "running"},
+            )
             self._persist_thread(thread)
             run.task = asyncio.create_task(self._run_session(thread.thread_id, run.run_id))
             return self.snapshot_for_http(run)
@@ -394,6 +452,18 @@ class ThreadManager:
         request.responded_at = _now_iso()
         if thread.controller is not None:
             thread.controller.resolve_approval(request_id, approved)
+        thread.ledger.append_entry(
+            "approval_resolved",
+            run_id=thread.current_run_id,
+            details={
+                "request_id": request_id,
+                "tool": request.tool,
+                "approved": approved,
+                "rule_id": request.rule_id,
+                "risk_level": request.risk_level,
+                "note": note,
+            },
+        )
 
         run = self.current_run(thread_id)
         if run is not None:
@@ -406,7 +476,7 @@ class ThreadManager:
             }
             stored = run.report.record(payload)
             await self._broadcast(run, {"kind": "event", "event": self._event_for_http(run.run_id, stored)})
-            if approved and thread.status == "blocked_waiting_user":
+            if thread.status == "blocked_waiting_user":
                 thread.status = "running"
         self._persist_thread(thread)
         return self.thread_snapshot_for_http(thread)
@@ -419,6 +489,11 @@ class ThreadManager:
         request.responded_at = _now_iso()
         if thread.controller is not None:
             thread.controller.resolve_question(request_id, answer)
+        thread.ledger.append_entry(
+            "question_answered",
+            run_id=thread.current_run_id,
+            details={"request_id": request_id, "answer": answer},
+        )
 
         run = self.current_run(thread_id)
         if run is not None:
@@ -458,6 +533,11 @@ class ThreadManager:
         result = await performer(tool, args)
         action = HumanAction(action_id=f"manual-{len(thread.human_actions) + 1:03d}", tool=tool, args=args)
         thread.human_actions.append(action)
+        thread.ledger.append_entry(
+            "human_action",
+            run_id=thread.current_run_id,
+            details={"action_id": action.action_id, "tool": tool, "args": args},
+        )
 
         if result.screenshot_b64:
             screenshot_event = {"type": "screenshot", "data": result.screenshot_b64}
@@ -509,6 +589,8 @@ class ThreadManager:
         snapshot["steps"] = _build_steps(snapshot["events"])
         snapshot["approval_requests"] = [asdict(item) for item in thread.approval_requests.values()]
         snapshot["question_requests"] = [asdict(item) for item in thread.question_requests.values()]
+        snapshot["audit"] = thread.ledger.entries(run_id=session.run_id)
+        snapshot.update(self.browser_sessions.snapshot_payload(thread.thread_id))
         return snapshot
 
     def thread_snapshot_for_http(self, thread: ThreadSession) -> dict[str, Any]:
@@ -521,6 +603,7 @@ class ThreadManager:
             "created_at": thread.created_at,
             "workspace_dir": str(thread.workspace_dir),
             "memory_dir": str(thread.memory_dir),
+            "long_term_memory_dir": str(thread.long_term_memory_dir),
             "current_run_id": thread.current_run_id,
             "runs": [
                 self._run_summary_for_http(self._runs[run_id])
@@ -530,6 +613,8 @@ class ThreadManager:
             "approval_requests": [asdict(item) for item in thread.approval_requests.values()],
             "question_requests": [asdict(item) for item in thread.question_requests.values()],
             "active_run": self.snapshot_for_http(current) if current is not None else None,
+            "audit": thread.ledger.entries(run_id=thread.current_run_id) if thread.current_run_id else [],
+            **self.browser_sessions.snapshot_payload(thread.thread_id),
         }
 
     async def _run_session(self, thread_id: str, run_id: str) -> None:
@@ -546,6 +631,9 @@ class ThreadManager:
                     controller=thread.controller,
                     scheduler=self.scheduler,
                     thread_id=thread.thread_id,
+                    run_id=session.run_id,
+                    browser_sessions=self.browser_sessions,
+                    approval_engine=self.approval_engine,
                 )
 
             generator = await agent.run(session.goal)
@@ -573,6 +661,9 @@ class ThreadManager:
                 {"kind": "event", "event": self._event_for_http(session.run_id, stored)},
             )
         finally:
+            workspace_audit = self._capture_workspace_audit(thread, session)
+            for entry in workspace_audit:
+                session.report.record_audit(entry)
             session.status = status
             session.finished_at = _now_iso()
             session.report.finalize(status)
@@ -588,6 +679,11 @@ class ThreadManager:
             thread.handoff_state = "agent"
             if thread.controller is not None:
                 thread.controller.resume()
+            thread.ledger.append_entry(
+                "run_finished",
+                run_id=session.run_id,
+                details={"status": status, "workspace_audit": workspace_audit},
+            )
             self._persist_thread(thread)
             snapshot = self.snapshot_for_http(session)
             await self._broadcast(session, {"kind": "status", "status": status, "snapshot": snapshot})
@@ -604,9 +700,22 @@ class ThreadManager:
                 args=dict(event.get("args", {})),
                 reason=str(event.get("reason", "")),
                 summary=str(event.get("summary", "")),
+                rule_id=str(event.get("rule_id", "") or "") or None,
+                risk_level=str(event.get("risk_level", "medium")),
             )
             thread.approval_requests[request.request_id] = request
             thread.status = "blocked_waiting_user"
+            thread.ledger.append_entry(
+                "approval_requested",
+                run_id=thread.current_run_id,
+                details={
+                    "request_id": request.request_id,
+                    "tool": request.tool,
+                    "reason": request.reason,
+                    "rule_id": request.rule_id,
+                    "risk_level": request.risk_level,
+                },
+            )
         elif event_type == "question_requested":
             request = UserInputRequest(
                 request_id=str(event["request_id"]),
@@ -615,6 +724,21 @@ class ThreadManager:
             )
             thread.question_requests[request.request_id] = request
             thread.status = "blocked_waiting_user"
+            thread.ledger.append_entry(
+                "question_requested",
+                run_id=thread.current_run_id,
+                details={"request_id": request.request_id, "prompt": request.prompt},
+            )
+        elif event_type == "screenshot":
+            thread.ledger.append_entry(
+                "artifact_recorded",
+                run_id=thread.current_run_id,
+                details={
+                    "frame_id": event.get("frame_id"),
+                    "frame_label": event.get("frame_label"),
+                    "image_path": event.get("image_path"),
+                },
+            )
         elif event_type == "done":
             thread.status = "completed"
         elif event_type == "error":
@@ -622,6 +746,44 @@ class ThreadManager:
         elif event_type not in {"paused", "resumed"} and thread.status not in {"paused_for_user", "blocked_waiting_user"}:
             thread.status = "running"
         self._persist_thread(thread)
+
+    def _capture_workspace_audit(self, thread: ThreadSession, session: RunSession) -> list[dict[str, Any]]:
+        agent = session.agent
+        workspace = getattr(agent, "workspace", None)
+        if workspace is None:
+            return []
+        checkpoint = getattr(workspace, "checkpoint", None)
+        if not callable(checkpoint):
+            return []
+        try:
+            summary = checkpoint(f"task: {session.goal[:60]}")
+        except Exception:  # noqa: BLE001
+            return []
+        audit_entries: list[dict[str, Any]] = []
+        if summary.before_sha or summary.after_sha:
+            audit_entries.append(
+                thread.ledger.append_entry(
+                    "workspace_checkpoint",
+                    run_id=session.run_id,
+                    details={
+                        "before_sha": summary.before_sha,
+                        "after_sha": summary.after_sha,
+                        "status": summary.status,
+                    },
+                )
+            )
+        if summary.changed_files or summary.diff_stats:
+            audit_entries.append(
+                thread.ledger.append_entry(
+                    "workspace_diff",
+                    run_id=session.run_id,
+                    details={
+                        "changed_files": summary.changed_files,
+                        "diff_stats": summary.diff_stats,
+                    },
+                )
+            )
+        return audit_entries
 
     async def _broadcast(self, session: RunSession, payload: EventPayload) -> None:
         stale: list[asyncio.Queue[EventPayload]] = []
@@ -672,9 +834,11 @@ class ThreadManager:
         thread_dir = threads_root / thread_id
         workspace_dir = thread_dir / "workspace"
         memory_dir = workspace_dir / ".memory"
+        long_term_memory_dir = base_root / ".memory-global"
         overrides = self.base_config.model_dump()
         overrides["workspace_dir"] = workspace_dir
         overrides["memory_dir"] = memory_dir
+        overrides["long_term_memory_dir"] = long_term_memory_dir
         config = AgentConfig(**overrides)
         thread = ThreadSession(
             thread_id=thread_id,
@@ -682,6 +846,7 @@ class ThreadManager:
             thread_dir=thread_dir,
             workspace_dir=workspace_dir,
             memory_dir=memory_dir,
+            long_term_memory_dir=long_term_memory_dir,
             config=config,
             ledger=WorkspaceLedger(thread_dir),
             controller=ThreadRuntimeController(thread_id),
@@ -694,6 +859,7 @@ class ThreadManager:
         overrides: dict[str, Any] = self.base_config.model_dump()
         overrides["workspace_dir"] = thread.workspace_dir
         overrides["memory_dir"] = thread.memory_dir
+        overrides["long_term_memory_dir"] = thread.long_term_memory_dir
         if getattr(request, "provider", None):
             overrides["llm_provider"] = request.provider
             if not getattr(request, "model", None):
@@ -718,7 +884,7 @@ class ThreadManager:
 
     def _persist_thread(self, thread: ThreadSession) -> None:
         runs = [self._runs[run_id] for run_id in thread.run_ids if run_id in self._runs]
-        thread.ledger.write_snapshot(thread, runs)
+        thread.ledger.write_snapshot(thread, runs, browser=self.browser_sessions.snapshot_payload(thread.thread_id))
         registry = []
         for item in sorted(self._threads.values(), key=lambda entry: entry.created_at):
             registry.append(

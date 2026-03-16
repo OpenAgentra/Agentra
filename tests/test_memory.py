@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from agentra.memory.embedding_memory import EmbeddingMemory, MemoryEntry
+from agentra.memory.embedding_memory import EmbeddingMemory, LongTermMemoryStore, MemoryEntry, MemoryScope, ThreadWorkingMemory
 
 
 @pytest.fixture
@@ -152,3 +152,22 @@ async def test_fallback_when_embed_fn_raises(tmp_path):
     # Should not raise — falls back to trivial embed
     entry = await mem.add("test text")
     assert entry.embedding  # still has a non-empty embedding
+
+
+@pytest.mark.asyncio
+async def test_dual_memory_scopes_and_metadata_filters(tmp_path):
+    working = ThreadWorkingMemory(memory_dir=tmp_path / ".thread-memory")
+    long_term = LongTermMemoryStore(memory_dir=tmp_path / ".long-term-memory")
+
+    await working.add("Current thread note", metadata={"thread_id": "thread-a", "run_id": "run-a"})
+    await long_term.add(
+        "Past run note",
+        metadata={"thread_id": "thread-b", "run_id": "run-b", "summary": "Past run"},
+    )
+
+    working_recent = working.recent()
+    long_term_results = await long_term.search("Past run", metadata_filters={"thread_id": "thread-b"})
+
+    assert working_recent[0].scope == MemoryScope.THREAD
+    assert long_term_results[0].scope == MemoryScope.LONG_TERM
+    assert long_term_results[0].metadata["run_id"] == "run-b"

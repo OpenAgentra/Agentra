@@ -11,6 +11,7 @@ import pytest
 from agentra.agents.autonomous import AutonomousAgent
 from agentra.config import AgentConfig
 from agentra.llm.base import LLMProvider, LLMResponse
+from agentra.memory.workspace import WorkspaceManager
 from agentra.runtime import ExecutionScheduler, ThreadManager
 from agentra.tools.base import BaseTool, ToolResult
 
@@ -110,6 +111,21 @@ class ApprovalLLM(LLMProvider):
 
     async def embed(self, text: str) -> list[float]:
         return [0.0] * 256
+
+
+class WorkspaceWritingAgent:
+    def __init__(self, config: AgentConfig) -> None:
+        self.config = config
+        self.workspace = WorkspaceManager(config.workspace_dir)
+
+    async def run(self, goal: str):
+        self.workspace.init()
+        (self.config.workspace_dir / "artifact.txt").write_text(goal, encoding="utf-8")
+
+        async def generator():
+            yield {"type": "done", "content": f"DONE: {goal}"}
+
+        return generator()
 
 
 async def _wait_for_run(manager: ThreadManager, run_id: str, timeout: float = 3.0):
@@ -218,3 +234,18 @@ async def test_thread_manager_requires_approval_for_risky_actions(base_config: A
     assert final_snapshot["status"] == "completed"
     assert any(event["type"] == "approval_requested" for event in final_snapshot["events"])
     assert any(event["type"] == "approved" for event in final_snapshot["events"])
+    assert final_snapshot["approval_requests"][0]["rule_id"] == "terminal-install-or-side-effect"
+    assert final_snapshot["approval_requests"][0]["risk_level"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_thread_manager_captures_workspace_audit(base_config: AgentConfig) -> None:
+    manager = ThreadManager(base_config, agent_factory=lambda cfg: WorkspaceWritingAgent(cfg))
+
+    snapshot = await manager.start_run(RuntimeRequest(goal="write artifact"))
+    session = await _wait_for_run(manager, snapshot["run_id"])
+    final_snapshot = manager.snapshot_for_http(session)
+
+    entry_types = [entry["entry_type"] for entry in final_snapshot["audit"]]
+    assert "workspace_checkpoint" in entry_types
+    assert "workspace_diff" in entry_types

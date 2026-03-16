@@ -51,11 +51,20 @@ class RunReport:
     def frames(self) -> list[dict[str, Any]]:
         return self.store.frames
 
+    @property
+    def audit(self) -> list[dict[str, Any]]:
+        return self.store.audit
+
     def snapshot(self) -> dict[str, Any]:
         return self.store.snapshot()
 
     def record(self, event: dict[str, Any]) -> dict[str, Any]:
         stored = self.store.record(event)
+        self._write_html()
+        return stored
+
+    def record_audit(self, entry: dict[str, Any]) -> dict[str, Any]:
+        stored = self.store.record_audit(entry)
         self._write_html()
         return stored
 
@@ -79,6 +88,7 @@ class RunReport:
         status = str(snapshot.get("status", "running"))
         events = snapshot.get("events", [])
         frames = snapshot.get("frames", [])
+        audit = snapshot.get("audit", [])
         refresh = '<meta http-equiv="refresh" content="2" />' if status == "running" else ""
         event_cards = "\n".join(self._render_event(event) for event in events) or (
             '<section class="card empty"><h2>Waiting for events</h2>'
@@ -91,6 +101,7 @@ class RunReport:
             else ""
         )
         frame_strip = self._render_frame_strip(frames)
+        audit_strip = self._render_audit_strip(audit)
 
         return f"""<!doctype html>
 <html lang="en">
@@ -268,7 +279,7 @@ class RunReport:
       font-size: 13px;
       color: var(--text);
     }}
-    .timeline {{
+    .timeline, .audit-strip {{
       display: grid;
       gap: 14px;
     }}
@@ -375,6 +386,7 @@ class RunReport:
       </aside>
     </section>
     {frame_strip}
+    {audit_strip}
     <section class="timeline">
       {event_cards}
     </section>
@@ -400,6 +412,15 @@ class RunReport:
         return (
             '<section class="card"><h2>Frame Timeline</h2>'
             f'<div class="frame-strip">{cards}</div></section>'
+        )
+
+    def _render_audit_strip(self, audit: list[dict[str, Any]]) -> str:
+        if not audit:
+            return ""
+        cards = "\n".join(self._render_audit_entry(entry) for entry in audit)
+        return (
+            '<section class="card"><h2>Audit Trail</h2>'
+            f'<div class="audit-strip">{cards}</div></section>'
         )
 
     def _render_event(self, event: dict[str, Any]) -> str:
@@ -472,6 +493,13 @@ class RunReport:
             f'<div class="eyebrow"><span>{html.escape(title)}</span><span>{timestamp}</span></div>'
             f"{body}</section>"
         )
+
+    def _render_audit_entry(self, entry: dict[str, Any]) -> str:
+        title = str(entry.get("entry_type", "audit")).replace("_", " ").title()
+        timestamp = html.escape(str(entry.get("timestamp", "")))
+        details = entry.get("details", {})
+        body = self._content_block(json.dumps(details, indent=2, ensure_ascii=False))
+        return self._event_shell("audit", title, timestamp, body)
 
     @staticmethod
     def _content_block(content: Any) -> str:

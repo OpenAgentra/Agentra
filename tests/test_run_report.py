@@ -85,3 +85,27 @@ def test_run_report_renders_error_state_with_wrapped_path(tmp_path):
     assert 'class="status error"' in html_text
     assert "thought_signature" in html_text
     assert "overflow-wrap: anywhere" in html_text
+
+
+def test_run_report_renders_audit_trail(tmp_path):
+    report = RunReport(
+        workspace_dir=tmp_path,
+        goal="Audit demo",
+        provider="gemini",
+        model="gemini-3-flash-preview",
+    )
+
+    report.record_audit(
+        {
+            "entry_type": "workspace_checkpoint",
+            "timestamp": "2026-03-16T12:00:00",
+            "details": {"before_sha": "abc12345", "after_sha": "def67890"},
+        }
+    )
+    report.finalize("completed")
+
+    html_text = report.html_path.read_text(encoding="utf-8")
+    payload = json.loads(report.events_path.read_text(encoding="utf-8"))
+
+    assert "Audit Trail" in html_text
+    assert "workspace_checkpoint" in payload["audit"][0]["entry_type"]
