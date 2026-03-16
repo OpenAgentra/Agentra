@@ -1972,6 +1972,601 @@ mount();
 """
 
 
+def _app_script_render() -> str:
+    return """
+function statusLabel(status) {
+  if (status === "loading") return "YÜKLENİYOR";
+  if (status === "running") return "ÇALIŞIYOR";
+  if (status === "completed") return "TAMAMLANDI";
+  if (status === "error") return "HATA";
+  if (status === "partial") return "KISMİ";
+  return "HAZIR";
+}
+
+function threadStatusLabel(status) {
+  if (status === "loading") return "YÜKLENİYOR";
+  if (status === "running") return "ÇALIŞIYOR";
+  if (status === "paused_for_user") return "DEVREDİLDİ";
+  if (status === "blocked_waiting_user") return "BEKLİYOR";
+  if (status === "completed") return "TAMAMLANDI";
+  if (status === "error") return "HATA";
+  return "HAZIR";
+}
+
+function loadingSummaryForThread(thread) {
+  const title = thread?.title || "Seçilen thread";
+  return `${title} yükleniyor...`;
+}
+
+function currentRunStatusLabel() {
+  if (state.isThreadSwitching || state.status === "loading") return "YÜKLENİYOR";
+  return statusLabel(state.status);
+}
+
+function currentOverlay(frame) {
+  if (state.isThreadSwitching || state.status === "loading") {
+    return {
+      busy: true,
+      summary: state.activity.summary || loadingSummaryForThread(state.activeThread),
+      focus_x: DEFAULT_FOCUS.x,
+      focus_y: DEFAULT_FOCUS.y,
+    };
+  }
+  if (state.status === "running" && (state.activity.mode === "thinking" || state.activity.mode === "acting")) {
+    return {
+      busy: true,
+      summary: state.activity.summary || (frame ? frame.display_summary : ""),
+      focus_x: typeof state.activity.focus_x === "number" ? state.activity.focus_x : (frame ? frame.focus_x : DEFAULT_FOCUS.x),
+      focus_y: typeof state.activity.focus_y === "number" ? state.activity.focus_y : (frame ? frame.focus_y : DEFAULT_FOCUS.y),
+    };
+  }
+  if (frame) {
+    return {
+      busy: false,
+      summary: frame.display_summary || "",
+      focus_x: typeof frame.focus_x === "number" ? frame.focus_x : DEFAULT_FOCUS.x,
+      focus_y: typeof frame.focus_y === "number" ? frame.focus_y : DEFAULT_FOCUS.y,
+    };
+  }
+  return {
+    busy: false,
+    summary: "",
+    focus_x: DEFAULT_FOCUS.x,
+    focus_y: DEFAULT_FOCUS.y,
+  };
+}
+
+function renderTimeline() {
+  const frame = currentFrame();
+  const frameIndex = frame ? Math.max(0, state.frames.findIndex((item) => item.id === frame.id)) : 0;
+  const label = document.getElementById("scrubber-label");
+  const track = document.getElementById("timeline-track");
+  const progress = document.getElementById("timeline-progress");
+  const handle = document.getElementById("timeline-handle");
+  const disabled = state.isThreadSwitching || !state.frames.length;
+  const percent = disabled ? 0 : (state.frames.length > 1 ? state.scrubPercent : 1);
+  const percentText = `${Math.max(0, Math.min(100, percent * 100))}%`;
+
+  label.textContent = state.frames.length ? `${frameIndex + 1} / ${state.frames.length}` : "0 / 0";
+  track.classList.toggle("disabled", disabled);
+  track.style.pointerEvents = disabled ? "none" : "auto";
+  track.style.opacity = disabled ? "0.58" : "1";
+  progress.style.width = percentText;
+  handle.style.left = percentText;
+  setInlineText("tv-status", currentRunStatusLabel());
+}
+"""
+
+
+def _app_script_mount() -> str:
+    return """
+Object.assign(state, {
+  pendingThreadId: state.pendingThreadId || null,
+  isThreadSwitching: false,
+  threadLoadToken: 0,
+  runLoadToken: 0,
+  streamToken: 0,
+});
+
+function previewThreadById(threadId) {
+  return state.threads.find((item) => item.thread_id === threadId) || null;
+}
+
+function syncSelectionToFrames() {
+  if (!state.frames.length) {
+    state.selectedFrameId = null;
+    state.scrubPercent = 0;
+    return;
+  }
+  if (state.liveMode || !state.selectedFrameId) {
+    state.selectedFrameId = state.frames[state.frames.length - 1].id;
+  } else if (!state.frames.find((frame) => frame.id === state.selectedFrameId)) {
+    state.selectedFrameId = state.frames[state.frames.length - 1].id;
+    state.liveMode = true;
+  }
+  const index = Math.max(0, state.frames.findIndex((frame) => frame.id === state.selectedFrameId));
+  state.scrubPercent = state.frames.length > 1 ? index / (state.frames.length - 1) : 1;
+}
+
+function disconnectStream() {
+  state.streamToken += 1;
+  if (state.source) {
+    state.source.close();
+    state.source = null;
+  }
+  state.streamRunId = null;
+}
+
+function clearRunState(options = {}) {
+  if (options.disconnect !== false) disconnectStream();
+  state.runId = null;
+  state.selectedRunId = null;
+  state.goal = "";
+  state.status = options.status || "idle";
+  state.events = [];
+  state.frames = [];
+  state.steps = [];
+  state.reportUrl = null;
+  state.liveMode = true;
+  state.historyMode = Boolean(options.history);
+  state.activity = {
+    mode: options.activityMode || "idle",
+    summary: options.summary || "",
+    focus_x: DEFAULT_FOCUS.x,
+    focus_y: DEFAULT_FOCUS.y,
+  };
+  syncSelectionToFrames();
+}
+
+function applySnapshot(snapshot, options = {}) {
+  state.runId = snapshot.run_id;
+  state.selectedRunId = snapshot.run_id;
+  state.goal = snapshot.goal || state.goal;
+  state.provider = snapshot.provider;
+  state.model = snapshot.model;
+  state.status = snapshot.status || state.status;
+  state.events = snapshot.events || [];
+  state.frames = snapshot.frames || [];
+  state.steps = snapshot.steps || buildSteps(state.events);
+  state.reportUrl = snapshot.report_url || null;
+  if (snapshot.thread_id) {
+    state.activeThreadId = snapshot.thread_id;
+    state.pendingThreadId = snapshot.thread_id;
+  }
+  state.isThreadSwitching = false;
+  state.historyMode = Boolean(options.history);
+  syncSelectionToFrames();
+  state.activity = deriveActivity(state.events, state.frames);
+  if (options.connect) {
+    connectStream(snapshot.run_id);
+  } else if (options.disconnect !== false) {
+    disconnectStream();
+  }
+  render();
+}
+
+function applyEvent(event) {
+  state.events = [...state.events, event];
+  const frame = frameFromEvent(event);
+  if (frame) state.frames = [...state.frames, frame];
+  if (event.type === "done" && state.status === "running") state.status = "completed";
+  if (event.type === "error") state.status = "error";
+  state.steps = buildSteps(state.events);
+  syncSelectionToFrames();
+  state.activity = deriveActivity(state.events, state.frames);
+  render();
+}
+
+function beginThreadSwitch(threadId) {
+  const preview = previewThreadById(threadId) || state.activeThread;
+  state.threadLoadToken += 1;
+  state.pendingThreadId = threadId;
+  state.activeThreadId = threadId;
+  state.activeThread = preview;
+  state.isThreadSwitching = true;
+  clearRunState({
+    status: "loading",
+    summary: loadingSummaryForThread(preview),
+    activityMode: "loading",
+    history: false,
+  });
+  render();
+  return state.threadLoadToken;
+}
+
+function setupScrubber() {
+  const track = document.getElementById("timeline-track");
+
+  function updateFromClientX(clientX) {
+    const rect = track.getBoundingClientRect();
+    if (!rect.width) return;
+    selectFrameByPercent((clientX - rect.left) / rect.width);
+  }
+
+  track.addEventListener("pointerdown", (event) => {
+    if (state.isThreadSwitching || !state.frames.length) return;
+    state.scrubDrag = { pointerId: event.pointerId };
+    track.setPointerCapture(event.pointerId);
+    updateFromClientX(event.clientX);
+  });
+
+  track.addEventListener("pointermove", (event) => {
+    if (!state.scrubDrag || state.scrubDrag.pointerId !== event.pointerId) return;
+    const clientX = event.clientX;
+    if (state.scrubDrag.raf) {
+      state.scrubDrag.pendingX = clientX;
+      return;
+    }
+    state.scrubDrag.pendingX = clientX;
+    state.scrubDrag.raf = window.requestAnimationFrame(() => {
+      updateFromClientX(state.scrubDrag.pendingX);
+      state.scrubDrag.raf = null;
+    });
+  });
+
+  function stopScrub(event) {
+    if (!state.scrubDrag || state.scrubDrag.pointerId !== event.pointerId) return;
+    if (state.scrubDrag.raf) window.cancelAnimationFrame(state.scrubDrag.raf);
+    track.releasePointerCapture?.(event.pointerId);
+    state.scrubDrag = null;
+  }
+
+  track.addEventListener("pointerup", stopScrub);
+  track.addEventListener("pointercancel", stopScrub);
+}
+
+function connectStream(runId) {
+  if (!runId) return;
+  if (state.streamRunId === runId && state.source) return;
+  disconnectStream();
+  const streamToken = state.streamToken;
+  state.streamRunId = runId;
+  const source = new EventSource(`/runs/${runId}/events`);
+  state.source = source;
+  source.onmessage = (message) => {
+    if (state.streamToken !== streamToken || state.streamRunId !== runId) return;
+    const payload = JSON.parse(message.data);
+    if (payload.kind === "snapshot") {
+      applySnapshot(payload.snapshot, { connect: false, disconnect: false, history: false });
+      return;
+    }
+    if (payload.kind === "event") {
+      applyEvent(payload.event);
+      return;
+    }
+    if (payload.kind === "status") {
+      state.status = payload.status || state.status;
+      applySnapshot(payload.snapshot, { connect: false, disconnect: false, history: false });
+      return;
+    }
+    if (payload.kind === "complete") {
+      state.status = payload.status || state.status;
+      state.activity = deriveActivity(state.events, state.frames);
+      if (state.streamToken === streamToken && state.source) {
+        state.source.close();
+        state.source = null;
+      }
+      if (state.streamToken === streamToken) state.streamRunId = null;
+      render();
+    }
+  };
+}
+
+async function loadRun(runId, options = {}) {
+  const runToken = options.token ?? (state.runLoadToken + 1);
+  state.runLoadToken = runToken;
+  const threadToken = options.threadToken ?? state.threadLoadToken;
+  const snapshot = await fetchJson(`/runs/${runId}`);
+  if (runToken !== state.runLoadToken) return;
+  if (threadToken !== state.threadLoadToken) return;
+  if (state.pendingThreadId && snapshot.thread_id && snapshot.thread_id !== state.pendingThreadId) return;
+  applySnapshot(snapshot, { connect: Boolean(options.live), history: Boolean(options.history) });
+}
+
+async function syncThreadSnapshot(thread, options = {}) {
+  const threadToken = options.token ?? state.threadLoadToken;
+  if (threadToken !== state.threadLoadToken) return;
+
+  state.activeThread = thread;
+  state.activeThreadId = thread.thread_id;
+  state.pendingThreadId = thread.thread_id;
+
+  const activeRun = activeRunForThread(thread);
+  const runs = runSummaries(thread);
+  const runIds = runs.map((item) => item.run_id);
+
+  let targetRunId = null;
+  let live = false;
+
+  if (options.preferLive && activeRun) {
+    targetRunId = activeRun.run_id;
+    live = true;
+  } else if (state.historyMode && state.selectedRunId && runIds.includes(state.selectedRunId)) {
+    targetRunId = state.selectedRunId;
+  } else if (options.preferRunId && runIds.includes(options.preferRunId)) {
+    targetRunId = options.preferRunId;
+    live = Boolean(activeRun && activeRun.run_id === options.preferRunId && options.preferLive);
+  } else if (activeRun) {
+    targetRunId = activeRun.run_id;
+    live = true;
+  } else if (runs.length) {
+    targetRunId = runs[runs.length - 1].run_id;
+  }
+
+  if (!targetRunId) {
+    state.isThreadSwitching = false;
+    clearRunState();
+    render();
+    return;
+  }
+
+  if (activeRun && targetRunId === activeRun.run_id) {
+    applySnapshot(activeRun, { connect: live, history: false });
+    return;
+  }
+
+  await loadRun(targetRunId, {
+    live: false,
+    history: Boolean(state.historyMode),
+    token: state.runLoadToken + 1,
+    threadToken,
+  });
+}
+
+async function loadThreadDetail(threadId, options = {}) {
+  const threadToken = options.token ?? state.threadLoadToken;
+  const thread = await fetchJson(`/threads/${threadId}`);
+  if (threadToken !== state.threadLoadToken) return;
+  await syncThreadSnapshot(thread, options);
+}
+
+function pickInitialThreadId() {
+  if (!state.threads.length) return null;
+  if (state.pendingThreadId && state.threads.some((item) => item.thread_id === state.pendingThreadId)) {
+    return state.pendingThreadId;
+  }
+  if (state.activeThreadId && state.threads.some((item) => item.thread_id === state.activeThreadId)) {
+    return state.activeThreadId;
+  }
+  if (state.initialRunId) {
+    const matched = state.threads.find((item) => item.current_run_id === state.initialRunId || runSummaries(item).some((run) => run.run_id === state.initialRunId));
+    if (matched) return matched.thread_id;
+  }
+  return state.threads[0].thread_id;
+}
+
+async function refreshThreads(options = {}) {
+  if (state.refreshInFlight) return;
+  const threadToken = options.token ?? state.threadLoadToken;
+  state.refreshInFlight = true;
+  try {
+    const payload = await fetchJson("/threads");
+    if (threadToken !== state.threadLoadToken) return;
+    state.threads = payload.threads || [];
+    setError("thread", "");
+
+    const nextThreadId = options.forceThreadId || state.pendingThreadId || pickInitialThreadId();
+    if (!nextThreadId) {
+      state.activeThreadId = null;
+      state.pendingThreadId = null;
+      state.activeThread = null;
+      clearRunState();
+      render();
+      return;
+    }
+
+    if (options.forceThreadId && options.forceThreadId !== state.activeThreadId) {
+      beginThreadSwitch(options.forceThreadId);
+    }
+
+    await loadThreadDetail(nextThreadId, {
+      preferRunId: options.preferRunId || state.selectedRunId,
+      preferLive: Boolean(options.preferLive),
+      token: state.threadLoadToken,
+    });
+  } catch (error) {
+    setError("thread", error.message);
+    render();
+  } finally {
+    state.refreshInFlight = false;
+  }
+}
+
+function scheduleThreadPolling() {
+  if (state.threadPollTimer) window.clearInterval(state.threadPollTimer);
+  state.threadPollTimer = window.setInterval(() => {
+    refreshThreads({
+      forceThreadId: state.pendingThreadId || state.activeThreadId,
+      preferRunId: state.historyMode ? state.selectedRunId : null,
+      preferLive: !state.historyMode,
+      token: state.threadLoadToken,
+    });
+  }, 2000);
+}
+
+async function openRunHistory(runId) {
+  state.historyMode = true;
+  state.isThreadSwitching = false;
+  await loadRun(runId, {
+    live: false,
+    history: true,
+    token: state.runLoadToken + 1,
+    threadToken: state.threadLoadToken,
+  });
+}
+
+async function returnToLiveRun() {
+  if (!state.activeThreadId) return;
+  state.historyMode = false;
+  await loadThreadDetail(state.activeThreadId, { preferLive: true, token: state.threadLoadToken });
+}
+
+async function handleConsoleClick(event) {
+  const threadSelect = event.target.closest("[data-thread-select]");
+  if (threadSelect) {
+    const threadId = threadSelect.getAttribute("data-thread-select");
+    beginThreadSwitch(threadId);
+    await loadThreadDetail(threadId, { preferLive: true, token: state.threadLoadToken });
+    return;
+  }
+
+  const threadAction = event.target.closest("[data-thread-action]");
+  if (threadAction) {
+    const action = threadAction.getAttribute("data-thread-action");
+    if (action === "pause") return pauseActiveThread();
+    if (action === "resume") return resumeActiveThread();
+    if (action === "report") return openReport();
+    if (action === "return-live") return returnToLiveRun();
+  }
+
+  const approvalAction = event.target.closest("[data-approval-id]");
+  if (approvalAction) {
+    const requestId = approvalAction.getAttribute("data-approval-id");
+    const approved = approvalAction.getAttribute("data-approved") === "true";
+    return respondApproval(requestId, approved);
+  }
+
+  const questionAction = event.target.closest("[data-question-submit]");
+  if (questionAction) {
+    return submitQuestionAnswer(questionAction.getAttribute("data-question-submit"));
+  }
+
+  const historyAction = event.target.closest("[data-history-open]");
+  if (historyAction) {
+    return openRunHistory(historyAction.getAttribute("data-history-open"));
+  }
+
+  const manualAction = event.target.closest("[data-manual-action]");
+  if (manualAction) {
+    return handleManualAction(manualAction.getAttribute("data-manual-action"));
+  }
+}
+
+function mount() {
+  document.getElementById("app").innerHTML = `
+    <main class="page">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="nav-button" type="button" aria-label="Geri">←</button>
+          <div class="title-stack">
+            <div class="app-title">Otonom Ajan - Görev Paneli</div>
+            <div class="app-subtitle" id="project-stamp"></div>
+          </div>
+        </div>
+      </header>
+      <section class="workspace">
+        <section class="left-pane">
+          <div class="left-pane-inner">
+            <section class="console-section">
+              <div class="section-title">Yeni Run</div>
+              <label class="field-label" for="goal-input">Görev</label>
+              <textarea id="goal-input" class="text-area" placeholder="Yeni bir komut veya görev girin"></textarea>
+              <label class="field-label" for="thread-title-input">Thread başlığı (opsiyonel)</label>
+              <input id="thread-title-input" class="text-input" type="text" placeholder="Yeni thread başlığı" />
+              <div class="action-row">
+                <button id="new-thread-button" class="action-button primary" type="button">Yeni thread'de başlat</button>
+                <button id="append-thread-button" class="action-button" type="button">Seçili thread'e ekle</button>
+              </div>
+              <div class="inline-error" id="run-error"></div>
+            </section>
+
+            <section class="console-section">
+              <div class="section-title">Threadler</div>
+              <div id="thread-list" class="thread-list"></div>
+            </section>
+
+            <section class="console-section">
+              <div class="section-title">Seçili Thread</div>
+              <div id="selected-thread-panel"></div>
+              <div class="inline-error" id="thread-error"></div>
+            </section>
+
+            <section class="console-section">
+              <div class="section-title">Bekleyen Onaylar</div>
+              <div id="approval-list" class="request-list"></div>
+              <div class="inline-error" id="approval-error"></div>
+            </section>
+
+            <section class="console-section">
+              <div class="section-title">Bekleyen Sorular</div>
+              <div id="question-list" class="request-list"></div>
+              <div class="inline-error" id="question-error"></div>
+            </section>
+
+            <section class="console-section">
+              <div class="section-title">Manuel Browser Kontrolleri</div>
+              <div id="manual-controls"></div>
+              <div class="inline-error" id="manual-error"></div>
+            </section>
+
+            <section class="console-section">
+              <div class="section-title">Run Geçmişi</div>
+              <div id="run-history" class="history-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="right-pane">
+          <div class="stage-shell">
+            <div class="stage-head">
+              <div class="stage-title" id="agent-title">Ajan</div>
+            </div>
+            <div class="tv-stage">
+              <div class="tv-shell">
+                <div class="tv-screen" id="tv-screen">
+                  <div class="tv-title" id="tv-frame-title">Ajan · HAZIR</div>
+                  <img class="tv-image" id="tv-image" alt="Agentra canlı kare" />
+                  <div class="tv-empty" id="tv-empty"></div>
+                  <div class="cursor-dot" id="cursor-dot"></div>
+                  <div class="cursor-bubble" id="cursor-bubble"></div>
+                </div>
+                <div class="tv-footer">
+                  <div class="scrub-row">
+                    <span class="scrub-meta" id="scrubber-label">0 / 0</span>
+                    <div class="timeline-track" id="timeline-track" aria-label="Zaman çizelgesi">
+                      <div class="timeline-progress" id="timeline-progress"></div>
+                      <div class="timeline-handle" id="timeline-handle"></div>
+                    </div>
+                    <span id="tv-status">HAZIR</span>
+                    <span>CANLI</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+  `;
+
+  document.getElementById("new-thread-button").addEventListener("click", () => startRun("new"));
+  document.getElementById("append-thread-button").addEventListener("click", () => startRun("append"));
+  document.getElementById("goal-input").addEventListener("input", handleConsoleInput);
+  document.getElementById("thread-title-input").addEventListener("input", handleConsoleInput);
+  document.getElementById("thread-list").addEventListener("click", handleConsoleClick);
+  document.getElementById("selected-thread-panel").addEventListener("click", handleConsoleClick);
+  document.getElementById("approval-list").addEventListener("click", handleConsoleClick);
+  document.getElementById("question-list").addEventListener("click", handleConsoleClick);
+  document.getElementById("question-list").addEventListener("input", handleConsoleInput);
+  document.getElementById("manual-controls").addEventListener("click", handleConsoleClick);
+  document.getElementById("manual-controls").addEventListener("input", handleConsoleInput);
+  document.getElementById("run-history").addEventListener("click", handleConsoleClick);
+
+  setupScrubber();
+  render();
+  refreshThreads({ preferLive: true, token: state.threadLoadToken });
+  scheduleThreadPolling();
+}
+
+window.addEventListener("beforeunload", () => {
+  disconnectStream();
+  if (state.threadPollTimer) window.clearInterval(state.threadPollTimer);
+});
+
+mount();
+"""
+
+
 def _app_script_state() -> str:
     return """
 const boot = window.__AGENTRA_BOOT__ || {};
