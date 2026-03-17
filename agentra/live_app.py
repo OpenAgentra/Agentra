@@ -814,12 +814,35 @@ a { color: inherit; text-decoration: none; }
   box-shadow: 0 10px 32px rgba(34, 70, 148, 0.1);
   backdrop-filter: blur(14px);
 }
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
 .section-title {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: rgba(18, 32, 61, 0.72);
+}
+.ghost-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(106, 130, 186, 0.22);
+  background: rgba(255, 255, 255, 0.28);
+  color: rgba(19, 34, 65, 0.82);
+  cursor: pointer;
+}
+.console-section[hidden],
+.advanced-panel[hidden],
+[hidden] {
+  display: none !important;
 }
 .field-label {
   font-size: 12px;
@@ -2496,6 +2519,16 @@ async function handleConsoleClick(event) {
     return openRunHistory(historyAction.getAttribute("data-history-open"));
   }
 
+  const advancedToggle = event.target.closest("[data-ui-action]");
+  if (advancedToggle) {
+    const action = advancedToggle.getAttribute("data-ui-action");
+    if (action === "toggle-advanced") {
+      state.ui.showAdvanced = !state.ui.showAdvanced;
+      render();
+      return;
+    }
+  }
+
   const manualAction = event.target.closest("[data-manual-action]");
   if (manualAction) {
     return handleManualAction(manualAction.getAttribute("data-manual-action"));
@@ -2518,7 +2551,10 @@ function mount() {
         <section class="left-pane">
           <div class="left-pane-inner">
             <section class="console-section">
-              <div class="section-title">Yeni Run</div>
+              <div class="section-head">
+                <div class="section-title">Yeni Run</div>
+                <button id="advanced-toggle" class="ghost-button" type="button" data-ui-action="toggle-advanced">Advanced</button>
+              </div>
               <label class="field-label" for="goal-input">Görev</label>
               <textarea id="goal-input" class="text-area" placeholder="Yeni bir komut veya görev girin"></textarea>
               <label class="field-label" for="thread-title-input">Thread başlığı (opsiyonel)</label>
@@ -2530,40 +2566,40 @@ function mount() {
               <div class="inline-error" id="run-error"></div>
             </section>
 
-            <section class="console-section">
+            <section class="console-section" hidden>
               <div class="section-title">Threadler</div>
               <div id="thread-list" class="thread-list"></div>
             </section>
 
-            <section class="console-section">
+<section class="console-section" hidden>
               <div class="section-title">Seçili Thread</div>
               <div id="selected-thread-panel"></div>
               <div class="inline-error" id="thread-error"></div>
             </section>
 
-            <section class="console-section">
+<section class="console-section" hidden>
               <div class="section-title">Bekleyen Onaylar</div>
               <div id="approval-list" class="request-list"></div>
               <div class="inline-error" id="approval-error"></div>
             </section>
 
-            <section class="console-section">
+<section class="console-section" hidden>
               <div class="section-title">Bekleyen Sorular</div>
               <div id="question-list" class="request-list"></div>
               <div class="inline-error" id="question-error"></div>
             </section>
 
-            <section class="console-section">
+<section class="console-section" hidden>
               <div class="section-title">Manuel Browser Kontrolleri</div>
               <div id="manual-controls"></div>
               <div class="inline-error" id="manual-error"></div>
             </section>
 
-            <section class="console-section">
+<section class="console-section" hidden>
               <div class="section-title">Run Geçmişi</div>
               <div id="run-history" class="history-list"></div>
             </section>
-            <section class="console-section">
+            <section class="console-section" hidden>
               <div class="section-title">Audit</div>
               <div id="audit-list" class="audit-list"></div>
             </section>
@@ -2607,6 +2643,7 @@ function mount() {
   document.getElementById("append-thread-button").addEventListener("click", () => startRun("append"));
   document.getElementById("goal-input").addEventListener("input", handleConsoleInput);
   document.getElementById("thread-title-input").addEventListener("input", handleConsoleInput);
+  document.getElementById("advanced-toggle").addEventListener("click", handleConsoleClick);
   document.getElementById("thread-list").addEventListener("click", handleConsoleClick);
   document.getElementById("selected-thread-panel").addEventListener("click", handleConsoleClick);
   document.getElementById("approval-list").addEventListener("click", handleConsoleClick);
@@ -2695,6 +2732,9 @@ const state = {
     summary: "",
     focus_x: DEFAULT_FOCUS.x,
     focus_y: DEFAULT_FOCUS.y,
+  },
+  ui: {
+    showAdvanced: false,
   },
 };
 
@@ -3223,7 +3263,7 @@ function currentOverlay(frame) {
 }
 
 function currentThreadTitle() {
-  return state.activeThread?.title || "Ajan";
+  return "Ajan";
 }
 
 function currentRunStatusLabel() {
@@ -3549,10 +3589,25 @@ function renderConsole() {
   const goalInput = document.getElementById("goal-input");
   const titleInput = document.getElementById("thread-title-input");
   const appendThreadButton = document.getElementById("append-thread-button");
+  const advancedToggle = document.getElementById("advanced-toggle");
+  const advancedPanelIds = [
+    "thread-list",
+    "selected-thread-panel",
+    "approval-list",
+    "question-list",
+    "manual-controls",
+    "run-history",
+    "audit-list",
+  ];
 
   if (goalInput && goalInput.value !== state.drafts.goal) goalInput.value = state.drafts.goal;
   if (titleInput && titleInput.value !== state.drafts.threadTitle) titleInput.value = state.drafts.threadTitle;
   if (appendThreadButton) appendThreadButton.disabled = !state.activeThreadId;
+  advancedPanelIds.forEach((id) => {
+    const panel = document.getElementById(id)?.closest(".console-section");
+    if (panel) panel.hidden = !state.ui.showAdvanced;
+  });
+  if (advancedToggle) advancedToggle.textContent = state.ui.showAdvanced ? "Advanced Gizle" : "Advanced";
 
   renderThreadList();
   renderSelectedThread();
@@ -3980,6 +4035,16 @@ function handleConsoleInput(event) {
 }
 
 async function handleConsoleClick(event) {
+  const uiAction = event.target.closest("[data-ui-action]");
+  if (uiAction) {
+    const action = uiAction.getAttribute("data-ui-action");
+    if (action === "toggle-advanced") {
+      state.ui.showAdvanced = !state.ui.showAdvanced;
+      render();
+    }
+    return;
+  }
+
   const threadSelect = event.target.closest("[data-thread-select]");
   if (threadSelect) {
     state.historyMode = false;
@@ -4035,7 +4100,10 @@ function mount() {
         <section class="left-pane">
           <div class="left-pane-inner">
             <section class="console-section">
-              <div class="section-title">Yeni Run</div>
+              <div class="section-head">
+                <div class="section-title">Yeni Run</div>
+                <button id="advanced-toggle" class="ghost-button" type="button" data-ui-action="toggle-advanced">Advanced</button>
+              </div>
               <label class="field-label" for="goal-input">Görev</label>
               <textarea id="goal-input" class="text-area" placeholder="Yeni bir komut veya görev girin"></textarea>
               <label class="field-label" for="thread-title-input">Thread başlığı (opsiyonel)</label>
@@ -4047,40 +4115,40 @@ function mount() {
               <div class="inline-error" id="run-error"></div>
             </section>
 
-            <section class="console-section">
+            <section class="console-section" hidden>
               <div class="section-title">Threadler</div>
               <div id="thread-list" class="thread-list"></div>
             </section>
 
-            <section class="console-section">
+            <section class="console-section" hidden>
               <div class="section-title">Seçili Thread</div>
               <div id="selected-thread-panel"></div>
               <div class="inline-error" id="thread-error"></div>
             </section>
 
-            <section class="console-section">
+            <section class="console-section" hidden>
               <div class="section-title">Bekleyen Onaylar</div>
               <div id="approval-list" class="request-list"></div>
               <div class="inline-error" id="approval-error"></div>
             </section>
 
-            <section class="console-section">
+            <section class="console-section" hidden>
               <div class="section-title">Bekleyen Sorular</div>
               <div id="question-list" class="request-list"></div>
               <div class="inline-error" id="question-error"></div>
             </section>
 
-            <section class="console-section">
+            <section class="console-section" hidden>
               <div class="section-title">Manuel Browser Kontrolleri</div>
               <div id="manual-controls"></div>
               <div class="inline-error" id="manual-error"></div>
             </section>
 
-            <section class="console-section">
+            <section class="console-section" hidden>
               <div class="section-title">Run Geçmişi</div>
               <div id="run-history" class="history-list"></div>
             </section>
-            <section class="console-section">
+            <section class="console-section" hidden>
               <div class="section-title">Audit</div>
               <div id="audit-list" class="audit-list"></div>
             </section>
@@ -4122,6 +4190,7 @@ function mount() {
 
   document.getElementById("new-thread-button").addEventListener("click", () => startRun("new"));
   document.getElementById("append-thread-button").addEventListener("click", () => startRun("append"));
+  document.getElementById("advanced-toggle").addEventListener("click", handleConsoleClick);
   document.getElementById("goal-input").addEventListener("input", handleConsoleInput);
   document.getElementById("thread-title-input").addEventListener("input", handleConsoleInput);
   document.getElementById("thread-list").addEventListener("click", handleConsoleClick);
