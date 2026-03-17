@@ -333,3 +333,28 @@ async def test_live_app_supports_pause_approval_question_and_manual_action(tmp_p
         assert created_agents[-1].paused is False
 
         await _wait_for_completion(client, payload["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_live_app_exposes_live_browser_frame_route(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    manager = app.state.manager
+    transport = httpx.ASGITransport(app=app)
+
+    async def fake_capture(thread_id: str) -> bytes | None:
+        assert thread_id.startswith("thread-")
+        return b"png-live-frame"
+
+    manager.capture_live_browser_frame = fake_capture
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Open python.org live"})
+        assert create_response.status_code == 200
+        thread_id = create_response.json()["thread_id"]
+
+        frame_response = await client.get(f"/threads/{thread_id}/live-frame")
+
+    assert frame_response.status_code == 200
+    assert frame_response.headers["content-type"] == "image/png"
+    assert frame_response.content == b"png-live-frame"

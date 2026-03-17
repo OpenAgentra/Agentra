@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  
+  <title>Agentra Run Report</title>
+  <style>
+    :root {
+      --bg: #09111e;
+      --panel: rgba(12, 22, 42, 0.9);
+      --panel-2: rgba(18, 31, 58, 0.94);
+      --line: rgba(148, 163, 184, 0.18);
+      --text: #edf3ff;
+      --muted: #9eb2cf;
+      --blue: #68b3ff;
+      --cyan: #65e0ff;
+      --green: #65f0b5;
+      --amber: #ffd166;
+      --red: #ff7d7d;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: "Trebuchet MS", "Aptos", "Segoe UI Variable", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(104, 179, 255, 0.28), transparent 28%),
+        radial-gradient(circle at top right, rgba(101, 240, 181, 0.18), transparent 24%),
+        linear-gradient(160deg, #08111f 0%, #0b1220 46%, #12203a 100%);
+    }
+    .shell {
+      max-width: 1280px;
+      margin: 32px auto;
+      padding: 0 20px 32px;
+    }
+    .hero {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: minmax(0, 1.6fr) minmax(280px, 0.9fr);
+      margin-bottom: 22px;
+    }
+    .frame {
+      background: linear-gradient(135deg, rgba(94, 165, 255, 0.92), rgba(86, 102, 255, 0.7));
+      border-radius: 28px;
+      padding: 14px;
+      box-shadow: var(--shadow);
+    }
+    .frame-inner {
+      min-height: 220px;
+      border-radius: 20px;
+      padding: 24px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.94), rgba(238,243,251,0.92) 10%, rgba(18,31,58,0.96) 10%, rgba(18,31,58,0.96) 100%);
+      position: relative;
+      overflow: hidden;
+    }
+    .hero-shot {
+      margin: 0 0 18px;
+      border-radius: 18px;
+      overflow: hidden;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      background: rgba(255, 255, 255, 0.05);
+    }
+    .hero-shot img {
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+    }
+    .window-bar {
+      color: #4f5d73;
+      font-size: 14px;
+      text-align: center;
+      margin-bottom: 24px;
+    }
+    .goal {
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 18px;
+      padding: 18px;
+      font-size: 24px;
+      line-height: 1.35;
+      max-width: 90%;
+    }
+    .live {
+      position: absolute;
+      right: 18px;
+      bottom: 12px;
+      color: white;
+      font-size: 13px;
+      letter-spacing: 0.18em;
+    }
+    .meta {
+      display: grid;
+      gap: 14px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 18px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+    .card h2, .card h3 {
+      margin: 0 0 10px;
+      font-size: 16px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 12px;
+      background: rgba(104, 179, 255, 0.14);
+      color: var(--blue);
+    }
+    .status.running { color: var(--amber); background: rgba(255, 209, 102, 0.12); }
+    .status.completed { color: var(--green); background: rgba(101, 240, 181, 0.12); }
+    .status.partial { color: var(--blue); }
+    .status.error { color: var(--red); background: rgba(255, 125, 125, 0.12); }
+    .meta-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .meta-grid strong {
+      display: block;
+      color: var(--text);
+      font-size: 15px;
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .frame-strip {
+      display: grid;
+      gap: 12px;
+      grid-auto-flow: column;
+      grid-auto-columns: minmax(190px, 220px);
+      overflow-x: auto;
+      padding-bottom: 6px;
+    }
+    .frame-thumb {
+      background: rgba(8, 17, 31, 0.58);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 16px;
+      padding: 10px;
+    }
+    .frame-thumb img {
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      margin-bottom: 10px;
+    }
+    .frame-thumb strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+      color: var(--text);
+    }
+    .frame-thumb span {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .frame-thumb p {
+      font-size: 13px;
+      color: var(--text);
+    }
+    .timeline {
+      display: grid;
+      gap: 14px;
+    }
+    .event {
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      position: relative;
+      overflow: hidden;
+    }
+    .event::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 4px;
+      background: var(--blue);
+    }
+    .event.thought::before { background: var(--cyan); }
+    .event.tool_call::before { background: var(--amber); }
+    .event.tool_result.success::before,
+    .event.done::before,
+    .event.sub_task.success::before { background: var(--green); }
+    .event.tool_result.error::before,
+    .event.error::before,
+    .event.sub_task.error::before { background: var(--red); }
+    .eyebrow {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .event h3 {
+      margin: 0 0 10px;
+      font-size: 18px;
+    }
+    pre {
+      margin: 0;
+      padding: 14px;
+      overflow: auto;
+      border-radius: 14px;
+      background: rgba(6, 13, 24, 0.72);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      color: #d8e2f2;
+      font-family: "Cascadia Code", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    p {
+      margin: 0;
+      color: var(--text);
+      line-height: 1.55;
+    }
+    img {
+      display: block;
+      width: 100%;
+      border-radius: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .muted { color: var(--muted); }
+    .empty { text-align: center; color: var(--muted); }
+    @media (max-width: 960px) {
+      .hero { grid-template-columns: 1fr; }
+      .meta-grid { grid-template-columns: 1fr; }
+      .goal { max-width: none; font-size: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="frame">
+        <div class="frame-inner">
+          <div class="window-bar">Agentra Live Run</div>
+          <div class="hero-shot"><img src="assets/screenshot-001.png" alt="Latest run screenshot" /></div>
+          <div class="goal">Open python.org and explain it</div>
+          <div class="live">PARTIAL</div>
+        </div>
+      </div>
+      <aside class="meta">
+        <section class="card">
+          <div class="status partial">PARTIAL</div>
+          <div class="meta-grid" style="margin-top: 14px;">
+            <div>Provider<strong>gemini</strong></div>
+            <div>Model<strong>gemini-3-flash-preview</strong></div>
+            <div>Started<strong>2026-03-15T12:00:49</strong></div>
+            <div>Finished<strong>2026-03-15T12:00:49</strong></div>
+            <div>Events<strong>3</strong></div>
+            <div>Frames<strong>1</strong></div>
+            <div>Report<strong>C:\Users\ariba\OneDrive\Documenti\Software Projects\AI Projects\Agentra\Agentra\tmp-live-workspace\.runs\20260315-120049-open-python-org-and-explain-it\index.html</strong></div>
+          </div>
+        </section>
+        <section class="card">
+          <h2>Demo Notes</h2>
+          <p class="muted">This standalone report is refreshed as the agent runs and keeps screenshots, timeline frames, tool calls, and model output in one shareable place.</p>
+        </section>
+      </aside>
+    </section>
+    <section class="card"><h2>Frame Timeline</h2><div class="frame-strip"><article class="frame-thumb"><img src="assets/screenshot-001.png" alt="browser ? navigate" /><strong>browser ? navigate</strong><span>2026-03-15T12:00:49</span><p>Opening python.org</p></article></div></section>
+    <section class="timeline">
+      <section class="event thought"><div class="eyebrow"><span>Thought</span><span>2026-03-15T12:00:49</span></div><p>Planning for Open python.org and explain it</p></section>
+<section class="event tool_call"><div class="eyebrow"><span>Tool Call</span><span>2026-03-15T12:00:49</span></div><h3>browser</h3><pre>{
+  &quot;action&quot;: &quot;navigate&quot;,
+  &quot;url&quot;: &quot;https://www.python.org&quot;
+}</pre></section>
+<section class="event screenshot"><div class="eyebrow"><span>Screenshot</span><span>2026-03-15T12:00:49</span></div><h3>browser ? navigate</h3><img src="assets/screenshot-001.png" alt="Agent screenshot" /></section>
+    </section>
+  </main>
+</body>
+</html>

@@ -15,6 +15,7 @@ class ToolResult:
     output: str = ""
     error: str = ""
     screenshot_b64: Optional[str] = None  # base64 PNG when relevant
+    extra_screenshots: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __str__(self) -> str:

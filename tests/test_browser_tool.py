@@ -56,9 +56,12 @@ class FakePage:
         self.clicked_selector: str | None = None
         self.filled: tuple[str, str] | None = None
         self.goto_url: str | None = None
+        self.goto_wait_until: str | None = None
+        self.screenshot_calls = 0
 
-    async def goto(self, url: str, timeout: int) -> None:
+    async def goto(self, url: str, timeout: int, wait_until: str | None = None) -> None:
         self.goto_url = url
+        self.goto_wait_until = wait_until
         self.url = url
 
     async def title(self) -> str:
@@ -66,6 +69,7 @@ class FakePage:
 
     async def screenshot(self, *, type: str) -> bytes:
         assert type == "png"
+        self.screenshot_calls += 1
         return b"png-bytes"
 
     async def click(self, selector: str, timeout: int) -> None:
@@ -101,6 +105,10 @@ async def test_browser_navigate_returns_frame_metadata() -> None:
     assert result.metadata["summary"] == "Opening python.org"
     assert result.metadata["focus_x"] == pytest.approx(0.74, rel=1e-3)
     assert result.metadata["focus_y"] == pytest.approx(0.2, rel=1e-3)
+    assert tool._page.goto_wait_until == "domcontentloaded"
+    assert len(result.extra_screenshots) == 2
+    assert result.extra_screenshots[0]["summary"].startswith("Opening python.org")
+    assert tool._page.screenshot_calls == 3
 
 
 @pytest.mark.asyncio

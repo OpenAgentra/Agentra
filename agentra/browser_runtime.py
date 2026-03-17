@@ -10,6 +10,7 @@ from typing import Any, Literal
 from agentra.tools.base import ToolResult
 
 _DEFAULT_FOCUS = (0.74, 0.2)
+_LIVE_REFRESH_INTERVALS = (0.2, 0.35)
 
 
 @dataclass
@@ -99,6 +100,7 @@ class BrowserSession:
                     frame_label="browser · back",
                     summary="Going back",
                     focus=self._default_focus(),
+                    burst=True,
                 )
             if action == "forward":
                 await self._page.go_forward()
@@ -107,6 +109,7 @@ class BrowserSession:
                     frame_label="browser · forward",
                     summary="Going forward",
                     focus=self._default_focus(),
+                    burst=True,
                 )
             if action == "new_tab":
                 page = await self._context.new_page()
@@ -116,6 +119,7 @@ class BrowserSession:
                     frame_label="browser · new_tab",
                     summary="Opening a new tab",
                     focus=self._default_focus(),
+                    burst=True,
                 )
             if action == "close_tab":
                 if self._page is not None:
@@ -130,6 +134,7 @@ class BrowserSession:
                     frame_label="browser · close_tab",
                     summary="Closing the tab",
                     focus=self._default_focus(),
+                    burst=True,
                 )
             return ToolResult(success=False, error=f"Unknown action: {action!r}")
         except Exception as exc:  # noqa: BLE001
@@ -200,6 +205,13 @@ class BrowserSession:
             tab_count=self._snapshot.tab_count,
         )
 
+    async def capture_live_png(self) -> bytes | None:
+        if self._page is None:
+            return None
+        png_bytes = await self._page.screenshot(type="png")
+        await self._refresh_snapshot()
+        return png_bytes
+
     async def _ensure_started(self) -> None:
         if self._page is not None:
             return
@@ -218,13 +230,14 @@ class BrowserSession:
     async def _navigate(self, url: str) -> ToolResult:
         if not url:
             return ToolResult(success=False, error="url is required for 'navigate'")
-        await self._page.goto(url, timeout=30000)
+        await self._page.goto(url, timeout=30000, wait_until="domcontentloaded")
         title = await self._page.title()
         return await self._capture_visual_state(
             output=f"Navigated to {url!r}. Page title: {title!r}",
             frame_label="browser · navigate",
             summary=f"Opening {self._short_url(url)}",
             focus=self._default_focus(),
+            burst=True,
         )
 
     async def _click(self, selector: str | None, x: float | None, y: float | None) -> ToolResult:
@@ -236,6 +249,7 @@ class BrowserSession:
                 frame_label="browser · click",
                 summary=f"Clicking {selector}",
                 focus=focus,
+                burst=True,
             )
         if x is not None and y is not None:
             await self._page.mouse.click(x, y)
@@ -244,6 +258,7 @@ class BrowserSession:
                 frame_label="browser · click",
                 summary="Clicking the page",
                 focus=(x, y),
+                burst=True,
             )
         return ToolResult(success=False, error="Provide selector or x,y coordinates.")
 
@@ -256,6 +271,7 @@ class BrowserSession:
                 frame_label="browser · type",
                 summary=f"Typing into {selector}",
                 focus=focus,
+                burst=True,
             )
         await self._page.keyboard.type(text)
         return await self._capture_visual_state(
@@ -263,6 +279,7 @@ class BrowserSession:
             frame_label="browser · type",
             summary="Typing text",
             focus=self._default_focus(y=0.56),
+            burst=True,
         )
 
     async def _scroll(self, x: float, y: float, delta_y: float) -> ToolResult:
@@ -273,6 +290,7 @@ class BrowserSession:
             frame_label="browser · scroll",
             summary="Scrolling the page",
             focus=focus,
+            burst=True,
         )
 
     async def _screenshot(self) -> ToolResult:
@@ -304,6 +322,7 @@ class BrowserSession:
         frame_label: str,
         summary: str,
         focus: tuple[float, float],
+        burst: bool = False,
     ) -> ToolResult:
         png_bytes = await self._page.screenshot(type="png")
         await self._refresh_snapshot()
@@ -312,6 +331,13 @@ class BrowserSession:
             success=True,
             output=output,
             screenshot_b64=base64.b64encode(png_bytes).decode(),
+            extra_screenshots=await self._capture_follow_up_frames(
+                frame_label=frame_label,
+                summary=summary,
+                focus_x=focus_x,
+                focus_y=focus_y,
+                enabled=burst,
+            ),
             metadata=self._metadata(
                 summary=summary,
                 frame_label=frame_label,
@@ -345,6 +371,45 @@ class BrowserSession:
         if extracted_text:
             metadata["extracted_text"] = extracted_text
         return metadata
+
+    async def _capture_follow_up_frames(
+        self,
+        *,
+        frame_label: str,
+        summary: str,
+        focus_x: float,
+        focus_y: float,
+        enabled: bool,
+    ) -> list[dict[str, Any]]:
+        if not enabled or self._page is None:
+            return []
+        frames: list[dict[str, Any]] = []
+        for index, delay in enumerate(_LIVE_REFRESH_INTERVALS, start=1):
+            await asyncio.sleep(delay)
+            png_bytes = await self._page.screenshot(type="png")
+            await self._refresh_snapshot()
+            frame_summary = f"{summary} (refresh {index})"
+            frame: dict[str, Any] = {
+                "data": base64.b64encode(png_bytes).decode(),
+                "frame_label": frame_label,
+                "summary": frame_summary,
+                "focus_x": focus_x,
+                "focus_y": focus_y,
+            }
+            frame.update(
+                {
+                    key: value
+                    for key, value in self._metadata(
+                        summary=frame_summary,
+                        frame_label=frame_label,
+                        focus_x=focus_x,
+                        focus_y=focus_y,
+                    ).items()
+                    if key not in {"summary", "frame_label", "focus_x", "focus_y"}
+                }
+            )
+            frames.append(frame)
+        return frames
 
     async def _refresh_snapshot(self) -> None:
         if self._page is None:
@@ -476,3 +541,9 @@ class BrowserSessionManager:
             "tab_count": snapshot.tab_count,
             "browser": asdict(snapshot),
         }
+
+    async def capture_live_png(self, thread_id: str) -> bytes | None:
+        session = self._sessions.get(thread_id)
+        if session is None:
+            return None
+        return await session.capture_live_png()

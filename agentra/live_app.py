@@ -498,7 +498,7 @@ def create_live_app(
 ):
     """Create the FastAPI application for the live operator UI."""
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 
     app = FastAPI(title="Agentra App")
     manager = ThreadManager(base_config=base_config, agent_factory=agent_factory)
@@ -605,6 +605,20 @@ def create_live_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Thread not found.") from exc
         return JSONResponse(manager.thread_snapshot_for_http(thread))
+
+    @app.get("/threads/{thread_id}/live-frame")
+    async def get_live_frame(thread_id: str) -> Response:
+        try:
+            png_bytes = await manager.capture_live_browser_frame(thread_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Thread not found.") from exc
+        if not png_bytes:
+            return Response(status_code=204)
+        return Response(
+            content=png_bytes,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
 
     @app.post("/threads/{thread_id}/pause")
     async def pause_thread(thread_id: str) -> JSONResponse:
@@ -899,9 +913,51 @@ a { color: inherit; text-decoration: none; }
 }
 .thread-list,
 .request-list,
-.history-list {
+.history-list,
+.audit-list {
   display: grid;
   gap: 8px;
+}
+.audit-item {
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(112, 128, 187, 0.2);
+  background: rgba(255, 255, 255, 0.26);
+  display: grid;
+  gap: 6px;
+}
+.audit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.audit-type {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(35, 55, 96, 0.75);
+}
+.audit-meta {
+  font-size: 11px;
+  color: rgba(35, 55, 96, 0.6);
+}
+.audit-detail {
+  font-size: 13px;
+  color: rgba(17, 32, 60, 0.84);
+  line-height: 1.4;
+}
+.audit-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(106, 130, 186, 0.3);
+  background: rgba(255, 255, 255, 0.38);
+  font-size: 11px;
+  color: rgba(28, 44, 79, 0.76);
 }
 .thread-item {
   width: 100%;
@@ -958,6 +1014,10 @@ a { color: inherit; text-decoration: none; }
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: rgba(20, 33, 61, 0.56);
+}
+.detail-value {
+  font-size: 12px;
+  color: rgba(17, 32, 60, 0.84);
 }
 .path-copy {
   font-size: 12px;
@@ -2503,6 +2563,10 @@ function mount() {
               <div class="section-title">Run Geçmişi</div>
               <div id="run-history" class="history-list"></div>
             </section>
+            <section class="console-section">
+              <div class="section-title">Audit</div>
+              <div id="audit-list" class="audit-list"></div>
+            </section>
           </div>
         </section>
 
@@ -2559,6 +2623,7 @@ function mount() {
 }
 
 window.addEventListener("beforeunload", () => {
+  stopLiveMirror();
   disconnectStream();
   if (state.threadPollTimer) window.clearInterval(state.threadPollTimer);
 });
@@ -2586,11 +2651,22 @@ const state = {
   events: [],
   frames: [],
   steps: [],
+  audit: [],
+  browser: {
+    active: false,
+    active_url: "",
+    active_title: "",
+    tab_count: 0,
+  },
   liveMode: true,
   historyMode: false,
   selectedFrameId: null,
   reportUrl: null,
   source: null,
+  liveFrameUrl: null,
+  liveFrameThreadId: null,
+  liveFrameLoopToken: 0,
+  liveFrameStamp: 0,
   threadPollTimer: null,
   refreshInFlight: false,
   scrubPercent: 1,
@@ -2683,6 +2759,29 @@ function shortPath(value) {
   return parts.slice(-4).join("/");
 }
 
+function browserStatusLabel() {
+  const active = Boolean(state.browser?.active);
+  const tabCount = Number(state.browser?.tab_count ?? 0);
+  return `${active ? "AKTIF" : "KAPALI"} Â· ${tabCount} sekme`;
+}
+
+function updateBrowserState(payload) {
+  if (!payload) return;
+  const hasDirectFields = Object.prototype.hasOwnProperty.call(payload, "browser_session_active")
+    || Object.prototype.hasOwnProperty.call(payload, "active_url")
+    || Object.prototype.hasOwnProperty.call(payload, "active_title")
+    || Object.prototype.hasOwnProperty.call(payload, "tab_count");
+  const browserPayload = payload.browser || {};
+  const hasBrowser = Object.keys(browserPayload || {}).length > 0;
+  if (!hasDirectFields && !hasBrowser) return;
+  state.browser = {
+    active: Boolean(payload.browser_session_active ?? browserPayload.active ?? false),
+    active_url: String(payload.active_url ?? browserPayload.active_url ?? ""),
+    active_title: String(payload.active_title ?? browserPayload.active_title ?? ""),
+    tab_count: Number(payload.tab_count ?? browserPayload.tab_count ?? 0) || 0,
+  };
+}
+
 function pendingApprovals(thread) {
   return (thread?.approval_requests || []).filter((item) => !item.status || item.status === "pending");
 }
@@ -2742,6 +2841,23 @@ function currentFrame() {
   if (!state.frames.length) return null;
   if (state.liveMode || !state.selectedFrameId) return state.frames[state.frames.length - 1];
   return state.frames.find((frame) => frame.id === state.selectedFrameId) || state.frames[state.frames.length - 1];
+}
+
+function wantsLiveMirror() {
+  const thread = state.activeThread;
+  const activeRun = activeRunForThread(thread);
+  if (!thread || !state.activeThreadId || !state.browser.active) return false;
+  if (state.historyMode || !state.liveMode) return false;
+  if (!activeRun || !state.selectedRunId) return false;
+  return activeRun.run_id === state.selectedRunId;
+}
+
+function releaseLiveFrameUrl() {
+  if (state.liveFrameUrl && state.liveFrameUrl.startsWith("blob:")) {
+    URL.revokeObjectURL(state.liveFrameUrl);
+  }
+  state.liveFrameUrl = null;
+  state.liveFrameStamp = 0;
 }
 
 function buildSteps(events) {
@@ -2951,8 +3067,70 @@ function disconnectStream() {
   state.streamRunId = null;
 }
 
+function stopLiveMirror() {
+  state.liveFrameLoopToken += 1;
+  state.liveFrameThreadId = null;
+  releaseLiveFrameUrl();
+}
+
+function startLiveMirror(threadId) {
+  stopLiveMirror();
+  if (!threadId) return;
+  const token = state.liveFrameLoopToken;
+  state.liveFrameThreadId = threadId;
+
+  async function pump() {
+    while (token === state.liveFrameLoopToken && state.liveFrameThreadId === threadId && wantsLiveMirror()) {
+      try {
+        const response = await fetch(`/threads/${threadId}/live-frame?ts=${Date.now()}`, {
+          cache: "no-store",
+        });
+        if (token !== state.liveFrameLoopToken || state.liveFrameThreadId !== threadId) return;
+        if (response.status === 204) {
+          await new Promise((resolve) => window.setTimeout(resolve, 90));
+          continue;
+        }
+        if (!response.ok) {
+          await new Promise((resolve) => window.setTimeout(resolve, 140));
+          continue;
+        }
+        const blob = await response.blob();
+        if (token !== state.liveFrameLoopToken || state.liveFrameThreadId !== threadId) return;
+        const nextUrl = URL.createObjectURL(blob);
+        const previousUrl = state.liveFrameUrl;
+        state.liveFrameUrl = nextUrl;
+        state.liveFrameStamp += 1;
+        renderTV();
+        if (previousUrl && previousUrl.startsWith("blob:")) URL.revokeObjectURL(previousUrl);
+      } catch (error) {
+        if (token !== state.liveFrameLoopToken || state.liveFrameThreadId !== threadId) return;
+        await new Promise((resolve) => window.setTimeout(resolve, 160));
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 45));
+    }
+  }
+
+  void pump();
+}
+
+function syncLiveMirror() {
+  const desiredThreadId = wantsLiveMirror() ? state.activeThreadId : null;
+  if (!desiredThreadId) {
+    stopLiveMirror();
+    return;
+  }
+  if (state.liveFrameThreadId === desiredThreadId && state.liveFrameUrl) {
+    return;
+  }
+  if (state.liveFrameThreadId === desiredThreadId && !state.liveFrameUrl) {
+    return;
+  }
+  startLiveMirror(desiredThreadId);
+}
+
 function clearRunState(options = {}) {
   if (options.disconnect !== false) disconnectStream();
+  stopLiveMirror();
   state.runId = null;
   state.selectedRunId = null;
   state.goal = "";
@@ -2960,6 +3138,7 @@ function clearRunState(options = {}) {
   state.events = [];
   state.frames = [];
   state.steps = [];
+  state.audit = [];
   state.reportUrl = null;
   state.historyMode = false;
   state.activity = {
@@ -2967,6 +3146,12 @@ function clearRunState(options = {}) {
     summary: "",
     focus_x: DEFAULT_FOCUS.x,
     focus_y: DEFAULT_FOCUS.y,
+  };
+  state.browser = {
+    active: false,
+    active_url: "",
+    active_title: "",
+    tab_count: 0,
   };
   syncSelectionToFrames();
 }
@@ -2981,9 +3166,11 @@ function applySnapshot(snapshot, options = {}) {
   state.events = snapshot.events || [];
   state.frames = snapshot.frames || [];
   state.steps = snapshot.steps || buildSteps(state.events);
+  state.audit = Array.isArray(snapshot.audit) ? snapshot.audit : [];
   state.reportUrl = snapshot.report_url || null;
   if (snapshot.thread_id) state.activeThreadId = snapshot.thread_id;
   state.historyMode = Boolean(options.history);
+  updateBrowserState(snapshot);
   syncSelectionToFrames();
   state.activity = deriveActivity(state.events, state.frames);
   if (options.connect) {
@@ -3119,6 +3306,22 @@ function renderSelectedThread() {
           <span class="detail-key">Memory</span>
           <span class="path-copy">${escapeHtml(shortPath(thread.memory_dir))}</span>
         </div>
+        <div class="detail-row">
+          <span class="detail-key">Long-term Memory</span>
+          <span class="path-copy">${escapeHtml(shortPath(thread.long_term_memory_dir))}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Browser</span>
+          <span class="detail-value">${escapeHtml(browserStatusLabel())}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">URL</span>
+          <span class="path-copy">${escapeHtml(shortText(state.browser.active_url || "-", 54))}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-key">Title</span>
+          <span class="path-copy">${escapeHtml(shortText(state.browser.active_title || "-", 54))}</span>
+        </div>
       </div>
       <div class="action-row">
         <button type="button" class="action-button" data-thread-action="pause" ${canPause ? "" : "disabled"}>Pause</button>
@@ -3238,6 +3441,35 @@ function renderRunHistory() {
   }).join("");
 }
 
+function renderAuditList() {
+  const container = document.getElementById("audit-list");
+  if (!container) return;
+  const audit = Array.isArray(state.audit) ? state.audit : [];
+  if (!audit.length) {
+    container.innerHTML = `<div class="empty-state">Audit kaydi yok.</div>`;
+    return;
+  }
+  const items = audit.slice().reverse().slice(0, 12);
+  container.innerHTML = items.map((entry) => {
+    const typeLabel = String(entry.entry_type || "audit").replaceAll("_", " ").toUpperCase();
+    const timestamp = formatDateTime(entry.timestamp);
+    const runId = entry.run_id ? shortText(entry.run_id, 12) : "";
+    const details = entry.details || {};
+    const detailText = details.summary || details.reason || details.tool || details.action || details.status || "";
+    const meta = [timestamp, runId ? `run ${runId}` : ""].filter(Boolean).join(" Â· ");
+    return `
+      <div class="audit-item">
+        <div class="audit-head">
+          <span class="audit-type">${escapeHtml(typeLabel)}</span>
+          <span class="audit-chip">${escapeHtml(entry.entry_type || "audit")}</span>
+        </div>
+        <div class="audit-detail">${escapeHtml(shortText(detailText || "Detay yok.", 140))}</div>
+        <div class="audit-meta">${escapeHtml(meta || "â€”")}</div>
+      </div>
+    `;
+  }).join("");
+}
+
 function renderHeader() {
   setInlineText("project-stamp", projectStamp());
   setInlineText("agent-title", currentThreadTitle());
@@ -3246,6 +3478,7 @@ function renderHeader() {
 function renderTV() {
   const frame = currentFrame();
   const overlay = currentOverlay(frame);
+  const liveMirrorActive = wantsLiveMirror() && Boolean(state.liveFrameUrl);
   const screen = document.getElementById("tv-screen");
   const image = document.getElementById("tv-image");
   const empty = document.getElementById("tv-empty");
@@ -3257,7 +3490,7 @@ function renderTV() {
   screen.classList.toggle("busy", Boolean(overlay.busy));
   title.textContent = `${activeLabel} · ${currentRunStatusLabel()}`;
 
-  if (!frame) {
+  if (!frame && !liveMirrorActive) {
     image.style.display = "none";
     empty.style.display = "grid";
     empty.innerHTML = overlay.busy
@@ -3266,11 +3499,17 @@ function renderTV() {
   } else {
     empty.style.display = "none";
     image.style.display = "block";
-    if (image.dataset.frameId !== frame.id) {
-      image.classList.add("swapping");
-      image.src = frame.image_url;
-      image.dataset.frameId = frame.id;
-      window.setTimeout(() => image.classList.remove("swapping"), 180);
+    const displayKey = liveMirrorActive ? `live-${state.liveFrameStamp}` : frame.id;
+    const displaySrc = liveMirrorActive ? state.liveFrameUrl : frame.image_url;
+    if (image.dataset.frameId !== displayKey) {
+      if (liveMirrorActive) {
+        image.classList.remove("swapping");
+      } else {
+        image.classList.add("swapping");
+        window.setTimeout(() => image.classList.remove("swapping"), 180);
+      }
+      image.src = displaySrc;
+      image.dataset.frameId = displayKey;
     }
   }
 
@@ -3321,6 +3560,7 @@ function renderConsole() {
   renderQuestionList();
   renderManualControls();
   renderRunHistory();
+  renderAuditList();
 
   setInlineText("run-error", state.errors.run);
   setInlineText("thread-error", state.errors.thread);
@@ -3334,6 +3574,7 @@ function render() {
   renderConsole();
   renderTV();
   renderTimeline();
+  syncLiveMirror();
 }
 
 async function fetchJson(url, options = {}) {
@@ -3451,6 +3692,8 @@ async function loadRun(runId, options = {}) {
 async function syncThreadSnapshot(thread, options = {}) {
   state.activeThread = thread;
   state.activeThreadId = thread.thread_id;
+  state.audit = Array.isArray(thread.audit) ? thread.audit : state.audit;
+  updateBrowserState(thread);
   const activeRun = activeRunForThread(thread);
   const runs = runSummaries(thread);
   const runIds = runs.map((item) => item.run_id);
@@ -3475,6 +3718,8 @@ async function syncThreadSnapshot(thread, options = {}) {
 
   if (!targetRunId) {
     clearRunState();
+    state.audit = Array.isArray(thread.audit) ? thread.audit : [];
+    updateBrowserState(thread);
     render();
     return;
   }
@@ -3834,6 +4079,10 @@ function mount() {
             <section class="console-section">
               <div class="section-title">Run Geçmişi</div>
               <div id="run-history" class="history-list"></div>
+            </section>
+            <section class="console-section">
+              <div class="section-title">Audit</div>
+              <div id="audit-list" class="audit-list"></div>
             </section>
           </div>
         </section>

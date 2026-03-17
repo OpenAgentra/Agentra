@@ -550,6 +550,20 @@ class ThreadManager:
             )
             stored = run.report.record(screenshot_event)
             await self._broadcast(run, {"kind": "event", "event": self._event_for_http(run.run_id, stored)})
+            for extra_frame in result.extra_screenshots:
+                extra_event = {
+                    "type": "screenshot",
+                    "data": extra_frame.get("data", ""),
+                }
+                extra_event.update(
+                    {
+                        key: value
+                        for key, value in extra_frame.items()
+                        if key in {"focus_x", "focus_y", "frame_label", "summary"}
+                    }
+                )
+                stored = run.report.record(extra_event)
+                await self._broadcast(run, {"kind": "event", "event": self._event_for_http(run.run_id, stored)})
 
         tool_result_event = {
             "type": "tool_result",
@@ -616,6 +630,10 @@ class ThreadManager:
             "audit": thread.ledger.entries(run_id=thread.current_run_id) if thread.current_run_id else [],
             **self.browser_sessions.snapshot_payload(thread.thread_id),
         }
+
+    async def capture_live_browser_frame(self, thread_id: str) -> bytes | None:
+        self.get_thread(thread_id)
+        return await self.browser_sessions.capture_live_png(thread_id)
 
     async def _run_session(self, thread_id: str, run_id: str) -> None:
         thread = self.get_thread(thread_id)

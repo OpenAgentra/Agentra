@@ -10,6 +10,7 @@ from agentra.browser_runtime import BrowserSessionManager
 from agentra.tools.base import BaseTool, ToolResult
 
 _DEFAULT_FOCUS = (0.74, 0.2)
+_LIVE_REFRESH_INTERVALS = (0.2, 0.35)
 
 
 class BrowserTool(BaseTool):
@@ -173,6 +174,7 @@ class BrowserTool(BaseTool):
                     frame_label="browser · back",
                     summary="Going back",
                     focus=self._default_focus(),
+                    burst=True,
                 )
             if action == "forward":
                 await self._page.go_forward()
@@ -181,6 +183,7 @@ class BrowserTool(BaseTool):
                     frame_label="browser · forward",
                     summary="Going forward",
                     focus=self._default_focus(),
+                    burst=True,
                 )
             if action == "new_tab":
                 self._page = await self._browser.new_page()
@@ -189,6 +192,7 @@ class BrowserTool(BaseTool):
                     frame_label="browser · new_tab",
                     summary="Opening a new tab",
                     focus=self._default_focus(),
+                    burst=True,
                 )
             if action == "close_tab":
                 await self._page.close()
@@ -198,6 +202,7 @@ class BrowserTool(BaseTool):
                     frame_label="browser · close_tab",
                     summary="Closing the tab",
                     focus=self._default_focus(),
+                    burst=True,
                 )
             return ToolResult(success=False, error=f"Unknown action: {action!r}")
         except Exception as exc:  # noqa: BLE001
@@ -294,13 +299,14 @@ class BrowserTool(BaseTool):
     async def _navigate(self, url: str) -> ToolResult:
         if not url:
             return ToolResult(success=False, error="url is required for 'navigate'")
-        await self._page.goto(url, timeout=30000)
+        await self._page.goto(url, timeout=30000, wait_until="domcontentloaded")
         title = await self._page.title()
         return await self._capture_visual_state(
             output=f"Navigated to {url!r}. Page title: {title!r}",
             frame_label="browser · navigate",
             summary=f"Opening {self._short_url(url)}",
             focus=self._default_focus(),
+            burst=True,
         )
 
     async def _click(
@@ -317,6 +323,7 @@ class BrowserTool(BaseTool):
                 frame_label="browser · click",
                 summary=f"Clicking {selector}",
                 focus=focus,
+                burst=True,
             )
         if x is not None and y is not None:
             await self._page.mouse.click(x, y)
@@ -325,6 +332,7 @@ class BrowserTool(BaseTool):
                 frame_label="browser · click",
                 summary="Clicking the page",
                 focus=(x, y),
+                burst=True,
             )
         return ToolResult(success=False, error="Provide selector or x,y coordinates.")
 
@@ -337,6 +345,7 @@ class BrowserTool(BaseTool):
                 frame_label="browser · type",
                 summary=f"Typing into {selector}",
                 focus=focus,
+                burst=True,
             )
         await self._page.keyboard.type(text)
         return await self._capture_visual_state(
@@ -344,6 +353,7 @@ class BrowserTool(BaseTool):
             frame_label="browser · type",
             summary="Typing text",
             focus=self._default_focus(y=0.56),
+            burst=True,
         )
 
     async def _scroll(self, x: float, y: float, delta_y: float) -> ToolResult:
@@ -354,6 +364,7 @@ class BrowserTool(BaseTool):
             frame_label="browser · scroll",
             summary="Scrolling the page",
             focus=focus,
+            burst=True,
         )
 
     async def _screenshot(self) -> ToolResult:
@@ -385,6 +396,7 @@ class BrowserTool(BaseTool):
         frame_label: str,
         summary: str,
         focus: tuple[float, float],
+        burst: bool = False,
     ) -> ToolResult:
         png_bytes = await self._page.screenshot(type="png")
         focus_x, focus_y = self._normalize_focus(*focus)
@@ -392,6 +404,13 @@ class BrowserTool(BaseTool):
             success=True,
             output=output,
             screenshot_b64=base64.b64encode(png_bytes).decode(),
+            extra_screenshots=await self._capture_follow_up_frames(
+                frame_label=frame_label,
+                summary=summary,
+                focus_x=focus_x,
+                focus_y=focus_y,
+                enabled=burst,
+            ),
             metadata={
                 "focus_x": focus_x,
                 "focus_y": focus_y,
@@ -399,6 +418,32 @@ class BrowserTool(BaseTool):
                 "summary": summary,
             },
         )
+
+    async def _capture_follow_up_frames(
+        self,
+        *,
+        frame_label: str,
+        summary: str,
+        focus_x: float,
+        focus_y: float,
+        enabled: bool,
+    ) -> list[dict[str, Any]]:
+        if not enabled or self._page is None:
+            return []
+        frames: list[dict[str, Any]] = []
+        for index, delay in enumerate(_LIVE_REFRESH_INTERVALS, start=1):
+            await asyncio.sleep(delay)
+            png_bytes = await self._page.screenshot(type="png")
+            frames.append(
+                {
+                    "data": base64.b64encode(png_bytes).decode(),
+                    "frame_label": frame_label,
+                    "summary": f"{summary} (refresh {index})",
+                    "focus_x": focus_x,
+                    "focus_y": focus_y,
+                }
+            )
+        return frames
 
     async def _selector_focus(self, selector: str) -> tuple[float, float]:
         locator = self._page.locator(selector).first

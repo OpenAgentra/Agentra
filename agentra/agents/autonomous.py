@@ -613,6 +613,19 @@ class AutonomousAgent:
                 },
             )
             yield screenshot_event
+            for extra_frame in result.extra_screenshots:
+                extra_event = {
+                    "type": "screenshot",
+                    "data": extra_frame.get("data", ""),
+                }
+                extra_event.update(
+                    {
+                        key: value
+                        for key, value in extra_frame.items()
+                        if key in {"focus_x", "focus_y", "frame_label", "summary"}
+                    }
+                )
+                yield extra_event
 
         result_text = str(result)
         await self._remember(
