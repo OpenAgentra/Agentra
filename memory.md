@@ -1,161 +1,68 @@
-# Agentra Project Memory
+# Project Memory & Instructions
 
-This file is the quick handoff for future chats/threads. Read this first before making changes.
+## 1. Project Overview
+* **Project Name:** Agentra
+* **Purpose:** Open-source autonomous AI agent runtime for real computer-use workflows: browser automation, desktop control, filesystem/terminal operations, memory, approvals, and live visual playback.
+* **Tech Stack:** Python 3.10+, Click CLI, Rich terminal UI, FastAPI live app, Playwright, Pydantic, provider adapters for OpenAI/Anthropic/Gemini/Ollama, pytest, Ruff, Black.
+* **Core Architectural Pattern:** Thread-aware Python monolith with pluggable providers, tools, runtime sessions, and report/live UI layers.
 
-## What This Project Is
+## 2. Immutable Rules (NEVER Do This)
+* Never hardcode demo-only flows, URLs, or provider-specific hacks that make the MVP look fake.
+* Never expose hidden chain-of-thought in the UI; only show concise reasoning summaries, action intent, and observable results.
+* Never casually commit nested runtime workspaces such as `workspace/`, `workspace-windows-demo/`, `workspace-windows-demo-2/`, or `tmp-runtime-debug/.threads/.../workspace`.
+* Never use destructive git commands like `git reset --hard` or revert user changes without explicit permission.
+* Never bypass approval checks for risky browser, terminal, filesystem, git, or computer actions.
 
-Agentra is an open-source autonomous AI agent project focused on real computer-use workflows:
+## 3. Coding & Style Standards (ALWAYS Do This)
+* **Language:** Use Python for new backend/runtime code and keep new files typed where practical.
+* **Architecture:** Extend the existing modules instead of creating parallel systems; runtime logic belongs near `agentra/runtime.py`, approvals near `agentra/approval_policy.py`, browser session behavior near `agentra/browser_runtime.py`, and live playback/report behavior near `agentra/live_app.py` and `agentra/run_report.py`.
+* **Formatting:** Follow repo tooling: line length `100`, format with `black`, lint with `ruff`.
+* **Naming:** `snake_case` for functions/variables/modules, `PascalCase` for classes, clear action-oriented names for runtime events and policy objects.
+* **Comments:** Keep comments brief and high-signal; add them only when code flow is not obvious.
+* **Behavior:** Prefer generic, reusable runtime improvements over one-off UI hacks or special cases.
 
-- browser automation
-- desktop/computer control
-- filesystem and terminal access
-- git-aware workspace handling
-- multimodal and multi-provider LLM support
-- live visual playback and HTML run reports
+## 4. Key Project Files & Directories
+* `agentra/cli.py`: Main CLI entrypoints for `agentra run` and `agentra app`.
+* `agentra/runtime.py`: Thread-aware runtime, approvals/questions/human actions, thread sessions, ledger persistence.
+* `agentra/approval_policy.py`: Ordered approval-rule engine.
+* `agentra/browser_runtime.py`: Shared Playwright runtime and thread-scoped browser sessions.
+* `agentra/live_app.py`: Local live web app / TV-style interface.
+* `agentra/run_report.py`: HTML run report generation and run finalization.
+* `agentra/run_store.py`: Stored events/frames used by live playback and reports.
+* `agentra/llm/`: Provider implementations and provider abstractions.
+* `agentra/tools/`: Browser, computer, filesystem, terminal, and git tools.
+* `agentra/memory/`: Embedding memory, providers, and workspace-related memory utilities.
+* `tests/`: Runtime, live app, browser, approval, memory, report, and provider test coverage.
+* `README.md`: Main product and setup documentation.
+* `TEACHER_BRIEF.md`: Presentation/demo narrative for explaining the project externally.
 
-The intent is not to build a fake demo. The guiding product direction is a real, flexible MVP that can grow into a controllable, thread-aware agent runtime.
+## 5. Development Workflow
+* **Install Locally:** `pip install -e ".[dev]"`
+* **Install Browser Runtime:** `python -m playwright install chromium`
+* **Run CLI Locally:** `python -m agentra.cli run "Open python.org and summarize it"`
+* **Run Live App:** `python -m agentra.cli app --provider gemini --model gemini-3-flash-preview --no-headless`
+* **Running Tests:** `pytest tests -v`
+* **Focused Tests:** `pytest tests/test_runtime.py tests/test_live_app.py -q`
+* **Linting:** `ruff check .`
+* **Formatting:** `black .`
 
-## Main User-Facing Modes
+## 6. Known Quirks & Gotchas
+* On Windows, `PYTHONUTF8=1` is important to avoid Unicode/Rich console issues.
+* The repo is used from both Windows and WSL; be explicit about which environment a command is meant for.
+* `workspace*` paths are nested git repos / generated artifacts, so top-level `git status` can look dirty even when product code is clean.
+* Gemini has been the main richer MVP/demo provider path; Ollama is useful for local smoke tests but may be limited depending on the installed model.
+* `agentra/live_app.py` is large and should be edited carefully; verify you are changing the active UI/render path, not a stale duplicate block.
 
-- `agentra run ...`
-  The CLI path for running the agent on a single goal.
-- `agentra app ...`
-  The local live web UI for watching runs, reviewing frames/events, and demoing the system visually.
+## 7. Memory & Context Management
+* **Memory Depth:** Keep this file short enough to scan quickly; target under 200 lines.
+* **Updating:** Update this file whenever architecture, workflow, major constraints, or project priorities change.
+* **Resume Context:** If a new chat says `continue`, assume the most likely focus is the backend milestone around approvals, shared browser session, memory, and auditability unless the user redirects.
+* **Recent Direction:** The project moved from basic setup/demo work toward a trustworthy runtime: approval engine, shared browser runtime, thread/local memory, and audit ledger/reporting.
+* **External Notes:** Read `README.md` for setup and `TEACHER_BRIEF.md` for presentation/demo context.
 
-## Core Code Areas
-
-- `agentra/cli.py`
-  CLI entrypoints for `run` and `app`.
-- `agentra/runtime.py`
-  Thread-aware runtime, thread sessions, approvals/questions/human actions, and workspace ledger/audit persistence.
-- `agentra/approval_policy.py`
-  Rule-based approval engine for risky tool actions.
-- `agentra/browser_runtime.py`
-  Shared Playwright runtime and thread-scoped browser sessions.
-- `agentra/live_app.py`
-  Local live UI/harness for watching and controlling runs.
-- `agentra/run_report.py`
-  Stores run events and renders the HTML report/timeline output.
-- `agentra/run_store.py`
-  Run/event/frame storage that backs reports and live playback.
-- `agentra/memory/embedding_memory.py`
-  Embedding-based memory storage/retrieval.
-- `agentra/memory/providers.py`
-  Embedding provider abstractions.
-- `agentra/memory/workspace.py`
-  Workspace-related memory/state handling.
-- `agentra/llm/*.py`
-  Provider implementations for OpenAI, Anthropic, Ollama, and Gemini.
-- `agentra/tools/*.py`
-  Browser, computer, filesystem, terminal, and git tools.
-
-## Product Direction We Have Been Following
-
-The project evolved in roughly this order:
-
-1. Get the project running locally.
-2. Make Gemini usable for the MVP.
-3. Add a rich HTML report and a live local UI.
-4. Avoid hardcoded demo-only behavior and keep the runtime generic.
-5. Move toward a more professional backend:
-   - approval policy engine
-   - shared browser session
-   - explicit memory architecture
-   - audit/ledger trail
-
-## Important Recent Milestones
-
-- `c166de5`
-  Thread runtime and live harness foundation.
-- `004d985`
-  Merge of `codex/gemini-mvp-foundation`.
-- `fcec419`
-  Minimal web test harness UI.
-- `8ce0ee9`
-  Multi-thread TV switching stabilization.
-- `25df1bc`
-  Approval engine and shared browser runtime.
-- `c29c8d2`
-  Live refresh improvements for the TV box.
-- `ec27c39`
-  Advanced button for hiding unnecessary test sections in the UI.
-- `b89f465`
-  Initial findings document for presentation/storytelling.
-- `aac9baf`
-  Teacher presentation brief.
-
-## Last Active Focus
-
-The latest meaningful project focus was the backend milestone around:
-
-- stronger approval-policy behavior
-- real shared browser session semantics
-- thread-local working memory plus project-wide/long-term memory
-- workspace ledger and reportable audit trail
-
-In other words: the center of gravity moved from "make the demo look good" to "make the runtime trustworthy and explainable."
-
-## Current High-Level State
-
-The repo already contains:
-
-- a thread-aware runtime
-- a rule-based approval engine
-- a shared browser runtime/session layer
-- a local live web app
-- HTML run reports
-- provider abstractions for multiple LLM backends
-- memory-related modules and tests
-
-This means the project is beyond the "blank prototype" stage. Most future work should extend and harden the existing runtime instead of replacing it.
-
-## Practical Notes For New Threads
-
-- Read this file first, then `README.md`, then any task-specific docs such as `TEACHER_BRIEF.md`.
-- Assume the goal is a real MVP, not hardcoded eyewash.
-- Prefer improving the runtime and architecture over cosmetic one-off hacks unless the user explicitly asks for UI polish.
-- Be careful with generated workspace artifacts and nested repos.
-
-## Very Important Repo Notes
-
-- The top-level repo is the product code.
-- `workspace`, `workspace-windows-demo`, `workspace-windows-demo-2`, and `tmp-runtime-debug/.threads/.../workspace` are nested git workspaces / generated runtime artifacts.
-- Do not casually commit those nested repos or their generated screenshots/reports/memory files unless the user explicitly wants that.
-- When git looks "dirty", first verify whether the dirt is in the top-level product repo or only in those nested workspace repos.
-
-## Environment Notes
-
-- This project has been run in both Windows and WSL contexts.
-- The repo path in WSL is:
-  `/mnt/c/Users/ariba/OneDrive/Documenti/Software Projects/AI Projects/Agentra/Agentra`
-- A common Windows runtime path used in previous work is:
-  `C:\Users\ariba\anaconda3\python.exe`
-- `PYTHONUTF8=1` has been important on Windows to avoid Unicode console issues.
-- Ollama was used for early/local smoke tests.
-- Gemini has been the main richer-demo provider path for the MVP.
-
-## What To Do Next If A New Chat Resumes Work
-
-If the user says "continue" and gives no extra direction, treat the likely next step as one of:
-
-1. continue backend milestone work around approval/shared-browser/memory/audit
-2. stabilize the live app around that backend
-3. prepare a demo or teacher-facing explanation using the existing runtime
-
-If unclear, inspect:
-
-- recent commits
-- `agentra/runtime.py`
-- `agentra/approval_policy.py`
-- `agentra/browser_runtime.py`
-- `agentra/live_app.py`
-- `agentra/run_report.py`
-- `TEACHER_BRIEF.md`
-
-## Working Assumptions To Preserve
-
-- Keep the system generic.
-- Do not hardcode a demo flow.
-- Preserve user control for risky actions.
-- Keep the live UI explainable without exposing hidden chain-of-thought.
-- Prefer thread-aware state and auditability over ad hoc shortcuts.
+## 8. Git/Command Guidelines
+* Use Conventional Commit style when possible, e.g. `feat: ...`, `fix: ...`, `docs: ...`.
+* Check whether changes are in the top-level repo or only inside generated nested workspace repos before committing.
+* Keep product-code commits separate from generated run artifacts.
+* Prefer non-interactive git commands.
+* Before pushing, verify what branch you are on and what exact files are staged.
