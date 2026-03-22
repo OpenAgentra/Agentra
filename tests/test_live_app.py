@@ -161,18 +161,33 @@ async def test_live_app_root_renders_operator_console(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert "Otonom Ajan - Görev Paneli" in response.text
+    assert "Logs" in response.text
     assert "Yeni Run" in response.text
     assert "Threadler" in response.text
     assert "Seçili Thread" in response.text
     assert "Bekleyen Onaylar" in response.text
     assert "Bekleyen Sorular" in response.text
-    assert "Manuel Browser Kontrolleri" in response.text
+    assert "Manuel Browser Kontrolleri" not in response.text
+    assert '<div class="section-title">Audit</div>' not in response.text
     assert "Yeni thread'de başlat" in response.text
     assert "Seçili thread'e ekle" in response.text
     assert "Yeni bir komut veya görev girin" in response.text
     assert "Agentra Canlı Kumanda" not in response.text
     assert "Sağlayıcı" not in response.text
     assert "Model" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_live_app_logs_page_renders(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, [])
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/logs")
+
+    assert response.status_code == 200
+    assert "Agentra Logs" in response.text
+    assert "Server Log Tail" in response.text
+    assert "agentra-app.log" in response.text
 
 
 @pytest.mark.asyncio

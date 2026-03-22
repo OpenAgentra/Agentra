@@ -4,22 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 from agentra.approval_policy import ApprovalPolicyEngine
 from agentra.browser_runtime import BrowserSessionManager
 from agentra.config import AgentConfig
 from agentra.llm.registry import get_provider_spec
+from agentra.logging_utils import exception_details
 from agentra.run_report import RunReport
 
 RunSnapshot = dict[str, Any]
 EventPayload = dict[str, Any]
 AgentFactory = Callable[[AgentConfig], Any]
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -354,6 +358,15 @@ class ThreadManager:
                 details={"goal": request.goal, "status": "running"},
             )
             self._persist_thread(thread)
+            logger.info(
+                "Thread run started thread_id=%s run_id=%s provider=%s model=%s goal=%r workspace=%s",
+                thread.thread_id,
+                run.run_id,
+                config.llm_provider,
+                config.llm_model,
+                request.goal,
+                thread.workspace_dir,
+            )
             run.task = asyncio.create_task(self._run_session(thread.thread_id, run.run_id))
             return self.snapshot_for_http(run)
 
@@ -411,6 +424,7 @@ class ThreadManager:
             stored = run.report.record(payload)
             await self._broadcast(run, {"kind": "event", "event": self._event_for_http(run.run_id, stored)})
         self._persist_thread(thread)
+        logger.info("Thread paused thread_id=%s run_id=%s reason=%r", thread.thread_id, thread.current_run_id, reason)
         return self.thread_snapshot_for_http(thread)
 
     async def resume_thread(self, thread_id: str, *, reason: str = "Agent resumed control.") -> dict[str, Any]:
@@ -434,6 +448,7 @@ class ThreadManager:
             stored = run.report.record(payload)
             await self._broadcast(run, {"kind": "event", "event": self._event_for_http(run.run_id, stored)})
         self._persist_thread(thread)
+        logger.info("Thread resumed thread_id=%s run_id=%s reason=%r", thread.thread_id, thread.current_run_id, reason)
         return self.thread_snapshot_for_http(thread)
 
     async def respond_to_approval(
@@ -576,6 +591,14 @@ class ThreadManager:
         stored = run.report.record(tool_result_event)
         await self._broadcast(run, {"kind": "event", "event": self._event_for_http(run.run_id, stored)})
         self._persist_thread(thread)
+        logger.info(
+            "Human action applied thread_id=%s run_id=%s tool=%s args=%s success=%s",
+            thread.thread_id,
+            run.run_id,
+            tool,
+            args,
+            result.success,
+        )
         return self.thread_snapshot_for_http(thread)
 
     def subscribe(self, run_id: str) -> asyncio.Queue[EventPayload]:
@@ -598,6 +621,7 @@ class ThreadManager:
         snapshot["thread_status"] = thread.status
         snapshot["handoff_state"] = thread.handoff_state
         snapshot["report_url"] = f"/runs/{session.run_id}/report"
+        snapshot["logs_url"] = self._logs_url(thread_id=thread.thread_id, run_id=session.run_id)
         snapshot["events"] = [self._event_for_http(session.run_id, event) for event in snapshot["events"]]
         snapshot["frames"] = [self._frame_for_http(session.run_id, frame) for frame in snapshot["frames"]]
         snapshot["steps"] = _build_steps(snapshot["events"])
@@ -619,6 +643,7 @@ class ThreadManager:
             "memory_dir": str(thread.memory_dir),
             "long_term_memory_dir": str(thread.long_term_memory_dir),
             "current_run_id": thread.current_run_id,
+            "logs_url": self._logs_url(thread_id=thread.thread_id, run_id=thread.current_run_id),
             "runs": [
                 self._run_summary_for_http(self._runs[run_id])
                 for run_id in thread.run_ids
@@ -661,6 +686,12 @@ class ThreadManager:
                     status = "completed"
                 elif stored["type"] == "error":
                     status = "error"
+                    logger.error(
+                        "Thread run emitted error event thread_id=%s run_id=%s content=%r",
+                        thread.thread_id,
+                        session.run_id,
+                        stored.get("content", ""),
+                    )
                 elif stored["type"] in {"approval_requested", "question_requested"}:
                     thread.status = "blocked_waiting_user"
                 await self._capture_runtime_state(thread, stored)
@@ -673,7 +704,15 @@ class ThreadManager:
                 )
         except Exception as exc:  # noqa: BLE001
             status = "error"
-            stored = session.report.record({"type": "error", "content": str(exc)})
+            details = exception_details(exc)
+            logger.exception(
+                "Thread run crashed thread_id=%s run_id=%s goal=%r",
+                thread.thread_id,
+                session.run_id,
+                session.goal,
+            )
+            stored = session.report.record({"type": "error", "content": str(exc), "details": details})
+            thread.ledger.append_entry("run_error", run_id=session.run_id, details=details)
             await self._broadcast(
                 session,
                 {"kind": "event", "event": self._event_for_http(session.run_id, stored)},
@@ -703,6 +742,12 @@ class ThreadManager:
                 details={"status": status, "workspace_audit": workspace_audit},
             )
             self._persist_thread(thread)
+            logger.info(
+                "Thread run finished thread_id=%s run_id=%s status=%s",
+                thread.thread_id,
+                session.run_id,
+                status,
+            )
             snapshot = self.snapshot_for_http(session)
             await self._broadcast(session, {"kind": "status", "status": status, "snapshot": snapshot})
             await self._broadcast(session, {"kind": "complete", "status": status})
@@ -761,6 +806,17 @@ class ThreadManager:
             thread.status = "completed"
         elif event_type == "error":
             thread.status = "error"
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            thread.ledger.append_entry(
+                "run_error",
+                run_id=thread.current_run_id,
+                details={
+                    "message": str(event.get("content", "")),
+                    "summary": str(event.get("summary", "")),
+                    "exception_type": str(details.get("exception_type", "")),
+                    "traceback": str(details.get("traceback", "")),
+                },
+            )
         elif event_type not in {"paused", "resumed"} and thread.status not in {"paused_for_user", "blocked_waiting_user"}:
             thread.status = "running"
         self._persist_thread(thread)
@@ -838,6 +894,16 @@ class ThreadManager:
     @staticmethod
     def _asset_url(run_id: str, image_path: str) -> str:
         return f"/runs/{run_id}/assets/{Path(image_path).name}"
+
+    @staticmethod
+    def _logs_url(*, thread_id: str | None = None, run_id: str | None = None) -> str:
+        params: dict[str, str] = {}
+        if thread_id:
+            params["thread_id"] = thread_id
+        if run_id:
+            params["run_id"] = run_id
+        query = urlencode(params)
+        return f"/logs?{query}" if query else "/logs"
 
     def _thread_for_request(self, request: Any) -> ThreadSession:
         thread_id = getattr(request, "thread_id", None)
@@ -926,6 +992,7 @@ class ThreadManager:
             "started_at": run.started_at,
             "finished_at": run.finished_at,
             "report_url": f"/runs/{run.run_id}/report",
+            "logs_url": ThreadManager._logs_url(thread_id=run.thread_id, run_id=run.run_id),
         }
 
 

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
 
 import click
 from agentra.llm.registry import get_provider_spec, provider_ids
+from agentra.logging_utils import configure_app_logging
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -30,6 +32,7 @@ def _enable_utf8_console() -> None:
 
 _enable_utf8_console()
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _runtime_overrides(
@@ -165,6 +168,7 @@ def run(
 
     overrides = _runtime_overrides(provider, model, headless, workspace, max_iterations)
     config = AgentConfig(**overrides)
+    log_path = configure_app_logging(config.workspace_dir)
     reporter = RunReport(config.workspace_dir, goal, config.llm_provider, config.llm_model) if report else None
 
     console.print(
@@ -178,10 +182,18 @@ def run(
         f"[dim]Provider: {config.llm_provider} / Model: {config.llm_model} / "
         f"Workspace: {config.workspace_dir}[/]"
     )
+    console.print(f"[dim]Logs: {log_path}[/]")
     if reporter:
         console.print(f"[dim]Run report: {reporter.html_path}[/]")
         if open_report:
             reporter.open()
+    logger.info(
+        "CLI run started provider=%s model=%s workspace=%s goal=%r",
+        config.llm_provider,
+        config.llm_model,
+        config.workspace_dir,
+        goal,
+    )
 
     asyncio.run(_async_run(goal, config, orchestrate, reporter))
 
@@ -235,6 +247,7 @@ def app(
 
     overrides = _runtime_overrides(provider, model, headless, workspace, max_iterations)
     config = AgentConfig(**overrides)
+    log_path = configure_app_logging(config.workspace_dir)
     web_app = create_live_app(config)
     url = f"http://{host}:{port}/"
 
@@ -242,10 +255,20 @@ def app(
         Panel(
             f"[bold]{url}[/]\n\n"
             f"[dim]Provider: {config.llm_provider} / Model: {config.llm_model}[/]\n"
-            f"[dim]Workspace: {config.workspace_dir}[/]",
+            f"[dim]Workspace: {config.workspace_dir}[/]\n"
+            f"[dim]Logs: {log_path}[/]",
             title="[bold blue]Agentra App[/]",
             border_style="blue",
         )
+    )
+    logger.info(
+        "CLI app startup host=%s port=%s provider=%s model=%s workspace=%s log_path=%s",
+        host,
+        port,
+        config.llm_provider,
+        config.llm_model,
+        config.workspace_dir,
+        log_path,
     )
 
     if open_browser:

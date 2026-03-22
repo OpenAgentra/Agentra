@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import logging
 import threading
 import webbrowser
 from dataclasses import dataclass, field
@@ -14,12 +16,14 @@ from pydantic import BaseModel, Field
 
 from agentra.config import AgentConfig
 from agentra.llm.registry import get_provider_spec
+from agentra.logging_utils import app_log_path, configure_app_logging, exception_details, read_log_tail
 from agentra.runtime import ThreadManager
 from agentra.run_report import RunReport
 
 RunSnapshot = dict[str, Any]
 EventPayload = dict[str, Any]
 AgentFactory = Callable[[AgentConfig], Any]
+logger = logging.getLogger(__name__)
 
 _DEFAULT_FOCUS = (0.74, 0.2)
 
@@ -163,7 +167,9 @@ class LiveRunManager:
                 )
         except Exception as exc:  # noqa: BLE001
             status = "error"
-            stored = session.report.record({"type": "error", "content": str(exc)})
+            details = exception_details(exc)
+            logger.exception("Live run crashed run_id=%s goal=%r", session.run_id, session.goal)
+            stored = session.report.record({"type": "error", "content": str(exc), "details": details})
             await self._broadcast(
                 session,
                 {"kind": "event", "event": self._event_for_http(session.run_id, stored)},
@@ -500,9 +506,32 @@ def create_live_app(
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 
+    log_path = configure_app_logging(base_config.workspace_dir)
     app = FastAPI(title="Agentra App")
     manager = ThreadManager(base_config=base_config, agent_factory=agent_factory)
     app.state.manager = manager
+    app.state.log_path = log_path
+    root_logger = logging.getLogger()
+    app.state.log_handler = next(
+        (handler for handler in root_logger.handlers if getattr(handler, "baseFilename", "") == str(log_path)),
+        None,
+    )
+    logger.info(
+        "Live app initialized workspace=%s provider=%s model=%s log_path=%s",
+        base_config.workspace_dir,
+        base_config.llm_provider,
+        base_config.llm_model,
+        log_path,
+    )
+
+    @app.on_event("shutdown")
+    async def close_app_log_handler() -> None:
+        handler = getattr(app.state, "log_handler", None)
+        if handler is None:
+            return
+        root_logger.removeHandler(handler)
+        handler.close()
+        app.state.log_handler = None
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -593,6 +622,19 @@ def create_live_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Run not found.") from exc
         return FileResponse(session.report.html_path)
+
+    @app.get("/logs", response_class=HTMLResponse)
+    async def get_logs(run_id: str | None = None, thread_id: str | None = None, lines: int = 400) -> HTMLResponse:
+        safe_lines = max(50, min(lines, 1500))
+        return HTMLResponse(
+            _render_logs_html(
+                base_config.workspace_dir,
+                app_log_path(base_config.workspace_dir),
+                run_id=run_id,
+                thread_id=thread_id,
+                max_lines=safe_lines,
+            )
+        )
 
     @app.get("/threads")
     async def list_threads() -> JSONResponse:
@@ -685,6 +727,234 @@ def _sse_payload(payload: EventPayload) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _resolve_run_artifacts(workspace_dir: Path, run_id: str | None) -> dict[str, Path] | None:
+    if not run_id:
+        return None
+    candidates = [workspace_dir / ".runs" / run_id]
+    candidates.extend(sorted((workspace_dir / ".threads").glob(f"*/workspace/.runs/{run_id}")))
+    for run_dir in candidates:
+        if run_dir.exists():
+            return {
+                "run_dir": run_dir,
+                "events_path": run_dir / "events.json",
+                "report_path": run_dir / "index.html",
+            }
+    return None
+
+
+def _resolve_thread_artifacts(workspace_dir: Path, thread_id: str | None) -> dict[str, Path] | None:
+    if not thread_id:
+        return None
+    thread_dir = workspace_dir / ".threads" / thread_id
+    if not thread_dir.exists():
+        return None
+    return {
+        "thread_dir": thread_dir,
+        "ledger_path": thread_dir / "ledger.json",
+        "audit_path": thread_dir / "audit.jsonl",
+    }
+
+
+def _latest_error_from_events(events_path: Path) -> dict[str, str] | None:
+    if not events_path.exists():
+        return None
+    try:
+        payload = json.loads(events_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    for event in reversed(payload.get("events", [])):
+        if str(event.get("type", "")) != "error":
+            continue
+        details = event.get("details") if isinstance(event.get("details"), dict) else {}
+        return {
+            "timestamp": str(event.get("timestamp", "")),
+            "message": str(event.get("content", "")),
+            "exception_type": str(details.get("exception_type", "")),
+            "traceback": str(details.get("traceback", "")),
+        }
+    return None
+
+
+def _render_logs_html(
+    workspace_dir: Path,
+    log_path: Path,
+    *,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+    max_lines: int = 400,
+) -> str:
+    run_artifacts = _resolve_run_artifacts(workspace_dir, run_id)
+    thread_artifacts = _resolve_thread_artifacts(workspace_dir, thread_id)
+    latest_error = _latest_error_from_events(run_artifacts["events_path"]) if run_artifacts else None
+    ledger_text = (
+        thread_artifacts["ledger_path"].read_text(encoding="utf-8", errors="replace")
+        if thread_artifacts and thread_artifacts["ledger_path"].exists()
+        else ""
+    )
+    audit_text = (
+        read_log_tail(thread_artifacts["audit_path"], max_lines=80)
+        if thread_artifacts and thread_artifacts["audit_path"].exists()
+        else ""
+    )
+    server_log_text = read_log_tail(log_path, max_lines=max_lines) or "No log lines have been written yet."
+
+    latest_error_html = ""
+    if latest_error:
+        trace_html = ""
+        if latest_error["traceback"]:
+            trace_html = "<h2>Traceback</h2>" f"<pre>{html.escape(latest_error['traceback'])}</pre>"
+        latest_error_html = (
+            "<section class=\"card\">"
+            "<h2>Latest Run Error</h2>"
+            f"<div class=\"meta\">{html.escape(latest_error['timestamp'] or 'unknown time')}</div>"
+            f"<pre>{html.escape(latest_error['message'] or 'Unknown error')}</pre>"
+            f"{trace_html}"
+            "</section>"
+        )
+
+    run_paths_html = ""
+    if run_artifacts:
+        run_paths_html = (
+            "<section class=\"card\">"
+            "<h2>Run Artifacts</h2>"
+            f"<div class=\"meta\">Run ID: {html.escape(run_id or '')}</div>"
+            f"<div class=\"path\"><strong>Run Dir</strong> {html.escape(str(run_artifacts['run_dir']))}</div>"
+            f"<div class=\"path\"><strong>Events</strong> {html.escape(str(run_artifacts['events_path']))}</div>"
+            f"<div class=\"path\"><strong>Report</strong> {html.escape(str(run_artifacts['report_path']))}</div>"
+            "</section>"
+        )
+
+    thread_paths_html = ""
+    if thread_artifacts:
+        thread_paths_html = (
+            "<section class=\"card\">"
+            "<h2>Thread Artifacts</h2>"
+            f"<div class=\"meta\">Thread ID: {html.escape(thread_id or '')}</div>"
+            f"<div class=\"path\"><strong>Thread Dir</strong> {html.escape(str(thread_artifacts['thread_dir']))}</div>"
+            f"<div class=\"path\"><strong>Ledger</strong> {html.escape(str(thread_artifacts['ledger_path']))}</div>"
+            f"<div class=\"path\"><strong>Audit</strong> {html.escape(str(thread_artifacts['audit_path']))}</div>"
+            "</section>"
+        )
+
+    ledger_html = ""
+    if ledger_text:
+        ledger_html = "<section class=\"card\"><h2>Thread Ledger</h2>" f"<pre>{html.escape(ledger_text)}</pre></section>"
+
+    audit_html = ""
+    if audit_text:
+        audit_html = "<section class=\"card\"><h2>Thread Audit Tail</h2>" f"<pre>{html.escape(audit_text)}</pre></section>"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="refresh" content="5" />
+  <title>Agentra Logs</title>
+  <style>
+    :root {{
+      --bg: #0b1424;
+      --panel: #13213a;
+      --line: rgba(167, 193, 235, 0.24);
+      --text: #edf4ff;
+      --muted: #9ab0d2;
+      --accent: #78b8ff;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Aptos", "Segoe UI Variable", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(81, 149, 255, 0.18), transparent 28%),
+        linear-gradient(180deg, #09111f 0%, #0f1b31 100%);
+      color: var(--text);
+    }}
+    .page {{
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 28px 20px 40px;
+      display: grid;
+      gap: 18px;
+    }}
+    .hero {{
+      display: grid;
+      gap: 8px;
+    }}
+    h1, h2 {{
+      margin: 0;
+    }}
+    h1 {{
+      font-size: 28px;
+    }}
+    h2 {{
+      font-size: 16px;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .grid {{
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    }}
+    .card {{
+      display: grid;
+      gap: 10px;
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(19, 33, 58, 0.94);
+      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.22);
+    }}
+    .path {{
+      font-size: 13px;
+      line-height: 1.5;
+      word-break: break-all;
+    }}
+    pre {{
+      margin: 0;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(167, 193, 235, 0.16);
+      background: rgba(4, 9, 18, 0.84);
+      color: #e8f0ff;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: "Cascadia Code", "Consolas", monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }}
+    .accent {{
+      color: var(--accent);
+    }}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <h1>Agentra Logs</h1>
+      <div class="meta">Detailed app and thread diagnostics. This page auto-refreshes every 5 seconds.</div>
+      <div class="meta accent">Server Log: {html.escape(str(log_path))}</div>
+    </section>
+    <section class="grid">
+      {run_paths_html}
+      {thread_paths_html}
+      {latest_error_html}
+    </section>
+    {ledger_html}
+    {audit_html}
+    <section class="card">
+      <h2>Server Log Tail</h2>
+      <div class="meta">Showing the last {max_lines} lines from {html.escape(str(log_path.name))}</div>
+      <pre>{html.escape(server_log_text)}</pre>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
 def _render_app_html(boot: dict[str, Any]) -> str:
     boot_json = json.dumps(boot).replace("</", "<\\/")
     return f"""<!doctype html>
@@ -742,7 +1012,7 @@ a { color: inherit; text-decoration: none; }
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: space-between;
   gap: 14px;
   padding: 0 18px;
   background: rgba(255,255,255,0.96);
@@ -752,6 +1022,11 @@ a { color: inherit; text-decoration: none; }
   display: flex;
   align-items: center;
   gap: 14px;
+}
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 .nav-button,
 .stage-close {
@@ -1253,6 +1528,82 @@ def _app_styles_tv() -> str:
   display: grid;
   gap: 0;
   padding: 8px 12px 0;
+}
+.manual-dock {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px 0;
+}
+.manual-dock-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.manual-dock-copy {
+  display: grid;
+  gap: 4px;
+}
+.manual-dock-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.86);
+}
+.manual-dock-text {
+  font-size: 13px;
+  line-height: 1.45;
+  color: rgba(226, 236, 255, 0.88);
+}
+.manual-mode-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mode-chip {
+  appearance: none;
+  border: 1px solid rgba(255,255,255,0.24);
+  background: rgba(255,255,255,0.08);
+  color: rgba(255,255,255,0.9);
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+}
+.mode-chip:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: rgba(255,255,255,0.12);
+}
+.mode-chip.active {
+  background: rgba(255,255,255,0.92);
+  color: #16203a;
+  border-color: rgba(255,255,255,0.92);
+  box-shadow: 0 8px 18px rgba(255,255,255,0.18);
+}
+.mode-chip:disabled {
+  opacity: 0.46;
+  cursor: not-allowed;
+}
+.tv-screen.manual-click .tv-image {
+  cursor: crosshair;
+}
+.tv-screen.manual-type .tv-image {
+  cursor: text;
+}
+.tv-screen.manual-scroll .tv-image {
+  cursor: ns-resize;
+}
+.manual-inline-note {
+  font-size: 12px;
+  color: rgba(226, 236, 255, 0.82);
+}
+.manual-dock .inline-error {
+  min-height: 18px;
 }
 .scrub-row {
   display: grid;
@@ -2546,6 +2897,9 @@ function mount() {
             <div class="app-subtitle" id="project-stamp"></div>
           </div>
         </div>
+        <div class="topbar-actions">
+          <a id="global-logs-link" class="ghost-button" href="/logs" target="_blank" rel="noreferrer">Logs</a>
+        </div>
       </header>
       <section class="workspace">
         <section class="left-pane">
@@ -2590,18 +2944,8 @@ function mount() {
             </section>
 
 <section class="console-section" hidden>
-              <div class="section-title">Manuel Browser Kontrolleri</div>
-              <div id="manual-controls"></div>
-              <div class="inline-error" id="manual-error"></div>
-            </section>
-
-<section class="console-section" hidden>
               <div class="section-title">Run Geçmişi</div>
               <div id="run-history" class="history-list"></div>
-            </section>
-            <section class="console-section" hidden>
-              <div class="section-title">Audit</div>
-              <div id="audit-list" class="audit-list"></div>
             </section>
           </div>
         </section>
@@ -2649,8 +2993,6 @@ function mount() {
   document.getElementById("approval-list").addEventListener("click", handleConsoleClick);
   document.getElementById("question-list").addEventListener("click", handleConsoleClick);
   document.getElementById("question-list").addEventListener("input", handleConsoleInput);
-  document.getElementById("manual-controls").addEventListener("click", handleConsoleClick);
-  document.getElementById("manual-controls").addEventListener("input", handleConsoleInput);
   document.getElementById("run-history").addEventListener("click", handleConsoleClick);
 
   setupScrubber();
@@ -2735,6 +3077,8 @@ const state = {
   },
   ui: {
     showAdvanced: false,
+    manualMode: "click",
+    manualPending: false,
   },
 };
 
@@ -2841,6 +3185,32 @@ function runSummaries(thread) {
 function canManualControl(thread) {
   if (!thread || !activeRunForThread(thread)) return false;
   return thread.status === "paused_for_user" || thread.status === "blocked_waiting_user";
+}
+
+function canDirectPreviewControl() {
+  const thread = state.activeThread;
+  const activeRun = activeRunForThread(thread);
+  if (!canManualControl(thread) || !activeRun || !state.selectedRunId) return false;
+  if (state.historyMode) return false;
+  return activeRun.run_id === state.selectedRunId;
+}
+
+function manualModeText(mode) {
+  if (mode === "type") return "Yaz";
+  if (mode === "scroll") return "Kaydır";
+  return "Tıkla";
+}
+
+function manualModeHint(mode, enabled) {
+  if (!enabled) {
+    if (!state.activeThread) return "Bir thread seç ya da yeni run başlat.";
+    if (state.historyMode) return "Manuel kontrol için aktif run'a dön.";
+    if (activeRunForThread(state.activeThread)) return "Kontrolü almak için önce pause et.";
+    return "Aktif run olmadığında manuel kontrol kapalıdır.";
+  }
+  if (mode === "type") return "Önce canlı görüntüde input alanına tıkla, sonra metni gönder.";
+  if (mode === "scroll") return "Canlı görüntü üzerinde mouse wheel ile kaydır veya miktar girip butonu kullan.";
+  return "Canlı görüntü üzerinde doğrudan tıklayarak sayfayı kontrol et.";
 }
 
 function displayedRunSummary() {
@@ -3367,6 +3737,7 @@ function renderSelectedThread() {
         <button type="button" class="action-button" data-thread-action="pause" ${canPause ? "" : "disabled"}>Pause</button>
         <button type="button" class="action-button" data-thread-action="resume" ${canResume ? "" : "disabled"}>Resume</button>
         <button type="button" class="action-button" data-thread-action="report" ${canOpenReport ? "" : "disabled"}>Report aç</button>
+        <button type="button" class="action-button" data-thread-action="logs">Logs</button>
         ${canReturnLive ? `<button type="button" class="action-button primary" data-thread-action="return-live">Aktif run'a dön</button>` : ""}
       </div>
     </div>
@@ -3421,7 +3792,7 @@ function renderManualControls() {
   const disabled = enabled ? "" : "disabled";
   container.innerHTML = `
     <div class="manual-grid">
-      <div class="helper-text">${enabled ? "Browser tool için hızlı manuel kontroller." : "Manuel kontrol için önce thread'i pause et veya kullanıcı bekleyen duruma gelmesini bekle."}</div>
+      <div class="helper-text">${enabled ? "Hızlı kontrol artık canlı TV üzerinden yapılabiliyor. Buradaki alanlar uzman/fallback kontrolleridir." : "Manuel kontrol için önce thread'i pause et veya kullanıcı bekleyen duruma gelmesini bekle."}</div>
       <div class="action-row">
         <button type="button" class="action-button" data-manual-action="back" ${disabled}>Geri</button>
         <button type="button" class="action-button" data-manual-action="forward" ${disabled}>İleri</button>
@@ -3481,38 +3852,63 @@ function renderRunHistory() {
   }).join("");
 }
 
-function renderAuditList() {
-  const container = document.getElementById("audit-list");
-  if (!container) return;
-  const audit = Array.isArray(state.audit) ? state.audit : [];
-  if (!audit.length) {
-    container.innerHTML = `<div class="empty-state">Audit kaydi yok.</div>`;
-    return;
-  }
-  const items = audit.slice().reverse().slice(0, 12);
-  container.innerHTML = items.map((entry) => {
-    const typeLabel = String(entry.entry_type || "audit").replaceAll("_", " ").toUpperCase();
-    const timestamp = formatDateTime(entry.timestamp);
-    const runId = entry.run_id ? shortText(entry.run_id, 12) : "";
-    const details = entry.details || {};
-    const detailText = details.summary || details.reason || details.tool || details.action || details.status || "";
-    const meta = [timestamp, runId ? `run ${runId}` : ""].filter(Boolean).join(" Â· ");
-    return `
-      <div class="audit-item">
-        <div class="audit-head">
-          <span class="audit-type">${escapeHtml(typeLabel)}</span>
-          <span class="audit-chip">${escapeHtml(entry.entry_type || "audit")}</span>
-        </div>
-        <div class="audit-detail">${escapeHtml(shortText(detailText || "Detay yok.", 140))}</div>
-        <div class="audit-meta">${escapeHtml(meta || "â€”")}</div>
-      </div>
-    `;
-  }).join("");
-}
-
 function renderHeader() {
   setInlineText("project-stamp", projectStamp());
   setInlineText("agent-title", currentThreadTitle());
+  const logsLink = document.getElementById("global-logs-link");
+  if (logsLink) logsLink.href = currentLogsUrl();
+}
+
+function renderStageManualDock() {
+  const container = document.getElementById("stage-manual-dock");
+  if (!container) return;
+  const thread = state.activeThread;
+  const activeRun = activeRunForThread(thread);
+  const enabled = canDirectPreviewControl();
+  const canPause = Boolean(activeRun) && thread?.status === "running";
+  const canResume = Boolean(activeRun) && canManualControl(thread);
+  const canReturnLive = Boolean(activeRun && state.historyMode && state.selectedRunId && state.selectedRunId !== activeRun.run_id);
+  const pending = Boolean(state.ui.manualPending);
+  const dockDisabled = enabled && !pending ? "" : "disabled";
+  const typeMode = state.ui.manualMode === "type";
+  const scrollMode = state.ui.manualMode === "scroll";
+
+  container.innerHTML = `
+    <div class="manual-dock">
+      <div class="manual-dock-head">
+        <div class="manual-dock-copy">
+          <div class="manual-dock-title">Canli Manuel Kontrol</div>
+          <div class="manual-dock-text">${escapeHtml(manualModeHint(state.ui.manualMode, enabled))}</div>
+        </div>
+        <div class="action-row">
+          <button type="button" class="action-button" data-thread-action="pause" ${canPause && !pending ? "" : "disabled"}>Pause</button>
+          <button type="button" class="action-button" data-thread-action="resume" ${canResume && !pending ? "" : "disabled"}>Resume</button>
+          ${canReturnLive ? `<button type="button" class="action-button primary" data-thread-action="return-live" ${pending ? "disabled" : ""}>Aktif run'a dön</button>` : ""}
+          <button type="button" class="action-button" data-manual-action="back" ${dockDisabled}>Geri</button>
+          <button type="button" class="action-button" data-manual-action="forward" ${dockDisabled}>İleri</button>
+        </div>
+      </div>
+      <div class="manual-mode-row">
+        <button type="button" class="mode-chip ${state.ui.manualMode === "click" ? "active" : ""}" data-manual-mode="click" ${pending ? "disabled" : ""}>Tıkla</button>
+        <button type="button" class="mode-chip ${state.ui.manualMode === "type" ? "active" : ""}" data-manual-mode="type" ${pending ? "disabled" : ""}>Yaz</button>
+        <button type="button" class="mode-chip ${state.ui.manualMode === "scroll" ? "active" : ""}" data-manual-mode="scroll" ${pending ? "disabled" : ""}>Kaydır</button>
+      </div>
+      ${typeMode ? `
+        <div class="inline-form">
+          <input class="mini-input" type="text" value="${escapeHtml(state.drafts.typeText)}" data-manual-input="typeText" placeholder="Yazılacak metin" ${pending ? "disabled" : ""} />
+          <button type="button" class="action-button primary" data-manual-action="type-focused" ${enabled && state.drafts.typeText.trim() && !pending ? "" : "disabled"}>${pending ? "Gönderiliyor..." : "Yaziyi gonder"}</button>
+        </div>
+      ` : ""}
+      ${scrollMode ? `
+        <div class="inline-form">
+          <input class="mini-input" type="number" value="${escapeHtml(state.drafts.scrollAmount)}" data-manual-input="scrollAmount" placeholder="Kaydırma miktarı" ${pending ? "disabled" : ""} />
+          <button type="button" class="action-button" data-manual-action="scroll" ${enabled && !pending ? "" : "disabled"}>${pending ? "Gönderiliyor..." : "Kaydir"}</button>
+        </div>
+      ` : ""}
+      <div class="manual-inline-note">${escapeHtml(`Mod: ${manualModeText(state.ui.manualMode)}${pending ? " · işlem gönderiliyor" : ""}`)}</div>
+      <div class="inline-error" id="manual-dock-error">${escapeHtml(state.errors.manual || "")}</div>
+    </div>
+  `;
 }
 
 function renderTV() {
@@ -3528,6 +3924,9 @@ function renderTV() {
   const activeLabel = currentThreadTitle();
 
   screen.classList.toggle("busy", Boolean(overlay.busy));
+  screen.classList.toggle("manual-click", canDirectPreviewControl() && state.ui.manualMode === "click");
+  screen.classList.toggle("manual-type", canDirectPreviewControl() && state.ui.manualMode === "type");
+  screen.classList.toggle("manual-scroll", canDirectPreviewControl() && state.ui.manualMode === "scroll");
   title.textContent = `${activeLabel} · ${currentRunStatusLabel()}`;
 
   if (!frame && !liveMirrorActive) {
@@ -3595,9 +3994,7 @@ function renderConsole() {
     "selected-thread-panel",
     "approval-list",
     "question-list",
-    "manual-controls",
     "run-history",
-    "audit-list",
   ];
 
   if (goalInput && goalInput.value !== state.drafts.goal) goalInput.value = state.drafts.goal;
@@ -3613,9 +4010,7 @@ function renderConsole() {
   renderSelectedThread();
   renderApprovalList();
   renderQuestionList();
-  renderManualControls();
   renderRunHistory();
-  renderAuditList();
 
   setInlineText("run-error", state.errors.run);
   setInlineText("thread-error", state.errors.thread);
@@ -3627,6 +4022,7 @@ function renderConsole() {
 function render() {
   renderHeader();
   renderConsole();
+  renderStageManualDock();
   renderTV();
   renderTimeline();
   syncLiveMirror();
@@ -3944,9 +4340,11 @@ async function submitQuestionAnswer(requestId) {
 }
 
 async function sendManualAction(tool, args) {
-  if (!state.activeThreadId) return;
+  if (!state.activeThreadId || state.ui.manualPending) return;
+  state.ui.manualPending = true;
   try {
     setError("manual", "");
+    render();
     const snapshot = await fetchJson(`/threads/${state.activeThreadId}/actions`, {
       method: "POST",
       body: JSON.stringify({ tool, args }),
@@ -3954,6 +4352,9 @@ async function sendManualAction(tool, args) {
     await syncThreadSnapshot(snapshot, { preferLive: true });
   } catch (error) {
     setError("manual", error.message);
+    render();
+  } finally {
+    state.ui.manualPending = false;
     render();
   }
 }
@@ -3995,6 +4396,22 @@ async function handleManualAction(kind) {
       text: state.drafts.typeText,
     });
   }
+  if (kind === "type-focused") {
+    if (!state.drafts.typeText.trim()) {
+      setError("manual", "Önce yazılacak metni gir.");
+      render();
+      return;
+    }
+    if (!canDirectPreviewControl()) {
+      setError("manual", state.historyMode ? "Önce aktif run'a dön." : "Önce pause et veya kullanıcı bekleyen duruma gelmesini bekle.");
+      render();
+      return;
+    }
+    return sendManualAction("browser", {
+      action: "type",
+      text: state.drafts.typeText,
+    });
+  }
   if (kind === "advanced") {
     try {
       const args = JSON.parse(state.drafts.advancedArgs || "{}");
@@ -4006,9 +4423,93 @@ async function handleManualAction(kind) {
   }
 }
 
+function previewImageMetrics() {
+  const image = document.getElementById("tv-image");
+  if (!image || image.style.display === "none" || !image.src) return null;
+  const naturalWidth = Number(image.naturalWidth || 0);
+  const naturalHeight = Number(image.naturalHeight || 0);
+  if (!naturalWidth || !naturalHeight) return null;
+  const rect = image.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const scale = Math.min(rect.width / naturalWidth, rect.height / naturalHeight);
+  const renderedWidth = naturalWidth * scale;
+  const renderedHeight = naturalHeight * scale;
+  return {
+    left: rect.left + (rect.width - renderedWidth) / 2,
+    top: rect.top + (rect.height - renderedHeight) / 2,
+    width: renderedWidth,
+    height: renderedHeight,
+    naturalWidth,
+    naturalHeight,
+  };
+}
+
+function previewPointFromEvent(event) {
+  const metrics = previewImageMetrics();
+  if (!metrics) return null;
+  const relativeX = event.clientX - metrics.left;
+  const relativeY = event.clientY - metrics.top;
+  if (relativeX < 0 || relativeY < 0 || relativeX > metrics.width || relativeY > metrics.height) {
+    return null;
+  }
+  return {
+    x: Number((((relativeX / metrics.width) * metrics.naturalWidth)).toFixed(1)),
+    y: Number((((relativeY / metrics.height) * metrics.naturalHeight)).toFixed(1)),
+  };
+}
+
+async function handlePreviewClick(event) {
+  if (!["click", "type"].includes(state.ui.manualMode)) return;
+  if (!canDirectPreviewControl()) {
+    setError("manual", state.historyMode ? "Önce aktif run'a dön." : "Önce pause et veya kullanıcı bekleyen duruma gelmesini bekle.");
+    render();
+    return;
+  }
+  const point = previewPointFromEvent(event);
+  if (!point) return;
+  event.preventDefault();
+  await sendManualAction("browser", {
+    action: "click",
+    x: point.x,
+    y: point.y,
+  });
+}
+
+async function handlePreviewWheel(event) {
+  if (state.ui.manualMode !== "scroll") return;
+  if (!canDirectPreviewControl()) {
+    setError("manual", state.historyMode ? "Önce aktif run'a dön." : "Önce pause et veya kullanıcı bekleyen duruma gelmesini bekle.");
+    render();
+    return;
+  }
+  const point = previewPointFromEvent(event);
+  if (!point) return;
+  event.preventDefault();
+  const fallback = Number.parseInt(state.drafts.scrollAmount || "0", 10) || 600;
+  const amount = Math.round(event.deltaY || fallback) || fallback;
+  await sendManualAction("browser", {
+    action: "scroll",
+    x: point.x,
+    y: point.y,
+    amount,
+  });
+}
+
 function openReport() {
   if (!state.reportUrl) return;
   window.open(state.reportUrl, "_blank", "noreferrer");
+}
+
+function currentLogsUrl() {
+  const params = new URLSearchParams();
+  if (state.activeThreadId) params.set("thread_id", state.activeThreadId);
+  if (state.selectedRunId) params.set("run_id", state.selectedRunId);
+  const query = params.toString();
+  return query ? `/logs?${query}` : "/logs";
+}
+
+function openLogs() {
+  window.open(currentLogsUrl(), "_blank", "noreferrer");
 }
 
 async function openRunHistory(runId) {
@@ -4058,6 +4559,7 @@ async function handleConsoleClick(event) {
     if (action === "pause") return pauseActiveThread();
     if (action === "resume") return resumeActiveThread();
     if (action === "report") return openReport();
+    if (action === "logs") return openLogs();
     if (action === "return-live") return returnToLiveRun();
   }
 
@@ -4076,6 +4578,14 @@ async function handleConsoleClick(event) {
   const historyAction = event.target.closest("[data-history-open]");
   if (historyAction) {
     return openRunHistory(historyAction.getAttribute("data-history-open"));
+  }
+
+  const manualModeAction = event.target.closest("[data-manual-mode]");
+  if (manualModeAction) {
+    state.ui.manualMode = manualModeAction.getAttribute("data-manual-mode") || "click";
+    setError("manual", "");
+    render();
+    return;
   }
 
   const manualAction = event.target.closest("[data-manual-action]");
@@ -4139,18 +4649,8 @@ function mount() {
             </section>
 
             <section class="console-section" hidden>
-              <div class="section-title">Manuel Browser Kontrolleri</div>
-              <div id="manual-controls"></div>
-              <div class="inline-error" id="manual-error"></div>
-            </section>
-
-            <section class="console-section" hidden>
               <div class="section-title">Run Geçmişi</div>
               <div id="run-history" class="history-list"></div>
-            </section>
-            <section class="console-section" hidden>
-              <div class="section-title">Audit</div>
-              <div id="audit-list" class="audit-list"></div>
             </section>
           </div>
         </section>
@@ -4180,6 +4680,7 @@ function mount() {
                     <span>CANLI</span>
                   </div>
                 </div>
+                <div id="stage-manual-dock"></div>
               </div>
             </div>
           </div>
@@ -4198,9 +4699,11 @@ function mount() {
   document.getElementById("approval-list").addEventListener("click", handleConsoleClick);
   document.getElementById("question-list").addEventListener("click", handleConsoleClick);
   document.getElementById("question-list").addEventListener("input", handleConsoleInput);
-  document.getElementById("manual-controls").addEventListener("click", handleConsoleClick);
-  document.getElementById("manual-controls").addEventListener("input", handleConsoleInput);
+  document.getElementById("stage-manual-dock").addEventListener("click", handleConsoleClick);
+  document.getElementById("stage-manual-dock").addEventListener("input", handleConsoleInput);
   document.getElementById("run-history").addEventListener("click", handleConsoleClick);
+  document.getElementById("tv-image").addEventListener("click", handlePreviewClick);
+  document.getElementById("tv-image").addEventListener("wheel", handlePreviewWheel, { passive: false });
 
   setupScrubber();
   render();
