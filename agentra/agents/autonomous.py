@@ -18,6 +18,7 @@ from agentra.approval_policy import ApprovalPolicyContext, ApprovalPolicyEngine
 from agentra.config import AgentConfig
 from agentra.llm.base import LLMMessage, LLMProvider, LLMSession, LLMToolResult
 from agentra.llm.factory import get_embedding_provider, get_provider
+from agentra.logging_utils import exception_details_with_context
 from agentra.memory.embedding_memory import LongTermMemoryStore, ThreadWorkingMemory
 from agentra.memory.workspace import WorkspaceManager
 from agentra.tools.base import BaseTool, ToolResult
@@ -271,8 +272,18 @@ class AutonomousAgent:
                     ),
                 }
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Agent error: %s", exc)
-                yield {"type": "error", "content": str(exc)}
+                details = exception_details_with_context(
+                    exc,
+                    provider=self.config.llm_provider,
+                    model=self.config.llm_model,
+                )
+                message = str(details.get("public_message") or str(exc))
+                payload: dict[str, Any] = {"type": "error", "content": message, "details": details}
+                hint = str(details.get("hint") or "")
+                if hint:
+                    payload["summary"] = hint
+                logger.exception("Agent error: %s", message)
+                yield payload
             finally:
                 self._running = False
                 if self._session is not None:

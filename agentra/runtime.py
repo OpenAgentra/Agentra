@@ -17,7 +17,7 @@ from agentra.approval_policy import ApprovalPolicyEngine
 from agentra.browser_runtime import BrowserSessionManager
 from agentra.config import AgentConfig
 from agentra.llm.registry import get_provider_spec
-from agentra.logging_utils import exception_details
+from agentra.logging_utils import exception_details_with_context
 from agentra.run_report import RunReport
 
 RunSnapshot = dict[str, Any]
@@ -704,14 +704,23 @@ class ThreadManager:
                 )
         except Exception as exc:  # noqa: BLE001
             status = "error"
-            details = exception_details(exc)
+            details = exception_details_with_context(
+                exc,
+                provider=session.config.llm_provider,
+                model=session.config.llm_model,
+            )
+            message = str(details.get("public_message") or str(exc))
             logger.exception(
                 "Thread run crashed thread_id=%s run_id=%s goal=%r",
                 thread.thread_id,
                 session.run_id,
                 session.goal,
             )
-            stored = session.report.record({"type": "error", "content": str(exc), "details": details})
+            payload: dict[str, Any] = {"type": "error", "content": message, "details": details}
+            hint = str(details.get("hint") or "")
+            if hint:
+                payload["summary"] = hint
+            stored = session.report.record(payload)
             thread.ledger.append_entry("run_error", run_id=session.run_id, details=details)
             await self._broadcast(
                 session,

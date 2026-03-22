@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from google.genai.errors import ClientError
 
 from agentra.agents.autonomous import AutonomousAgent
 from agentra.config import AgentConfig
@@ -55,6 +56,28 @@ class PreviewTool(EchoTool):
             "focus_x": 0.4,
             "focus_y": 0.5,
         }
+
+
+class QuotaFailingLLM(LLMProvider):
+    """Raise a provider quota error so the agent surfaces a friendly message."""
+
+    async def complete(self, messages, tools=None, temperature=0.2, max_tokens=4096):
+        raise ClientError(
+            429,
+            {
+                "error": {
+                    "code": 429,
+                    "message": (
+                        "You exceeded your current quota, please check your plan and billing details."
+                    ),
+                    "status": "RESOURCE_EXHAUSTED",
+                }
+            },
+            None,
+        )
+
+    async def embed(self, text: str) -> list[float]:
+        return [0.0] * 256
 
 
 @pytest.fixture
@@ -298,3 +321,36 @@ async def test_agent_emits_phase_and_visual_intent_for_previewable_tools(config,
     assert visual_intent["summary"] == "Preparing the echo action"
     assert visual_intent["focus_x"] == pytest.approx(0.4)
     assert visual_intent["focus_y"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_agent_surfaces_friendly_provider_quota_errors(tmp_workspace):
+    config = AgentConfig(
+        llm_provider="gemini",
+        llm_model="gemini-3-flash-preview",
+        workspace_dir=tmp_workspace,
+        memory_dir=tmp_workspace / ".memory",
+        max_iterations=5,
+        allow_computer_control=False,
+        allow_terminal=False,
+    )
+    agent = AutonomousAgent(config=config, llm=QuotaFailingLLM(), tools=[EchoTool()])
+
+    events = []
+    gen = await agent.run("Open a repository")
+    async for event in gen:
+        events.append(event)
+
+    error = next(event for event in events if event["type"] == "error")
+
+    assert error["content"] == (
+        "Gemini quota exceeded for model gemini-3-flash-preview. "
+        "Add billing or wait for quota reset, then retry."
+    )
+    assert error["summary"] == (
+        "Switch the thread to another provider/model, or add Gemini "
+        "billing/credits before retrying."
+    )
+    assert error["details"]["status_code"] == 429
+    assert error["details"]["provider_status"] == "RESOURCE_EXHAUSTED"
+    assert error["details"]["error_kind"] == "quota_exceeded"

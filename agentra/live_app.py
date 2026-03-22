@@ -16,7 +16,12 @@ from pydantic import BaseModel, Field
 
 from agentra.config import AgentConfig
 from agentra.llm.registry import get_provider_spec
-from agentra.logging_utils import app_log_path, configure_app_logging, exception_details, read_log_tail
+from agentra.logging_utils import (
+    app_log_path,
+    configure_app_logging,
+    exception_details_with_context,
+    read_log_tail,
+)
 from agentra.runtime import ThreadManager
 from agentra.run_report import RunReport
 
@@ -167,9 +172,18 @@ class LiveRunManager:
                 )
         except Exception as exc:  # noqa: BLE001
             status = "error"
-            details = exception_details(exc)
+            details = exception_details_with_context(
+                exc,
+                provider=session.config.llm_provider,
+                model=session.config.llm_model,
+            )
+            message = str(details.get("public_message") or str(exc))
             logger.exception("Live run crashed run_id=%s goal=%r", session.run_id, session.goal)
-            stored = session.report.record({"type": "error", "content": str(exc), "details": details})
+            payload: dict[str, Any] = {"type": "error", "content": message, "details": details}
+            hint = str(details.get("hint") or "")
+            if hint:
+                payload["summary"] = hint
+            stored = session.report.record(payload)
             await self._broadcast(
                 session,
                 {"kind": "event", "event": self._event_for_http(session.run_id, stored)},
@@ -771,6 +785,7 @@ def _latest_error_from_events(events_path: Path) -> dict[str, str] | None:
             "message": str(event.get("content", "")),
             "exception_type": str(details.get("exception_type", "")),
             "traceback": str(details.get("traceback", "")),
+            "hint": str(details.get("hint", "")),
         }
     return None
 
@@ -801,13 +816,20 @@ def _render_logs_html(
     latest_error_html = ""
     if latest_error:
         trace_html = ""
+        hint_html = ""
         if latest_error["traceback"]:
             trace_html = "<h2>Traceback</h2>" f"<pre>{html.escape(latest_error['traceback'])}</pre>"
+        if latest_error["hint"]:
+            hint_html = (
+                "<div class=\"meta accent\">Suggested fix: "
+                f"{html.escape(latest_error['hint'])}</div>"
+            )
         latest_error_html = (
             "<section class=\"card\">"
             "<h2>Latest Run Error</h2>"
             f"<div class=\"meta\">{html.escape(latest_error['timestamp'] or 'unknown time')}</div>"
             f"<pre>{html.escape(latest_error['message'] or 'Unknown error')}</pre>"
+            f"{hint_html}"
             f"{trace_html}"
             "</section>"
         )

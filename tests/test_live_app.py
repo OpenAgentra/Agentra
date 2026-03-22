@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from agentra.config import AgentConfig
-from agentra.live_app import create_live_app
+from agentra.live_app import _render_logs_html, create_live_app
 from agentra.runtime import ApprovalRequest, UserInputRequest
 from agentra.tools.base import ToolResult
 
@@ -188,6 +188,57 @@ async def test_live_app_logs_page_renders(tmp_path: Path) -> None:
     assert "Agentra Logs" in response.text
     assert "Server Log Tail" in response.text
     assert "agentra-app.log" in response.text
+
+
+def test_live_app_logs_page_renders_provider_error_hint(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    run_id = "20260322-174415-demo"
+    run_dir = workspace / ".runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "index.html").write_text("", encoding="utf-8")
+    (run_dir / "events.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "goal": "Demo failure",
+                "provider": "gemini",
+                "model": "gemini-3-flash-preview",
+                "status": "error",
+                "started_at": "2026-03-22T17:44:15",
+                "finished_at": "2026-03-22T17:44:17",
+                "report_path": str(run_dir / "index.html"),
+                "events": [
+                    {
+                        "type": "error",
+                        "timestamp": "2026-03-22T17:44:17",
+                        "content": (
+                            "Gemini quota exceeded for model gemini-3-flash-preview. "
+                            "Add billing or wait for quota reset, then retry."
+                        ),
+                        "details": {
+                            "hint": (
+                                "Switch the thread to another provider/model, or add "
+                                "Gemini billing/credits before retrying."
+                            ),
+                            "traceback": "traceback text",
+                        },
+                    }
+                ],
+                "frames": [],
+                "audit": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    log_path = workspace / ".logs" / "agentra-app.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("log line", encoding="utf-8")
+
+    html = _render_logs_html(workspace, log_path, run_id=run_id)
+
+    assert "Latest Run Error" in html
+    assert "Suggested fix:" in html
+    assert "Gemini billing/credits before retrying." in html
 
 
 @pytest.mark.asyncio
