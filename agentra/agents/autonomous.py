@@ -244,18 +244,34 @@ def _goal_requires_visual_desktop_control(goal: str) -> bool:
     return _contains_any_phrase(normalized, _VISUAL_DESKTOP_ACTION_TERMS)
 
 
+def _goal_has_local_desktop_component(goal: str) -> bool:
+    normalized = _normalized_text(goal)
+    if not _goal_mentions_desktop_surface(goal):
+        return False
+    return (
+        _contains_any_phrase(normalized, _VISUAL_DESKTOP_ACTION_TERMS)
+        or _contains_any_phrase(normalized, _FOLDER_CONTENT_TERMS)
+        or _contains_any_phrase(normalized, _LOCAL_DOCUMENT_OPEN_TERMS)
+        or _contains_any_phrase(normalized, _PATH_STYLE_LOCAL_TERMS)
+    )
+
+
+def _goal_has_mixed_web_and_local_desktop_components(goal: str) -> bool:
+    return _goal_mentions_web_target(goal) and _goal_has_local_desktop_component(goal)
+
+
 def _goal_is_desktop_local_only(goal: str) -> bool:
-    return _goal_requires_visual_desktop_control(goal) and not _goal_mentions_web_target(goal)
+    return _goal_has_local_desktop_component(goal) and not _goal_mentions_web_target(goal)
 
 
 def _goal_requests_folder_contents(goal: str) -> bool:
-    if not _goal_is_desktop_local_only(goal):
+    if not _goal_has_local_desktop_component(goal):
         return False
     return _contains_any_phrase(_normalized_text(goal), _FOLDER_CONTENT_TERMS)
 
 
 def _goal_requests_local_document_open(goal: str) -> bool:
-    if not _goal_is_desktop_local_only(goal):
+    if not _goal_has_local_desktop_component(goal):
         return False
     return _contains_any_phrase(_normalized_text(goal), _LOCAL_DOCUMENT_OPEN_TERMS)
 
@@ -867,18 +883,31 @@ class AutonomousAgent:
         return LLMMessage(role="system", content=content)
 
     def _goal_guidance(self, goal: str) -> str:
-        if _goal_is_desktop_local_only(goal):
+        if _goal_has_local_desktop_component(goal):
             if self._uses_under_the_hood_local_execution(goal):
                 guidance = (
-                    "This is a local desktop/file task, and this run is configured for under-the-hood "
-                    "local execution. Do not use `computer` automatically. First use `local_system` "
-                    "to resolve known folders such as Desktop, then use `filesystem` to inspect the "
-                    "resolved WSL path, and use `local_system` `open_path` to open the confirmed file "
-                    "or folder with the native OS. Only use `terminal` if `filesystem` or "
-                    "`local_system` cannot resolve the local path. If you cannot resolve the target "
-                    "confidently, ask the user instead of switching to visible desktop automation. "
-                    "Do not use `browser` unless the user explicitly mentions a website or URL."
+                    "This goal includes a local desktop/file step, and this run is configured for "
+                    "under-the-hood local execution. Do not use `computer` automatically. For the "
+                    "local step, first use `local_system` to resolve known folders such as Desktop, "
+                    "then use `filesystem` to inspect the resolved WSL path, and use "
+                    "`local_system` `open_path` to open the confirmed file or folder with the "
+                    "native OS. Only use `terminal` if `filesystem` or `local_system` cannot "
+                    "resolve the local path. If you cannot resolve the target confidently, ask the "
+                    "user instead of switching to visible desktop automation."
                 )
+                if _goal_has_mixed_web_and_local_desktop_components(goal):
+                    guidance = (
+                        "This goal has both web and local steps. Use `browser` for the website part "
+                        "first, then complete the local desktop/file step with under-the-hood local "
+                        "execution. "
+                    ) + guidance
+                    guidance += (
+                        " Do not say DONE after only the website step. The goal is complete only "
+                        "after both the requested web step and the requested local open/listing step "
+                        "succeed."
+                    )
+                else:
+                    guidance += " Do not use `browser` unless the user explicitly mentions a website or URL."
                 guidance += (
                     " `local_system resolve_known_folder` returns the real local Desktop path, including "
                     "OneDrive-backed Desktop locations when present."
@@ -894,6 +923,27 @@ class AutonomousAgent:
                         "1) resolve the Desktop path with `local_system`, 2) locate the exact folder "
                         "or file with `filesystem`, 3) open the confirmed item with "
                         "`local_system open_path`."
+                    )
+                return guidance
+            if _goal_has_mixed_web_and_local_desktop_components(goal):
+                guidance = (
+                    "This goal has both web and visible local desktop steps. Use `browser` for the "
+                    "website step, then use `computer` for the on-screen local desktop step. Do not "
+                    "say DONE after only the browser step; the local step must also be completed."
+                )
+                guidance += " " + self._desktop_path_guidance()
+                if _goal_requests_folder_contents(goal):
+                    guidance += (
+                        " The user also wants the folder contents. After the local step, verify the "
+                        "actual items with a successful local listing/read step, preferably "
+                        "`filesystem`, before you say DONE."
+                    )
+                if _goal_requests_local_document_open(goal):
+                    guidance += (
+                        " This goal names a local document or presentation. After the web step, "
+                        "resolve the exact local folder or file path with `filesystem` or a valid "
+                        "`terminal` command, then open the confirmed item on screen. Do not keep "
+                        "double-clicking guesses."
                     )
                 return guidance
             guidance = (
@@ -934,7 +984,7 @@ class AutonomousAgent:
     def _uses_under_the_hood_local_execution(self, goal: str) -> bool:
         return (
             self.config.local_execution_mode == "under_the_hood"
-            and _goal_is_desktop_local_only(goal)
+            and _goal_has_local_desktop_component(goal)
         )
 
     def _desktop_path_guidance(self) -> str:
@@ -1067,7 +1117,7 @@ class AutonomousAgent:
             if action == "open_path" and not str(tool_args.get("path", "") or "").strip():
                 return "Resolve the exact local file or folder path before calling `local_system open_path`."
             return None
-        if tool_name == "terminal" and _goal_is_desktop_local_only(goal):
+        if tool_name == "terminal" and _goal_has_local_desktop_component(goal):
             command = str(tool_args.get("command", "") or "")
             lowered_command = command.casefold()
             if self._uses_under_the_hood_local_execution(goal):
@@ -1083,14 +1133,14 @@ class AutonomousAgent:
                     "paths like `C:\\...` to shell commands here. Use `/mnt/c/Users/...` paths, "
                     "or call `powershell.exe` explicitly if you need Windows-native behavior."
                 )
-        if tool_name == "filesystem" and _goal_is_desktop_local_only(goal):
+        if tool_name == "filesystem" and _goal_has_local_desktop_component(goal):
             path = str(tool_args.get("path", "") or "")
             if re.search(r"^[a-zA-Z]:\\", path):
                 return (
                     "The filesystem tool resolves paths in WSL/Linux space. Use `/mnt/c/Users/...` "
                     "style paths instead of raw `C:\\...` Windows paths."
                 )
-        if tool_name == "computer" and _goal_is_desktop_local_only(goal):
+        if tool_name == "computer" and _goal_has_local_desktop_component(goal):
             if self._uses_under_the_hood_local_execution(goal):
                 return (
                     "This run is configured for under-the-hood local execution, so visible desktop "
@@ -1117,6 +1167,11 @@ class AutonomousAgent:
 
     def _done_guard_message(self, goal: str, tool_history: list[dict[str, Any]]) -> str | None:
         successful_tools_used = _successful_tools_used(tool_history)
+        if _goal_has_mixed_web_and_local_desktop_components(goal) and "browser" not in successful_tools_used:
+            return (
+                "This goal includes both a web step and a local step. Complete the requested "
+                "browser action first, then continue to the local step before you say DONE."
+            )
         if self._uses_under_the_hood_local_execution(goal):
             if _goal_requests_folder_contents(goal) and not _has_successful_local_listing(tool_history):
                 return (
@@ -1136,7 +1191,13 @@ class AutonomousAgent:
                     "actual folder or file path with `filesystem` before you finish."
                 )
             return None
-        if _goal_is_desktop_local_only(goal) and "computer" not in successful_tools_used:
+        if _goal_has_local_desktop_component(goal) and "computer" not in successful_tools_used:
+            if _goal_has_mixed_web_and_local_desktop_components(goal):
+                return (
+                    "This goal also includes a local desktop/UI step. A completed website step does "
+                    "not finish the task. Use the computer tool to complete the requested on-screen "
+                    "local action, then continue."
+                )
             return (
                 "The user asked for a desktop/UI action. A terminal listing or unrelated browser tab "
                 "does not count as opening the requested folder or window. Use the computer tool to "

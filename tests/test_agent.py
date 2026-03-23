@@ -808,6 +808,96 @@ async def test_agent_prefers_local_system_for_under_the_hood_document_goals(tmp_
 
 
 @pytest.mark.asyncio
+async def test_agent_requires_local_completion_after_browser_for_mixed_under_the_hood_goal(
+    tmp_workspace,
+):
+    config = AgentConfig(
+        llm_provider="openai",
+        llm_model="gpt-4o",
+        workspace_dir=tmp_workspace,
+        memory_dir=tmp_workspace / ".memory",
+        max_iterations=8,
+        local_execution_mode="under_the_hood",
+        desktop_fallback_policy="pause_and_ask",
+        allow_computer_control=False,
+        allow_terminal=False,
+    )
+    browser = NamedTool("browser", "Web browser control.")
+    filesystem = NamedTool("filesystem", "Filesystem access.")
+    local_system = NamedTool("local_system", "Native local operations.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "1",
+                        "name": "browser",
+                        "arguments": {"action": "navigate", "url": "https://github.com/dhatfieldai/agentra"},
+                    }
+                ],
+            ),
+            LLMResponse(content="DONE: Agentra GitHub repo is open."),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "2",
+                        "name": "local_system",
+                        "arguments": {"action": "resolve_known_folder", "folder_key": "desktop"},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "3",
+                        "name": "filesystem",
+                        "arguments": {"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun"},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "4",
+                        "name": "local_system",
+                        "arguments": {
+                            "action": "open_path",
+                            "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun/deck.pptx",
+                        },
+                    }
+                ],
+            ),
+            LLMResponse(content="DONE: Agentra GitHub repo is open and the PowerPoint presentation is open."),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[browser, filesystem, local_system])
+
+    events = []
+    gen = await agent.run(
+        "Tarayicida google.com'u ac, Agentra GitHub reposunu bul, sonra masaustumdeki "
+        "secondsun klasorunu bulup icindeki PowerPoint dosyasini varsayilan uygulamayla ac."
+    )
+    async for event in gen:
+        events.append(event)
+
+    done_events = [event for event in events if event["type"] == "done"]
+    assert len(done_events) == 1
+    assert "PowerPoint presentation is open" in done_events[0]["content"]
+    assert browser.calls == [{"action": "navigate", "url": "https://github.com/dhatfieldai/agentra"}]
+    assert local_system.calls == [
+        {"action": "resolve_known_folder", "folder_key": "desktop"},
+        {"action": "open_path", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun/deck.pptx"},
+    ]
+    assert filesystem.calls == [
+        {"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agent_blocks_terminal_navigation_for_under_the_hood_local_goals(tmp_workspace):
     config = AgentConfig(
         llm_provider="openai",

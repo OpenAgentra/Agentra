@@ -312,6 +312,34 @@ async def test_live_app_chooses_visible_desktop_policy_for_visual_local_goal(tmp
 
 
 @pytest.mark.asyncio
+async def test_live_app_chooses_under_the_hood_policy_for_mixed_web_and_local_document_goal(
+    tmp_path: Path,
+) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/runs",
+            json={
+                "goal": (
+                    "Tarayicida google.com'u ac, Agentra GitHub reposunu bul, sonra "
+                    "masaustumdeki secondsun klasorunu bulup icindeki PowerPoint dosyasini "
+                    "varsayilan uygulamayla ac."
+                )
+            },
+        )
+        response.raise_for_status()
+
+    await _wait_for_agent_creation(created_agents)
+    agent_config = created_agents[0].config
+    assert agent_config.browser_headless is True
+    assert agent_config.local_execution_mode == "under_the_hood"
+    assert agent_config.desktop_fallback_policy == "pause_and_ask"
+
+
+@pytest.mark.asyncio
 async def test_live_app_respects_explicit_headless_override(tmp_path: Path) -> None:
     created_agents: list[FakeAgent] = []
     app = _make_app(tmp_path, created_agents)

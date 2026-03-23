@@ -188,24 +188,40 @@ def goal_requires_visual_desktop_control(goal: str) -> bool:
     return _contains_any_phrase(normalized, _VISUAL_DESKTOP_ACTION_TERMS)
 
 
+def goal_has_local_desktop_component(goal: str) -> bool:
+    normalized = _normalized_text(goal)
+    if not goal_mentions_desktop_surface(goal):
+        return False
+    return (
+        _contains_any_phrase(normalized, _VISUAL_DESKTOP_ACTION_TERMS)
+        or _contains_any_phrase(normalized, _FOLDER_CONTENT_TERMS)
+        or _contains_any_phrase(normalized, _LOCAL_DOCUMENT_OPEN_TERMS)
+        or _contains_any_phrase(normalized, _PATH_STYLE_LOCAL_TERMS)
+    )
+
+
+def goal_has_mixed_web_and_local_desktop_components(goal: str) -> bool:
+    return goal_mentions_web_target(goal) and goal_has_local_desktop_component(goal)
+
+
 def goal_is_desktop_local_only(goal: str) -> bool:
-    return goal_requires_visual_desktop_control(goal) and not goal_mentions_web_target(goal)
+    return goal_has_local_desktop_component(goal) and not goal_mentions_web_target(goal)
 
 
 def goal_requests_folder_contents(goal: str) -> bool:
-    if not goal_is_desktop_local_only(goal):
+    if not goal_has_local_desktop_component(goal):
         return False
     return _contains_any_phrase(_normalized_text(goal), _FOLDER_CONTENT_TERMS)
 
 
 def goal_requests_local_document_open(goal: str) -> bool:
-    if not goal_is_desktop_local_only(goal):
+    if not goal_has_local_desktop_component(goal):
         return False
     return _contains_any_phrase(_normalized_text(goal), _LOCAL_DOCUMENT_OPEN_TERMS)
 
 
 def goal_prefers_under_the_hood_local_execution(goal: str) -> bool:
-    if not goal_is_desktop_local_only(goal):
+    if not goal_has_local_desktop_component(goal):
         return False
 
     normalized = _normalized_text(goal)
@@ -227,12 +243,19 @@ def choose_live_execution_policy(
 
     browser_headless = True if requested_headless is None else requested_headless
 
-    if goal_is_desktop_local_only(goal):
+    if goal_has_local_desktop_component(goal):
         if goal_prefers_under_the_hood_local_execution(goal):
             return LiveExecutionPolicy(
                 browser_headless=browser_headless,
                 local_execution_mode="under_the_hood",
                 desktop_fallback_policy="pause_and_ask",
+                control_surface_hint="browser",
+            )
+        if goal_has_mixed_web_and_local_desktop_components(goal):
+            return LiveExecutionPolicy(
+                browser_headless=browser_headless,
+                local_execution_mode="visible",
+                desktop_fallback_policy="visible_control",
                 control_surface_hint="browser",
             )
         return LiveExecutionPolicy(
