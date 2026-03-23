@@ -58,6 +58,39 @@ class PreviewTool(EchoTool):
         }
 
 
+class NamedTool(BaseTool):
+    """Simple configurable tool used for routing tests."""
+
+    def __init__(self, name: str, description: str) -> None:
+        self._name = name
+        self._description = description
+        self.calls: list[dict[str, Any]] = []
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return self._description
+
+    @property
+    def schema(self):
+        return {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "command": {"type": "string"},
+                "url": {"type": "string"},
+                "text": {"type": "string"},
+            },
+        }
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        self.calls.append(kwargs)
+        return ToolResult(success=True, output=f"{self._name} ok")
+
+
 class QuotaFailingLLM(LLMProvider):
     """Raise a provider quota error so the agent surfaces a friendly message."""
 
@@ -354,3 +387,527 @@ async def test_agent_surfaces_friendly_provider_quota_errors(tmp_workspace):
     assert error["details"]["status_code"] == 429
     assert error["details"]["provider_status"] == "RESOURCE_EXHAUSTED"
     assert error["details"]["error_kind"] == "quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_agent_blocks_browser_drift_for_local_desktop_goal(config, tmp_workspace):
+    browser = NamedTool("browser", "Web browser control.")
+    computer = NamedTool("computer", "Desktop control.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "1",
+                        "name": "browser",
+                        "arguments": {"action": "navigate", "url": "https://github.com/kagankakao"},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "2", "name": "computer", "arguments": {"action": "click"}}],
+            ),
+            LLMResponse(content='DONE: "Second Sun" folder is now open on the desktop.'),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[browser, computer])
+
+    events = []
+    gen = await agent.run("masaüstündeki Second Sun klasörüne gir")
+    async for event in gen:
+        events.append(event)
+
+    browser_result = next(
+        event
+        for event in events
+        if event["type"] == "tool_result" and event["tool"] == "browser"
+    )
+    assert browser_result["success"] is False
+    assert "desktop/folder task" in browser_result["result"]
+    assert browser.calls == []
+    assert computer.calls == [{"action": "click"}]
+
+
+@pytest.mark.asyncio
+async def test_agent_requires_computer_before_done_for_local_desktop_goal(config, tmp_workspace):
+    terminal = NamedTool("terminal", "Terminal access.")
+    computer = NamedTool("computer", "Desktop control.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "1",
+                        "name": "terminal",
+                        "arguments": {"command": 'dir "C:\\\\Users\\\\ariba\\\\OneDrive\\\\Desktop\\\\Second Sun"'},
+                    }
+                ],
+            ),
+            LLMResponse(content='DONE: "Second Sun" folder was listed in the terminal.'),
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "2", "name": "computer", "arguments": {"action": "double_click"}}],
+            ),
+            LLMResponse(content='DONE: "Second Sun" folder is now open on screen.'),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[terminal, computer])
+
+    events = []
+    gen = await agent.run("masaüstündeki Second Sun klasörüne gir")
+    async for event in gen:
+        events.append(event)
+
+    done_events = [event for event in events if event["type"] == "done"]
+    assert len(done_events) == 1
+    assert done_events[0]["content"] == 'DONE: "Second Sun" folder is now open on screen.'
+    assert terminal.calls == [{'command': 'dir "C:\\\\Users\\\\ariba\\\\OneDrive\\\\Desktop\\\\Second Sun"'}]
+    assert computer.calls == [{"action": "double_click"}]
+
+
+@pytest.mark.asyncio
+async def test_agent_requires_listing_evidence_before_done_for_local_desktop_contents_goal(
+    config, tmp_workspace
+):
+    computer = NamedTool("computer", "Desktop control.")
+    filesystem = NamedTool("filesystem", "Filesystem access.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "1", "name": "computer", "arguments": {"action": "double_click"}}],
+            ),
+            LLMResponse(content='DONE: "Second Sun" folder is open and its contents are listed.'),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "2",
+                        "name": "filesystem",
+                        "arguments": {"action": "list", "path": "/mnt/c/Users/ariba/Desktop/Second Sun"},
+                    }
+                ],
+            ),
+            LLMResponse(content='DONE: "Second Sun" folder is open and its contents are verified.'),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[computer, filesystem])
+
+    events = []
+    gen = await agent.run("masaüstüme git ve Second Sun klasörünü aç ve içindekileri bana söyle")
+    async for event in gen:
+        events.append(event)
+
+    done_events = [event for event in events if event["type"] == "done"]
+    assert len(done_events) == 1
+    assert done_events[0]["content"] == 'DONE: "Second Sun" folder is open and its contents are verified.'
+    assert computer.calls == [{"action": "double_click"}]
+    assert filesystem.calls == [{"action": "list", "path": "/mnt/c/Users/ariba/Desktop/Second Sun"}]
+
+
+@pytest.mark.asyncio
+async def test_agent_blocks_repeated_same_desktop_click_guessing(config, tmp_workspace):
+    computer = NamedTool("computer", "Desktop control.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "1",
+                        "name": "computer",
+                        "arguments": {"action": "double_click", "x": 920, "y": 30},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "2",
+                        "name": "computer",
+                        "arguments": {"action": "double_click", "x": 920, "y": 30},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "3",
+                        "name": "computer",
+                        "arguments": {"action": "double_click", "x": 921, "y": 31},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "4", "name": "computer", "arguments": {"action": "screenshot"}}],
+            ),
+            LLMResponse(content='DONE: "Second Sun" folder is now open on screen.'),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[computer])
+
+    events = []
+    gen = await agent.run("masaüstündeki Second Sun klasörüne gir")
+    async for event in gen:
+        events.append(event)
+
+    assert any(
+        event["type"] == "tool_result"
+        and event["tool"] == "computer"
+        and event["success"] is False
+        and "Stop guessing coordinates" in event["result"]
+        for event in events
+    )
+    assert computer.calls == [
+        {"action": "double_click", "x": 920, "y": 30},
+        {"action": "double_click", "x": 920, "y": 30},
+        {"action": "screenshot"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_blocks_excessive_desktop_click_guessing_across_different_points(
+    config, tmp_workspace
+):
+    computer = NamedTool("computer", "Desktop control.")
+    filesystem = NamedTool("filesystem", "Filesystem access.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "1", "name": "computer", "arguments": {"action": "double_click", "x": 925, "y": 30}}],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "2", "name": "computer", "arguments": {"action": "double_click", "x": 1800, "y": 40}}],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "3", "name": "computer", "arguments": {"action": "double_click", "x": 1820, "y": 35}}],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "4", "name": "computer", "arguments": {"action": "double_click", "x": 500, "y": 590}}],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "5", "name": "computer", "arguments": {"action": "double_click", "x": 530, "y": 335}}],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "6",
+                        "name": "filesystem",
+                        "arguments": {"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun"},
+                    }
+                ],
+            ),
+            LLMResponse(content='DONE: "Second Sun" folder path is confirmed.'),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[computer, filesystem])
+
+    events = []
+    gen = await agent.run("masaüstüne git ve oradan secondsun klasörüne gir")
+    async for event in gen:
+        events.append(event)
+
+    assert any(
+        event["type"] == "tool_result"
+        and event["tool"] == "computer"
+        and event["success"] is False
+        and "Stop brute-forcing the UI" in event["result"]
+        for event in events
+    )
+    assert computer.calls == [
+        {"action": "double_click", "x": 925, "y": 30},
+        {"action": "double_click", "x": 1800, "y": 40},
+        {"action": "double_click", "x": 1820, "y": 35},
+        {"action": "double_click", "x": 500, "y": 590},
+    ]
+    assert filesystem.calls == [{"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun"}]
+
+
+@pytest.mark.asyncio
+async def test_agent_blocks_windows_paths_in_terminal_for_local_desktop_goals(config, tmp_workspace):
+    terminal = NamedTool("terminal", "Terminal access.")
+    filesystem = NamedTool("filesystem", "Filesystem access.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "1",
+                        "name": "terminal",
+                        "arguments": {"command": 'ls "C:\\\\Users\\\\ariba\\\\Desktop"'},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "2",
+                        "name": "filesystem",
+                        "arguments": {"action": "list", "path": "/mnt/c/Users/ariba/Desktop"},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "3", "name": "computer", "arguments": {"action": "double_click"}}],
+            ),
+            LLMResponse(content='DONE: Desktop path confirmed and folder opened on screen.'),
+        ]
+    )
+    computer = NamedTool("computer", "Desktop control.")
+    agent = AutonomousAgent(config=config, llm=llm, tools=[terminal, filesystem, computer])
+
+    events = []
+    gen = await agent.run("masaüstüne git ve oradan secondsun klasörüne gir")
+    async for event in gen:
+        events.append(event)
+
+    terminal_failures = [
+        event for event in events if event["type"] == "tool_result" and event["tool"] == "terminal" and not event["success"]
+    ]
+    assert terminal_failures
+    assert "WSL/Linux path space" in terminal_failures[0]["result"]
+    assert terminal.calls == []
+    assert filesystem.calls == [{"action": "list", "path": "/mnt/c/Users/ariba/Desktop"}]
+
+
+@pytest.mark.asyncio
+async def test_agent_requires_path_resolution_before_done_for_local_document_open_goal(
+    config, tmp_workspace
+):
+    computer = NamedTool("computer", "Desktop control.")
+    filesystem = NamedTool("filesystem", "Filesystem access.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "1", "name": "computer", "arguments": {"action": "double_click"}}],
+            ),
+            LLMResponse(content="DONE: PowerPoint presentation is open."),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "2",
+                        "name": "filesystem",
+                        "arguments": {"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/Second Sun"},
+                    }
+                ],
+            ),
+            LLMResponse(content="DONE: PowerPoint presentation is open."),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[computer, filesystem])
+
+    events = []
+    gen = await agent.run("masaüstüne git ve oradan secondsun klasörüne gir ve karşına çıkan powerpoint sunumunu aç")
+    async for event in gen:
+        events.append(event)
+
+    done_events = [event for event in events if event["type"] == "done"]
+    assert len(done_events) == 1
+    assert filesystem.calls == [{"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/Second Sun"}]
+
+
+@pytest.mark.asyncio
+async def test_agent_prefers_local_system_for_under_the_hood_document_goals(tmp_workspace):
+    config = AgentConfig(
+        llm_provider="openai",
+        llm_model="gpt-4o",
+        workspace_dir=tmp_workspace,
+        memory_dir=tmp_workspace / ".memory",
+        max_iterations=6,
+        local_execution_mode="under_the_hood",
+        desktop_fallback_policy="pause_and_ask",
+        allow_computer_control=False,
+        allow_terminal=False,
+    )
+    computer = NamedTool("computer", "Desktop control.")
+    filesystem = NamedTool("filesystem", "Filesystem access.")
+    local_system = NamedTool("local_system", "Native local operations.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "1", "name": "computer", "arguments": {"action": "double_click"}}],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "2",
+                        "name": "local_system",
+                        "arguments": {"action": "resolve_known_folder", "folder_key": "desktop"},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "3",
+                        "name": "filesystem",
+                        "arguments": {"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun"},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "4",
+                        "name": "local_system",
+                        "arguments": {
+                            "action": "open_path",
+                            "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun/deck.pptx",
+                        },
+                    }
+                ],
+            ),
+            LLMResponse(content="DONE: PowerPoint presentation is open."),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[computer, filesystem, local_system])
+
+    events = []
+    gen = await agent.run(
+        "masaüstüne git ve oradan secondsun klasörüne gir ve karşına çıkan powerpoint sunumunu aç"
+    )
+    async for event in gen:
+        events.append(event)
+
+    computer_failures = [
+        event
+        for event in events
+        if event["type"] == "tool_result" and event["tool"] == "computer" and not event["success"]
+    ]
+    assert computer_failures
+    assert "visible desktop automation is disabled" in computer_failures[0]["result"]
+    assert computer.calls == []
+    assert filesystem.calls == [
+        {"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun"}
+    ]
+    assert local_system.calls == [
+        {"action": "resolve_known_folder", "folder_key": "desktop"},
+        {"action": "open_path", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun/deck.pptx"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_blocks_terminal_navigation_for_under_the_hood_local_goals(tmp_workspace):
+    config = AgentConfig(
+        llm_provider="openai",
+        llm_model="gpt-4o",
+        workspace_dir=tmp_workspace,
+        memory_dir=tmp_workspace / ".memory",
+        max_iterations=6,
+        local_execution_mode="under_the_hood",
+        desktop_fallback_policy="pause_and_ask",
+        allow_computer_control=False,
+        allow_terminal=False,
+    )
+    terminal = NamedTool("terminal", "Terminal access.")
+    filesystem = NamedTool("filesystem", "Filesystem access.")
+    local_system = NamedTool("local_system", "Native local operations.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "1",
+                        "name": "terminal",
+                        "arguments": {"command": "ls /mnt/c/Users/ariba/OneDrive/Desktop"},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "2",
+                        "name": "local_system",
+                        "arguments": {"action": "resolve_known_folder", "folder_key": "desktop"},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "3",
+                        "name": "filesystem",
+                        "arguments": {"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun"},
+                    }
+                ],
+            ),
+            LLMResponse(content="DONE: Folder contents are verified."),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[terminal, filesystem, local_system])
+
+    events = []
+    gen = await agent.run("masaüstüne git ve oradan secondsun klasörüne gir ve içindekileri bana söyle")
+    async for event in gen:
+        events.append(event)
+
+    terminal_failures = [
+        event
+        for event in events
+        if event["type"] == "tool_result" and event["tool"] == "terminal" and not event["success"]
+    ]
+    assert terminal_failures
+    assert "prefer `filesystem` for path discovery" in terminal_failures[0]["result"]
+    assert terminal.calls == []
+    assert local_system.calls == [{"action": "resolve_known_folder", "folder_key": "desktop"}]
+    assert filesystem.calls == [
+        {"action": "list", "path": "/mnt/c/Users/ariba/OneDrive/Desktop/secondsun"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_long_term_memory_is_skipped_for_local_desktop_goals(config, tmp_workspace):
+    agent = AutonomousAgent(config=config, llm=FakeLLM([]), tools=[EchoTool()])
+    agent._run_id = "run-current"
+    await agent.long_term_memory.add(
+        "Navigated to https://github.com/kagankakao",
+        metadata={"run_id": "run-older", "summary": "Opening github.com/kagankakao"},
+    )
+
+    memory_message = await agent._long_term_memory_message("masaüstündeki Second Sun klasörüne gir")
+
+    assert memory_message is None
+
+
+@pytest.mark.asyncio
+async def test_long_term_memory_requires_goal_overlap(config, tmp_workspace):
+    agent = AutonomousAgent(config=config, llm=FakeLLM([]), tools=[EchoTool()])
+    agent._run_id = "run-current"
+    await agent.long_term_memory.add(
+        "Navigated to https://github.com/kagankakao",
+        metadata={"run_id": "run-older", "summary": "Opening github.com/kagankakao"},
+    )
+    await agent.long_term_memory.add(
+        "Navigated to https://example.com/docs",
+        metadata={"run_id": "run-older-2", "summary": "Opening example.com/docs"},
+    )
+
+    memory_message = await agent._long_term_memory_message("open example.com")
+
+    assert memory_message is not None
+    assert "example.com" in memory_message.content
+    assert "github.com/kagankakao" not in memory_message.content

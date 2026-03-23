@@ -88,6 +88,10 @@ class BrowserTool(BaseTool):
             if snapshot.active:
                 self._page = object()
             return
+        if self._page is not None and not self._page_is_closed(self._page):
+            return
+        if self._page is not None:
+            await self._recover_after_browser_loss(None)
         if self._page is None:
             await self.start()
 
@@ -104,6 +108,8 @@ class BrowserTool(BaseTool):
                         "navigate",
                         "click",
                         "type",
+                        "key",
+                        "drag",
                         "scroll",
                         "screenshot",
                         "get_text",
@@ -122,8 +128,14 @@ class BrowserTool(BaseTool):
                     "description": "CSS selector or text content (prefixed with 'text=').",
                 },
                 "text": {"type": "string", "description": "Text to type."},
+                "key": {"type": "string", "description": "Keyboard key to press."},
                 "x": {"type": "number", "description": "X coordinate for click/scroll."},
                 "y": {"type": "number", "description": "Y coordinate for click/scroll."},
+                "start_x": {"type": "number", "description": "Drag start X coordinate."},
+                "start_y": {"type": "number", "description": "Drag start Y coordinate."},
+                "end_x": {"type": "number", "description": "Drag end X coordinate."},
+                "end_y": {"type": "number", "description": "Drag end Y coordinate."},
+                "steps": {"type": "number", "description": "Interpolation steps for drag movement."},
                 "delta_y": {"type": "number", "description": "Pixels to scroll vertically."},
                 "timeout": {
                     "type": "number",
@@ -143,70 +155,85 @@ class BrowserTool(BaseTool):
                 headless=self._headless,
             )
             return await session.execute(**kwargs)
-        await self._ensure_started()
         action: str = kwargs.get("action", "")
-        try:
-            if action == "navigate":
-                return await self._navigate(kwargs.get("url", ""))
-            if action == "click":
-                return await self._click(
-                    kwargs.get("selector"), kwargs.get("x"), kwargs.get("y")
-                )
-            if action == "type":
-                return await self._type(kwargs.get("selector"), kwargs.get("text", ""))
-            if action == "scroll":
-                return await self._scroll(
-                    kwargs.get("x", 0), kwargs.get("y", 0), kwargs.get("delta_y", 500)
-                )
-            if action == "screenshot":
-                return await self._screenshot()
-            if action == "get_text":
-                return await self._get_text(kwargs.get("selector"))
-            if action == "get_html":
-                return await self._get_html(kwargs.get("selector"))
-            if action == "wait":
-                await asyncio.sleep(kwargs.get("timeout", 1000) / 1000)
-                return ToolResult(success=True, output="Waited.")
-            if action == "back":
-                await self._page.go_back()
-                return await self._capture_visual_state(
-                    output="Navigated back.",
-                    frame_label="browser · back",
-                    summary="Going back",
-                    focus=self._default_focus(),
-                    burst=True,
-                )
-            if action == "forward":
-                await self._page.go_forward()
-                return await self._capture_visual_state(
-                    output="Navigated forward.",
-                    frame_label="browser · forward",
-                    summary="Going forward",
-                    focus=self._default_focus(),
-                    burst=True,
-                )
-            if action == "new_tab":
-                self._page = await self._browser.new_page()
-                return await self._capture_visual_state(
-                    output="Opened new tab.",
-                    frame_label="browser · new_tab",
-                    summary="Opening a new tab",
-                    focus=self._default_focus(),
-                    burst=True,
-                )
-            if action == "close_tab":
-                await self._page.close()
-                self._page = await self._browser.new_page()
-                return await self._capture_visual_state(
-                    output="Closed tab.",
-                    frame_label="browser · close_tab",
-                    summary="Closing the tab",
-                    focus=self._default_focus(),
-                    burst=True,
-                )
-            return ToolResult(success=False, error=f"Unknown action: {action!r}")
-        except Exception as exc:  # noqa: BLE001
-            return ToolResult(success=False, error=str(exc))
+        for attempt in range(2):
+            try:
+                await self._ensure_started()
+                if action == "navigate":
+                    return await self._navigate(kwargs.get("url", ""))
+                if action == "click":
+                    return await self._click(
+                        kwargs.get("selector"), kwargs.get("x"), kwargs.get("y")
+                    )
+                if action == "type":
+                    return await self._type(kwargs.get("selector"), kwargs.get("text", ""))
+                if action == "key":
+                    return await self._key(kwargs.get("key", ""))
+                if action == "drag":
+                    return await self._drag(
+                        kwargs.get("start_x"),
+                        kwargs.get("start_y"),
+                        kwargs.get("end_x"),
+                        kwargs.get("end_y"),
+                        kwargs.get("steps", 14),
+                    )
+                if action == "scroll":
+                    return await self._scroll(
+                        kwargs.get("x", 0), kwargs.get("y", 0), kwargs.get("delta_y", 500)
+                    )
+                if action == "screenshot":
+                    return await self._screenshot()
+                if action == "get_text":
+                    return await self._get_text(kwargs.get("selector"))
+                if action == "get_html":
+                    return await self._get_html(kwargs.get("selector"))
+                if action == "wait":
+                    await asyncio.sleep(kwargs.get("timeout", 1000) / 1000)
+                    return ToolResult(success=True, output="Waited.")
+                if action == "back":
+                    await self._page.go_back()
+                    return await self._capture_visual_state(
+                        output="Navigated back.",
+                        frame_label="browser · back",
+                        summary="Going back",
+                        focus=self._default_focus(),
+                        burst=True,
+                    )
+                if action == "forward":
+                    await self._page.go_forward()
+                    return await self._capture_visual_state(
+                        output="Navigated forward.",
+                        frame_label="browser · forward",
+                        summary="Going forward",
+                        focus=self._default_focus(),
+                        burst=True,
+                    )
+                if action == "new_tab":
+                    self._page = await self._browser.new_page()
+                    return await self._capture_visual_state(
+                        output="Opened new tab.",
+                        frame_label="browser · new_tab",
+                        summary="Opening a new tab",
+                        focus=self._default_focus(),
+                        burst=True,
+                    )
+                if action == "close_tab":
+                    await self._page.close()
+                    self._page = await self._browser.new_page()
+                    return await self._capture_visual_state(
+                        output="Closed tab.",
+                        frame_label="browser · close_tab",
+                        summary="Closing the tab",
+                        focus=self._default_focus(),
+                        burst=True,
+                    )
+                return ToolResult(success=False, error=f"Unknown action: {action!r}")
+            except Exception as exc:  # noqa: BLE001
+                recovered = await self._recover_after_browser_loss(exc)
+                if attempt == 0 and recovered:
+                    continue
+                return ToolResult(success=False, error=str(exc))
+        return ToolResult(success=False, error="Browser is unavailable.")
 
     async def preview(self, **kwargs: Any) -> dict[str, Any] | None:
         if self._browser_sessions is not None and self._thread_id is not None:
@@ -252,6 +279,23 @@ class BrowserTool(BaseTool):
                 frame_label="browser · type",
                 summary="Typing text",
                 focus=self._default_focus_normalized(y=0.56),
+            )
+        if action == "key":
+            return self._preview_payload(
+                frame_label="browser · key",
+                summary=self._key_summary(kwargs.get("key")),
+                focus=self._default_focus_normalized(y=0.56),
+            )
+        if action == "drag":
+            return self._preview_payload(
+                frame_label="browser · drag",
+                summary="Dragging on the page",
+                focus=self._normalize_drag_focus(
+                    kwargs.get("start_x"),
+                    kwargs.get("start_y"),
+                    kwargs.get("end_x"),
+                    kwargs.get("end_y"),
+                ),
             )
         if action == "scroll":
             x = kwargs.get("x")
@@ -356,6 +400,41 @@ class BrowserTool(BaseTool):
             burst=True,
         )
 
+    async def _key(self, key: str) -> ToolResult:
+        if not key:
+            return ToolResult(success=False, error="key is required for 'key'")
+        await self._page.keyboard.press(key)
+        return await self._capture_visual_state(
+            output=f"Pressed {key!r}.",
+            frame_label="browser · key",
+            summary=self._key_summary(key),
+            focus=self._default_focus(y=0.56),
+            burst=True,
+        )
+
+    async def _drag(
+        self,
+        start_x: float | None,
+        start_y: float | None,
+        end_x: float | None,
+        end_y: float | None,
+        steps: int | None,
+    ) -> ToolResult:
+        if None in {start_x, start_y, end_x, end_y}:
+            return ToolResult(success=False, error="start_x, start_y, end_x, and end_y are required for 'drag'")
+        drag_steps = max(1, int(steps or 14))
+        await self._page.mouse.move(float(start_x), float(start_y))
+        await self._page.mouse.down()
+        await self._page.mouse.move(float(end_x), float(end_y), steps=drag_steps)
+        await self._page.mouse.up()
+        return await self._capture_visual_state(
+            output=f"Dragged ({start_x}, {start_y}) to ({end_x}, {end_y})",
+            frame_label="browser · drag",
+            summary="Dragging on the page",
+            focus=(float(end_x), float(end_y)),
+            burst=True,
+        )
+
     async def _scroll(self, x: float, y: float, delta_y: float) -> ToolResult:
         await self._page.mouse.wheel(delta_x=0, delta_y=delta_y)
         focus = (x, y) if x or y else self._default_focus(y=0.78)
@@ -445,6 +524,48 @@ class BrowserTool(BaseTool):
             )
         return frames
 
+    async def _recover_after_browser_loss(self, exc: Exception | None) -> bool:
+        if exc is not None and not self._looks_like_closed_browser_error(exc):
+            return False
+        try:
+            await self.stop()
+        except Exception:  # noqa: BLE001
+            self._browser = None
+            self._page = None
+            self._playwright = None
+        return True
+
+    @staticmethod
+    def _looks_like_closed_browser_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        if not message:
+            return False
+        if "target page" in message and "closed" in message:
+            return True
+        if "browser has been closed" in message:
+            return True
+        if "browser is closed" in message:
+            return True
+        if "context has been closed" in message:
+            return True
+        if "page has been closed" in message:
+            return True
+        if "connection closed" in message:
+            return True
+        if "disconnected" in message and "browser" in message:
+            return True
+        return False
+
+    @staticmethod
+    def _page_is_closed(page: Any) -> bool:
+        checker = getattr(page, "is_closed", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:  # noqa: BLE001
+                return True
+        return False
+
     async def _selector_focus(self, selector: str) -> tuple[float, float]:
         locator = self._page.locator(selector).first
         box = await locator.bounding_box()
@@ -499,6 +620,19 @@ class BrowserTool(BaseTool):
             return self._default_focus_normalized()
         return self._normalize_focus(float(x), float(y))
 
+    def _normalize_drag_focus(
+        self,
+        start_x: float | None,
+        start_y: float | None,
+        end_x: float | None,
+        end_y: float | None,
+    ) -> tuple[float, float]:
+        if end_x is not None and end_y is not None:
+            return self._normalize_preview_focus(end_x, end_y)
+        if start_x is not None and start_y is not None:
+            return self._normalize_preview_focus(start_x, start_y)
+        return self._default_focus_normalized()
+
     @staticmethod
     def _preview_payload(
         *,
@@ -513,6 +647,11 @@ class BrowserTool(BaseTool):
             "focus_x": max(0.0, min(1.0, float(focus_x))),
             "focus_y": max(0.0, min(1.0, float(focus_y))),
         }
+
+    @staticmethod
+    def _key_summary(key: Any) -> str:
+        value = str(key or "").strip()
+        return f"Pressing {value}" if value else "Pressing a key"
 
     @staticmethod
     def _short_url(url: str) -> str:

@@ -84,6 +84,12 @@ class AgentConfig(BaseSettings):
     browser_headless: bool = Field(default=False)
     browser_type: Literal["chromium", "firefox", "webkit"] = Field(default="chromium")
 
+    # ── Local execution policy ────────────────────────────────────────────────
+    local_execution_mode: Literal["visible", "under_the_hood"] = Field(default="visible")
+    desktop_fallback_policy: Literal["visible_control", "pause_and_ask"] = Field(
+        default="visible_control"
+    )
+
     # ── Safety ────────────────────────────────────────────────────────────────
     allow_terminal: bool = Field(default=True)
     allow_filesystem_write: bool = Field(default=True)

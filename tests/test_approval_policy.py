@@ -31,3 +31,32 @@ def test_default_policy_allows_safe_browser_navigation() -> None:
     )
 
     assert decision.action == "allow"
+
+
+def test_default_policy_allows_safe_desktop_navigation_key_for_local_goal() -> None:
+    engine = ApprovalPolicyEngine.default()
+
+    decision = engine.evaluate(
+        ApprovalPolicyContext(
+            tool_name="computer",
+            tool_args={"action": "key", "text": "win+d"},
+            goal="masaüstüme git ve secondsun klasörünü aç",
+        )
+    )
+
+    assert decision.action == "allow"
+
+
+def test_default_policy_requires_approval_for_risky_desktop_shortcut() -> None:
+    engine = ApprovalPolicyEngine.default()
+
+    decision = engine.evaluate(
+        ApprovalPolicyContext(
+            tool_name="computer",
+            tool_args={"action": "key", "text": "alt+f4"},
+            goal="masaüstüme git ve secondsun klasörünü aç",
+        )
+    )
+
+    assert decision.action == "require_approval"
+    assert decision.rule_id == "computer-direct-control"

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import unicodedata
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
 
@@ -26,6 +27,7 @@ from agentra.tools.browser import BrowserTool
 from agentra.tools.computer import ComputerTool
 from agentra.tools.filesystem import FilesystemTool
 from agentra.tools.git_tool import GitTool
+from agentra.tools.local_system import LocalSystemTool
 from agentra.tools.terminal import TerminalTool
 
 logger = logging.getLogger(__name__)
@@ -43,12 +45,304 @@ You are Agentra, an autonomous AI agent with full access to a computer.
 4. When the goal is fully achieved, output a final summary beginning with "DONE: ".
 5. If you are unsure or need clarification, ask the user.
 
+## Tool routing rules
+- Use `browser` only for websites, web apps, URLs, and web pages.
+- Use `local_system` to resolve known local folders and open confirmed local files or folders with the OS default handler.
+- Use `computer` only for visible desktop/UI tasks that truly require on-screen interaction.
+- Use `filesystem` to inspect local paths and contents. Use `terminal` only when `filesystem` or `local_system` cannot directly resolve the local task.
+- After every `computer` action, inspect the latest screenshot before repeating the same click. If the screen did not visibly change, stop guessing and reassess.
+- If the user asks what is inside a local folder, verify the contents with a successful local listing/read step (prefer `filesystem`) after opening it. Never invent contents from failed commands or blind clicks.
+- Ignore unrelated remembered context, unrelated open tabs, and unrelated previous-run state. Never substitute a different website, account, or task just because it was used before.
+- Do not take unrelated extra actions after the goal is already satisfied.
+
 ## Safety rules
 - Never delete files unless explicitly asked.
 - Do not execute commands that could cause irreversible damage without warning.
 - Confirm destructive actions with the user before proceeding.
 - You operate inside the workspace directory: {workspace_dir}
+
+## Current goal guidance
+{goal_guidance}
 """
+
+_DESKTOP_SURFACE_TERMS = (
+    "desktop",
+    "masaustu",
+    "taskbar",
+    "gorev cubugu",
+    "start menu",
+    "baslat",
+    "file explorer",
+    "explorer",
+    "folder",
+    "klasor",
+    "directory",
+    "window",
+    "pencere",
+    "icon",
+    "kisayol",
+    "shortcut",
+    "native app",
+    "uygulama",
+)
+_VISUAL_DESKTOP_ACTION_TERMS = (
+    "open",
+    "launch",
+    "click",
+    "double click",
+    "drag",
+    "scroll",
+    "type",
+    "press",
+    "enter",
+    "go to",
+    "show",
+    "select",
+    "navigate",
+    "ac",
+    "tikla",
+    "surukle",
+    "kaydir",
+    "yaz",
+    "bas",
+    "sec",
+    "goster",
+    "gir",
+)
+_WEB_TERMS = (
+    "browser",
+    "tarayici",
+    "web",
+    "website",
+    "site",
+    "sayfa",
+    "page",
+    "repo",
+    "repository",
+    "github",
+    "gitlab",
+    "google",
+    "youtube",
+    "linkedin",
+    "x.com",
+    "twitter",
+    "login",
+    "log in",
+    "sign in",
+    "account",
+    "hesap",
+)
+_FOLDER_CONTENT_TERMS = (
+    "contents",
+    "content",
+    "inside",
+    "what is inside",
+    "what's inside",
+    "list",
+    "listele",
+    "icerik",
+    "icerigini",
+    "icindekileri",
+    "neler var",
+    "bana soyle",
+)
+_LOCAL_DOCUMENT_OPEN_TERMS = (
+    "powerpoint",
+    "ppt",
+    "pptx",
+    "sunum",
+    "presentation",
+    "slide",
+    "document",
+    "dosya",
+    "pdf",
+    "word",
+    "excel",
+)
+_GOAL_STOPWORDS = {
+    "the",
+    "and",
+    "then",
+    "with",
+    "into",
+    "from",
+    "that",
+    "this",
+    "open",
+    "click",
+    "launch",
+    "show",
+    "select",
+    "navigate",
+    "please",
+    "desktop",
+    "folder",
+    "window",
+    "app",
+    "taskbar",
+    "browser",
+    "masaustu",
+    "klasor",
+    "pencere",
+    "uygulama",
+    "gorev",
+    "cubugu",
+    "ac",
+    "tikla",
+    "goster",
+    "sec",
+    "gir",
+    "ve",
+    "ile",
+    "bir",
+    "icin",
+    "sonra",
+    "hesap",
+    "site",
+    "sayfa",
+}
+
+
+def _normalized_text(text: str) -> str:
+    folded = unicodedata.normalize("NFKD", text.casefold())
+    stripped = "".join(char for char in folded if not unicodedata.combining(char))
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
+def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def _goal_tokens(text: str) -> set[str]:
+    normalized = _normalized_text(text)
+    tokens = set(re.findall(r"[a-z0-9]{4,}", normalized))
+    return {token for token in tokens if token not in _GOAL_STOPWORDS}
+
+
+def _goal_mentions_web_target(goal: str) -> bool:
+    normalized = _normalized_text(goal)
+    if re.search(r"https?://|www\.", normalized):
+        return True
+    if re.search(r"\b[a-z0-9-]+\.(com|org|net|io|ai|app|dev|co|tr)\b", normalized):
+        return True
+    return _contains_any_phrase(normalized, _WEB_TERMS)
+
+
+def _goal_mentions_desktop_surface(goal: str) -> bool:
+    normalized = _normalized_text(goal)
+    if re.search(r"\b[a-z]:\\", goal, flags=re.IGNORECASE):
+        return True
+    if "onedrive" in normalized:
+        return True
+    return _contains_any_phrase(normalized, _DESKTOP_SURFACE_TERMS)
+
+
+def _goal_requires_visual_desktop_control(goal: str) -> bool:
+    normalized = _normalized_text(goal)
+    if not _goal_mentions_desktop_surface(goal):
+        return False
+    return _contains_any_phrase(normalized, _VISUAL_DESKTOP_ACTION_TERMS)
+
+
+def _goal_is_desktop_local_only(goal: str) -> bool:
+    return _goal_requires_visual_desktop_control(goal) and not _goal_mentions_web_target(goal)
+
+
+def _goal_requests_folder_contents(goal: str) -> bool:
+    if not _goal_is_desktop_local_only(goal):
+        return False
+    return _contains_any_phrase(_normalized_text(goal), _FOLDER_CONTENT_TERMS)
+
+
+def _goal_requests_local_document_open(goal: str) -> bool:
+    if not _goal_is_desktop_local_only(goal):
+        return False
+    return _contains_any_phrase(_normalized_text(goal), _LOCAL_DOCUMENT_OPEN_TERMS)
+
+
+def _memory_entry_matches_goal(goal: str, text: str) -> bool:
+    tokens = _goal_tokens(goal)
+    if not tokens:
+        return True
+    haystack = _normalized_text(text)
+    return any(token in haystack for token in tokens)
+
+
+def _recent_repeated_desktop_click(
+    tool_args: dict[str, Any],
+    tool_history: list[dict[str, Any]],
+    *,
+    tolerance: float = 24.0,
+) -> bool:
+    action = str(tool_args.get("action", "")).lower()
+    if action not in {"click", "double_click", "right_click"}:
+        return False
+    x = tool_args.get("x")
+    y = tool_args.get("y")
+    if x is None or y is None:
+        return False
+
+    similar = 0
+    for entry in reversed(tool_history[-6:]):
+        if entry.get("tool") != "computer" or not entry.get("success"):
+            continue
+        prior_args = entry.get("args") or {}
+        if str(prior_args.get("action", "")).lower() != action:
+            continue
+        prior_x = prior_args.get("x")
+        prior_y = prior_args.get("y")
+        if prior_x is None or prior_y is None:
+            continue
+        if abs(float(prior_x) - float(x)) <= tolerance and abs(float(prior_y) - float(y)) <= tolerance:
+            similar += 1
+        if similar >= 2:
+            return True
+    return False
+
+
+def _has_successful_local_listing(tool_history: list[dict[str, Any]]) -> bool:
+    return any(
+        entry.get("success") and entry.get("tool") in {"filesystem", "terminal"}
+        for entry in tool_history
+    )
+
+
+def _has_successful_local_open(tool_history: list[dict[str, Any]]) -> bool:
+    return any(
+        entry.get("success")
+        and entry.get("tool") == "local_system"
+        and str((entry.get("args") or {}).get("action", "")).lower() == "open_path"
+        for entry in tool_history
+    )
+
+
+def _has_excessive_desktop_click_guessing(
+    tool_args: dict[str, Any],
+    tool_history: list[dict[str, Any]],
+    *,
+    threshold: int = 4,
+) -> bool:
+    action = str(tool_args.get("action", "")).lower()
+    if action not in {"click", "double_click", "right_click"}:
+        return False
+
+    click_count = 0
+    for entry in reversed(tool_history[-12:]):
+        if not entry.get("success"):
+            continue
+        tool = entry.get("tool")
+        if tool in {"filesystem", "terminal", "browser"}:
+            return False
+        if tool != "computer":
+            continue
+        prior_action = str((entry.get("args") or {}).get("action", "")).lower()
+        if prior_action in {"click", "double_click", "right_click"}:
+            click_count += 1
+    return click_count >= threshold
+
+
+def _successful_tools_used(tool_history: list[dict[str, Any]]) -> set[str]:
+    return {str(entry.get("tool")) for entry in tool_history if entry.get("success")}
 
 
 class AutonomousAgent:
@@ -119,7 +413,7 @@ class AutonomousAgent:
         self._running = True
         self._goal = goal
         self._session = self.llm.start_session(
-            system_message=self._system_message(),
+            system_message=self._system_message(goal),
             tools=self._tool_schemas(),
         )
 
@@ -127,6 +421,8 @@ class AutonomousAgent:
         await self._remember(goal, role="user", source_type="goal")
 
         iteration = 0
+        successful_tools_used: set[str] = set()
+        tool_history: list[dict[str, Any]] = []
 
         async def _generator() -> AsyncIterator[dict[str, Any]]:
             nonlocal iteration
@@ -171,6 +467,13 @@ class AutonomousAgent:
                         )
                         done_content = self._extract_done_content(response.content)
                         if done_content is not None:
+                            desktop_guard_message = self._done_guard_message(
+                                goal,
+                                tool_history,
+                            )
+                            if desktop_guard_message is not None:
+                                self._session.append(LLMMessage(role="user", content=desktop_guard_message))
+                                continue
                             if self._thread_id is None:
                                 self.workspace.snapshot(f"task: {goal[:60]}")
                             yield {"type": "done", "content": done_content}
@@ -191,8 +494,6 @@ class AutonomousAgent:
                             tool_name: str = tool_call["name"]
                             tool_args: dict[str, Any] = tool_call["arguments"]
                             tool_call_id: str = tool_call.get("id", tool_name)
-                            preview = await self._preview_tool(tool_name, tool_args)
-                            approval_event = self._prepare_approval_event(tool_name, tool_args)
 
                             yield {
                                 "type": "phase",
@@ -200,6 +501,43 @@ class AutonomousAgent:
                                 "content": "İşlemi hazırlıyor...",
                                 "summary": "İşlemi hazırlıyor...",
                             }
+                            yield {"type": "tool_call", "tool": tool_name, "args": tool_args}
+
+                            guardrail_error = self._tool_guardrail_error(
+                                goal,
+                                tool_name,
+                                tool_args,
+                                successful_tools_used,
+                                tool_history,
+                            )
+                            if guardrail_error is not None:
+                                result = ToolResult(
+                                    success=False,
+                                    error=guardrail_error,
+                                    metadata={"summary": guardrail_error},
+                                )
+                                async for result_event in self._emit_tool_result_events(tool_name, result):
+                                    yield result_event
+                                tool_results.append(
+                                    LLMToolResult(
+                                        tool_call_id=tool_call_id,
+                                        name=tool_name,
+                                        content=str(result),
+                                        success=False,
+                                    )
+                                )
+                                tool_history.append(
+                                    {
+                                        "tool": tool_name,
+                                        "args": dict(tool_args),
+                                        "success": False,
+                                        "guardrail": True,
+                                    }
+                                )
+                                continue
+
+                            preview = await self._preview_tool(tool_name, tool_args)
+                            approval_event = self._prepare_approval_event(tool_name, tool_args)
 
                             if approval_event is not None:
                                 yield approval_event
@@ -230,7 +568,6 @@ class AutonomousAgent:
                                     )
                                     continue
 
-                            yield {"type": "tool_call", "tool": tool_name, "args": tool_args}
                             if preview:
                                 yield {
                                     "type": "visual_intent",
@@ -240,6 +577,16 @@ class AutonomousAgent:
                                 }
 
                             result = await self._call_tool(tool_name, tool_args)
+                            tool_history.append(
+                                {
+                                    "tool": tool_name,
+                                    "args": dict(tool_args),
+                                    "success": result.success,
+                                    "result": str(result),
+                                }
+                            )
+                            if result.success:
+                                successful_tools_used.add(tool_name)
                             async for result_event in self._emit_tool_result_events(tool_name, result):
                                 yield result_event
                             result_text = str(result)
@@ -359,11 +706,12 @@ class AutonomousAgent:
                 headless=self.config.browser_headless,
                 browser_type=self.config.browser_type,
             ),
-            ComputerTool(allow=self.config.allow_computer_control),
             FilesystemTool(
                 workspace_dir=self.config.workspace_dir,
                 allow_write=self.config.allow_filesystem_write,
             ),
+            LocalSystemTool(),
+            ComputerTool(allow=self.config.allow_computer_control),
             TerminalTool(
                 cwd=self.config.workspace_dir,
                 allow=self.config.allow_terminal,
@@ -507,15 +855,103 @@ class AutonomousAgent:
     def _tool_schemas(self) -> list[dict[str, Any]]:
         return [tool.to_openai_tool() for tool in self.tools.values()]
 
-    def _system_message(self) -> LLMMessage:
+    def _system_message(self, goal: str) -> LLMMessage:
         tool_descriptions = "\n".join(
             f"- **{tool.name}**: {tool.description}" for tool in self.tools.values()
         )
         content = _SYSTEM_PROMPT.format(
             tool_descriptions=tool_descriptions,
             workspace_dir=self.config.workspace_dir,
+            goal_guidance=self._goal_guidance(goal),
         )
         return LLMMessage(role="system", content=content)
+
+    def _goal_guidance(self, goal: str) -> str:
+        if _goal_is_desktop_local_only(goal):
+            if self._uses_under_the_hood_local_execution(goal):
+                guidance = (
+                    "This is a local desktop/file task, and this run is configured for under-the-hood "
+                    "local execution. Do not use `computer` automatically. First use `local_system` "
+                    "to resolve known folders such as Desktop, then use `filesystem` to inspect the "
+                    "resolved WSL path, and use `local_system` `open_path` to open the confirmed file "
+                    "or folder with the native OS. Only use `terminal` if `filesystem` or "
+                    "`local_system` cannot resolve the local path. If you cannot resolve the target "
+                    "confidently, ask the user instead of switching to visible desktop automation. "
+                    "Do not use `browser` unless the user explicitly mentions a website or URL."
+                )
+                guidance += (
+                    " `local_system resolve_known_folder` returns the real local Desktop path, including "
+                    "OneDrive-backed Desktop locations when present."
+                )
+                if _goal_requests_folder_contents(goal):
+                    guidance += (
+                        " The user also wants the folder contents. Verify the actual items with a "
+                        "successful `filesystem` listing of the resolved path before you say DONE."
+                    )
+                if _goal_requests_local_document_open(goal):
+                    guidance += (
+                        " This goal names a local document or presentation. Follow this order: "
+                        "1) resolve the Desktop path with `local_system`, 2) locate the exact folder "
+                        "or file with `filesystem`, 3) open the confirmed item with "
+                        "`local_system open_path`."
+                    )
+                return guidance
+            guidance = (
+                "This is a local desktop task. Prefer `computer` for opening folders, apps, or "
+                "windows on screen. `terminal` or `filesystem` may help you discover paths, but "
+                "they do not count as visually opening the requested folder or app. Do not use "
+                "`browser` unless the user explicitly mentions a website or URL."
+            )
+            guidance += " " + self._desktop_path_guidance()
+            if _goal_requests_folder_contents(goal):
+                guidance += (
+                    " The user also wants the folder contents. After opening the folder on screen, "
+                    "verify the actual items with a successful local listing/read step, preferably "
+                    "`filesystem`, before you say DONE."
+                )
+            if _goal_requests_local_document_open(goal):
+                guidance += (
+                    " This goal names a local document or presentation. First resolve the exact "
+                    "folder or file path with `filesystem` or a valid `terminal` command, then "
+                    "open the confirmed item on screen. Do not keep double-clicking guesses."
+                )
+            return guidance
+        if _goal_requires_visual_desktop_control(goal):
+            return (
+                "This goal includes visible desktop interaction. Use `computer` to complete any "
+                "desktop/UI step, and only use `browser` for an explicitly requested website."
+            )
+        if _goal_mentions_web_target(goal):
+            return (
+                "This goal is web-oriented. Prefer `browser` for website actions and ignore "
+                "unrelated desktop or previous-run context."
+            )
+        return (
+            "Pick the tool that directly matches the user's requested environment, and ignore "
+            "unrelated memories or stale browser state."
+        )
+
+    def _uses_under_the_hood_local_execution(self, goal: str) -> bool:
+        return (
+            self.config.local_execution_mode == "under_the_hood"
+            and _goal_is_desktop_local_only(goal)
+        )
+
+    def _desktop_path_guidance(self) -> str:
+        workspace_text = str(self.config.workspace_dir).replace("\\", "/")
+        match = re.search(r"/mnt/([a-z])/Users/([^/]+)/", workspace_text, re.IGNORECASE)
+        if match:
+            drive_letter, username = match.groups()
+            desktop_path = f"/mnt/{drive_letter.lower()}/Users/{username}/Desktop"
+            onedrive_desktop_path = f"/mnt/{drive_letter.lower()}/Users/{username}/OneDrive/Desktop"
+        else:
+            desktop_path = "/mnt/c/Users/<user>/Desktop"
+            onedrive_desktop_path = "/mnt/c/Users/<user>/OneDrive/Desktop"
+        return (
+            "The `terminal` and `filesystem` tools run in WSL/Linux path space, not raw Windows "
+            f"paths. Prefer paths like `{desktop_path}` or `{onedrive_desktop_path}`; if you need "
+            "native Windows shell behavior, use `powershell.exe` explicitly."
+        )
 
     @staticmethod
     def _extract_done_content(content: str) -> str | None:
@@ -600,6 +1036,128 @@ class AutonomousAgent:
             "risk_level": decision.risk_level,
         }
 
+    def _tool_guardrail_error(
+        self,
+        goal: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        successful_tools_used: set[str],
+        tool_history: list[dict[str, Any]],
+    ) -> str | None:
+        if tool_name == "browser":
+            if "computer" in successful_tools_used:
+                return None
+            if not _goal_is_desktop_local_only(goal):
+                return None
+            action = str(tool_args.get("action", "")).lower()
+            if action in {"navigate", "click", "type", "scroll", "drag", "back", "forward", "new_tab"}:
+                if self._uses_under_the_hood_local_execution(goal):
+                    return (
+                        "This is an under-the-hood local task, not a website task. Use "
+                        "`local_system` plus `filesystem` to resolve and open the requested local "
+                        "folder or file instead of using the browser."
+                    )
+                return (
+                    "This goal is a local desktop/folder task. Use the computer tool to open the "
+                    "requested folder or window on screen before using the browser."
+                )
+            return None
+        if tool_name == "local_system" and self._uses_under_the_hood_local_execution(goal):
+            action = str(tool_args.get("action", "")).lower()
+            if action == "open_path" and not str(tool_args.get("path", "") or "").strip():
+                return "Resolve the exact local file or folder path before calling `local_system open_path`."
+            return None
+        if tool_name == "terminal" and _goal_is_desktop_local_only(goal):
+            command = str(tool_args.get("command", "") or "")
+            lowered_command = command.casefold()
+            if self._uses_under_the_hood_local_execution(goal):
+                if re.search(r"\b(ls|dir|find|fd|pwd|cd)\b", lowered_command):
+                    return (
+                        "For this under-the-hood local task, prefer `filesystem` for path discovery "
+                        "and listings. Use `terminal` only if `filesystem` or `local_system` cannot "
+                        "resolve the needed local path."
+                    )
+            if re.search(r"[a-zA-Z]:\\", command) and "powershell.exe" not in lowered_command:
+                return (
+                    "The terminal tool runs in WSL/Linux path space. Do not pass raw Windows "
+                    "paths like `C:\\...` to shell commands here. Use `/mnt/c/Users/...` paths, "
+                    "or call `powershell.exe` explicitly if you need Windows-native behavior."
+                )
+        if tool_name == "filesystem" and _goal_is_desktop_local_only(goal):
+            path = str(tool_args.get("path", "") or "")
+            if re.search(r"^[a-zA-Z]:\\", path):
+                return (
+                    "The filesystem tool resolves paths in WSL/Linux space. Use `/mnt/c/Users/...` "
+                    "style paths instead of raw `C:\\...` Windows paths."
+                )
+        if tool_name == "computer" and _goal_is_desktop_local_only(goal):
+            if self._uses_under_the_hood_local_execution(goal):
+                return (
+                    "This run is configured for under-the-hood local execution, so visible desktop "
+                    "automation is disabled by default. Resolve the actual local path with "
+                    "`local_system` and `filesystem`, then open the confirmed item with "
+                    "`local_system open_path`. If you still cannot continue confidently, ask the "
+                    "user instead of using the computer tool."
+                )
+            if _recent_repeated_desktop_click(tool_args, tool_history):
+                return (
+                    "You have already repeated this same desktop click at nearly the same "
+                    "coordinates multiple times. Stop guessing coordinates, inspect the latest "
+                    "screenshot, and choose a different target or use a path/listing step before "
+                    "continuing."
+                )
+            if _has_excessive_desktop_click_guessing(tool_args, tool_history):
+                return (
+                    "You have already tried several desktop click or double-click guesses without "
+                    "real progress. Stop brute-forcing the UI. Resolve the local folder/file path "
+                    "with `filesystem` or a valid WSL/PowerShell command, then continue from the "
+                    "confirmed target."
+                )
+        return None
+
+    def _done_guard_message(self, goal: str, tool_history: list[dict[str, Any]]) -> str | None:
+        successful_tools_used = _successful_tools_used(tool_history)
+        if self._uses_under_the_hood_local_execution(goal):
+            if _goal_requests_folder_contents(goal) and not _has_successful_local_listing(tool_history):
+                return (
+                    "The user asked for the contents of a local folder. Do not guess from partial "
+                    "path resolution alone. First verify the actual items with a successful "
+                    "`filesystem` or `terminal` listing of the resolved local path, then continue."
+                )
+            if not _goal_requests_folder_contents(goal) and not _has_successful_local_open(tool_history):
+                return (
+                    "This under-the-hood local task is not complete yet. Resolve the exact local "
+                    "file or folder path, then open the confirmed item with `local_system "
+                    "open_path` before you say DONE."
+                )
+            if _goal_requests_local_document_open(goal) and not _has_successful_local_listing(tool_history):
+                return (
+                    "The user asked you to open a local document or presentation. Confirm the "
+                    "actual folder or file path with `filesystem` before you finish."
+                )
+            return None
+        if _goal_is_desktop_local_only(goal) and "computer" not in successful_tools_used:
+            return (
+                "The user asked for a desktop/UI action. A terminal listing or unrelated browser tab "
+                "does not count as opening the requested folder or window. Use the computer tool to "
+                "visually open it on screen, then continue."
+            )
+        if _goal_requests_folder_contents(goal) and not _has_successful_local_listing(tool_history):
+            return (
+                "The user asked you to report the contents of a local desktop folder. Do not guess "
+                "from clicks or failed commands. After opening the folder on screen, verify the "
+                "actual items with a successful `filesystem` or `terminal` listing of the resolved "
+                "local path, then continue."
+            )
+        if _goal_requests_local_document_open(goal) and not _has_successful_local_listing(tool_history):
+            return (
+                "The user asked you to open a local desktop document or presentation. Do not guess "
+                "which icon or file to open from repeated clicks alone. First confirm the local "
+                "folder or file path with a successful `filesystem` or `terminal` step, then "
+                "continue."
+            )
+        return None
+
     async def _emit_tool_result_events(self, tool_name: str, result: ToolResult) -> AsyncIterator[dict[str, Any]]:
         if result.screenshot_b64:
             screenshot_event = {"type": "screenshot", "data": result.screenshot_b64}
@@ -683,6 +1241,8 @@ class AutonomousAgent:
         await self.long_term_memory.add(text, role=role, screenshot_b64=screenshot_b64, metadata=payload)
 
     async def _long_term_memory_message(self, goal: str) -> LLMMessage | None:
+        if _goal_is_desktop_local_only(goal):
+            return None
         try:
             results = await self.long_term_memory.search(goal, top_k=3)
         except Exception as exc:  # noqa: BLE001
@@ -696,6 +1256,21 @@ class AutonomousAgent:
                 continue
             snippet = item.text.strip()
             if not snippet:
+                continue
+            text_to_match = "\n".join(
+                filter(
+                    None,
+                    (
+                        item.text,
+                        item.retrieval_text,
+                        str(item.metadata.get("summary", "")),
+                        str(item.metadata.get("url", "")),
+                        str(item.metadata.get("active_url", "")),
+                        str(item.metadata.get("active_title", "")),
+                    ),
+                )
+            )
+            if not _memory_entry_matches_goal(goal, text_to_match):
                 continue
             compact = snippet[:220]
             if compact in seen:

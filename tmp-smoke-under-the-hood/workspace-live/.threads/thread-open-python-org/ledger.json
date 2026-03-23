@@ -1,0 +1,28 @@
+{
+  "thread_id": "thread-open-python-org",
+  "title": "Open python.org",
+  "status": "idle",
+  "handoff_state": "agent",
+  "created_at": "2026-03-23T12:54:14",
+  "current_run_id": null,
+  "workspace_dir": "C:\\Users\\ariba\\OneDrive\\Documenti\\Software Projects\\AI Projects\\Agentra\\Agentra\\tmp-smoke-under-the-hood\\workspace-live\\.threads\\thread-open-python-org\\workspace",
+  "memory_dir": "C:\\Users\\ariba\\OneDrive\\Documenti\\Software Projects\\AI Projects\\Agentra\\Agentra\\tmp-smoke-under-the-hood\\workspace-live\\.threads\\thread-open-python-org\\workspace\\.memory",
+  "long_term_memory_dir": "C:\\Users\\ariba\\OneDrive\\Documenti\\Software Projects\\AI Projects\\Agentra\\Agentra\\tmp-smoke-under-the-hood\\workspace-live\\.memory-global",
+  "runs": [],
+  "approvals": [],
+  "questions": [],
+  "human_actions": [],
+  "browser": {
+    "browser_session_active": false,
+    "active_url": "",
+    "active_title": "",
+    "tab_count": 0,
+    "browser": {
+      "active": false,
+      "active_url": "",
+      "active_title": "",
+      "tab_count": 0
+    }
+  },
+  "audit": []
+}

@@ -14,11 +14,12 @@ from typing import Any, Callable
 from urllib.parse import urlencode
 
 from agentra.approval_policy import ApprovalPolicyEngine
-from agentra.browser_runtime import BrowserSessionManager
+from agentra.browser_runtime import BrowserSessionManager, LiveBrowserFrame
 from agentra.config import AgentConfig
 from agentra.llm.registry import get_provider_spec
 from agentra.logging_utils import exception_details_with_context
 from agentra.run_report import RunReport
+from agentra.task_routing import choose_live_execution_policy
 
 RunSnapshot = dict[str, Any]
 EventPayload = dict[str, Any]
@@ -555,7 +556,13 @@ class ThreadManager:
         )
 
         if result.screenshot_b64:
-            screenshot_event = {"type": "screenshot", "data": result.screenshot_b64}
+            action_name = str(args.get("action", "manual")).strip() or "manual"
+            screenshot_event = {
+                "type": "screenshot",
+                "data": result.screenshot_b64,
+                "frame_label": f"{tool} · {action_name}",
+                "summary": f"Kullanıcı {tool} aracını kullandı.",
+            }
             screenshot_event.update(
                 {
                     key: value
@@ -615,11 +622,16 @@ class ThreadManager:
     def snapshot_for_http(self, session: RunSession) -> RunSnapshot:
         snapshot = session.report.snapshot()
         thread = self.get_thread(session.thread_id)
+        policy = choose_live_execution_policy(
+            session.goal,
+            requested_headless=session.config.browser_headless,
+        )
         snapshot["active"] = not session.completed.is_set() and thread.current_run_id == session.run_id
         snapshot["thread_id"] = thread.thread_id
         snapshot["thread_title"] = thread.title
         snapshot["thread_status"] = thread.status
         snapshot["handoff_state"] = thread.handoff_state
+        snapshot["control_surface_hint"] = policy.control_surface_hint
         snapshot["report_url"] = f"/runs/{session.run_id}/report"
         snapshot["logs_url"] = self._logs_url(thread_id=thread.thread_id, run_id=session.run_id)
         snapshot["events"] = [self._event_for_http(session.run_id, event) for event in snapshot["events"]]
@@ -656,9 +668,25 @@ class ThreadManager:
             **self.browser_sessions.snapshot_payload(thread.thread_id),
         }
 
-    async def capture_live_browser_frame(self, thread_id: str) -> bytes | None:
+    async def capture_live_browser_frame(self, thread_id: str) -> LiveBrowserFrame | None:
         self.get_thread(thread_id)
-        return await self.browser_sessions.capture_live_png(thread_id)
+        return await self.browser_sessions.capture_live_frame(thread_id)
+
+    async def capture_live_computer_frame(self, thread_id: str) -> LiveBrowserFrame | None:
+        thread = self.get_thread(thread_id)
+        if not thread.config.allow_computer_control:
+            return None
+
+        def _capture() -> LiveBrowserFrame | None:
+            from agentra.tools.computer import ComputerTool
+
+            try:
+                tool = ComputerTool(allow=True)
+                return LiveBrowserFrame(data=tool.capture_png_bytes(), media_type="image/png")
+            except Exception:  # noqa: BLE001
+                return None
+
+        return await asyncio.to_thread(_capture)
 
     async def _run_session(self, thread_id: str, run_id: str) -> None:
         thread = self.get_thread(thread_id)
@@ -953,14 +981,19 @@ class ThreadManager:
         overrides["workspace_dir"] = thread.workspace_dir
         overrides["memory_dir"] = thread.memory_dir
         overrides["long_term_memory_dir"] = thread.long_term_memory_dir
+        policy = choose_live_execution_policy(
+            str(getattr(request, "goal", "") or ""),
+            requested_headless=getattr(request, "headless", None),
+        )
+        overrides["local_execution_mode"] = policy.local_execution_mode
+        overrides["desktop_fallback_policy"] = policy.desktop_fallback_policy
         if getattr(request, "provider", None):
             overrides["llm_provider"] = request.provider
             if not getattr(request, "model", None):
                 overrides["llm_model"] = get_provider_spec(request.provider).default_model
         if getattr(request, "model", None):
             overrides["llm_model"] = request.model
-        if getattr(request, "headless", None) is not None:
-            overrides["browser_headless"] = request.headless
+        overrides["browser_headless"] = policy.browser_headless
         if getattr(request, "max_iterations", None) is not None:
             overrides["max_iterations"] = request.max_iterations
         return AgentConfig(**overrides)

@@ -28,6 +28,15 @@ class ComputerTool(BaseTool):
     def __init__(self, allow: bool = True) -> None:
         self._allow = allow
 
+    async def preview(self, **kwargs: Any) -> dict[str, Any] | None:
+        action = str(kwargs.get("action", "")).strip().lower()
+        if not action:
+            return None
+        return {
+            "frame_label": f"computer · {action}",
+            "summary": self._summary_for_action(action, kwargs),
+        }
+
     @property
     def schema(self) -> dict[str, Any]:
         return {
@@ -113,24 +122,15 @@ class ComputerTool(BaseTool):
     # ── private helpers ────────────────────────────────────────────────────────
 
     def _take_screenshot(self) -> ToolResult:
-        try:
-            import mss  # noqa: PLC0415
-            import mss.tools  # noqa: PLC0415
-
-            with mss.mss() as sct:
-                monitor = sct.monitors[0]  # all monitors combined
-                img = sct.grab(monitor)
-                png_bytes = mss.tools.to_png(img.rgb, img.size)
-        except ImportError:
-            # Fallback to pyautogui
-            import pyautogui  # noqa: PLC0415
-
-            buf = io.BytesIO()
-            pyautogui.screenshot().save(buf, format="PNG")
-            png_bytes = buf.getvalue()
-
-        b64 = base64.b64encode(png_bytes).decode()
-        return ToolResult(success=True, output="Screenshot taken.", screenshot_b64=b64)
+        return ToolResult(
+            success=True,
+            output="Screenshot taken.",
+            screenshot_b64=self._capture_screenshot_b64(),
+            metadata={
+                "frame_label": "computer · screenshot",
+                "summary": "Capturing the desktop",
+            },
+        )
 
     def _click(
         self,
@@ -143,7 +143,12 @@ class ComputerTool(BaseTool):
         import pyautogui  # noqa: PLC0415
 
         pyautogui.click(x=int(x), y=int(y), button=button)
-        return ToolResult(success=True, output=f"Clicked ({x}, {y}) with {button} button.")
+        action = "right_click" if button == "right" else "click"
+        return self._desktop_result(
+            action=action,
+            output=f"Clicked ({x}, {y}) with {button} button.",
+            summary="Right-clicking on the desktop" if button == "right" else "Clicking on the desktop",
+        )
 
     def _double_click(self, x: Optional[float], y: Optional[float]) -> ToolResult:
         if x is None or y is None:
@@ -151,7 +156,11 @@ class ComputerTool(BaseTool):
         import pyautogui  # noqa: PLC0415
 
         pyautogui.doubleClick(x=int(x), y=int(y))
-        return ToolResult(success=True, output=f"Double-clicked ({x}, {y}).")
+        return self._desktop_result(
+            action="double_click",
+            output=f"Double-clicked ({x}, {y}).",
+            summary="Double-clicking on the desktop",
+        )
 
     def _move(self, x: Optional[float], y: Optional[float]) -> ToolResult:
         if x is None or y is None:
@@ -159,19 +168,31 @@ class ComputerTool(BaseTool):
         import pyautogui  # noqa: PLC0415
 
         pyautogui.moveTo(int(x), int(y))
-        return ToolResult(success=True, output=f"Moved cursor to ({x}, {y}).")
+        return self._desktop_result(
+            action="move",
+            output=f"Moved cursor to ({x}, {y}).",
+            summary="Moving the cursor",
+        )
 
     def _type(self, text: str) -> ToolResult:
         import pyautogui  # noqa: PLC0415
 
         pyautogui.typewrite(text, interval=0.02)
-        return ToolResult(success=True, output=f"Typed: {text!r}")
+        return self._desktop_result(
+            action="type",
+            output=f"Typed: {text!r}",
+            summary="Typing text on the desktop",
+        )
 
     def _key(self, key: str) -> ToolResult:
         import pyautogui  # noqa: PLC0415
 
         pyautogui.hotkey(*key.split("+"))
-        return ToolResult(success=True, output=f"Pressed key: {key!r}")
+        return self._desktop_result(
+            action="key",
+            output=f"Pressed key: {key!r}",
+            summary=f"Pressing {key}" if key else "Pressing a key",
+        )
 
     def _scroll(
         self,
@@ -186,7 +207,11 @@ class ComputerTool(BaseTool):
             pyautogui.scroll(clicks, x=int(x), y=int(y))
         else:
             pyautogui.scroll(clicks)
-        return ToolResult(success=True, output=f"Scrolled {clicks} clicks.")
+        return self._desktop_result(
+            action="scroll",
+            output=f"Scrolled {clicks} clicks.",
+            summary="Scrolling on the desktop",
+        )
 
     def _drag(
         self,
@@ -201,4 +226,62 @@ class ComputerTool(BaseTool):
 
         pyautogui.moveTo(int(x), int(y))
         pyautogui.dragTo(int(end_x), int(end_y), duration=0.5, button="left")
-        return ToolResult(success=True, output=f"Dragged from ({x},{y}) to ({end_x},{end_y}).")
+        return self._desktop_result(
+            action="drag",
+            output=f"Dragged from ({x},{y}) to ({end_x},{end_y}).",
+            summary="Dragging on the desktop",
+        )
+
+    def capture_png_bytes(self) -> bytes:
+        try:
+            import mss  # noqa: PLC0415
+            import mss.tools  # noqa: PLC0415
+
+            with mss.mss() as sct:
+                monitor = sct.monitors[0]  # all monitors combined
+                img = sct.grab(monitor)
+                return mss.tools.to_png(img.rgb, img.size)
+        except ImportError:
+            import pyautogui  # noqa: PLC0415
+
+            buf = io.BytesIO()
+            pyautogui.screenshot().save(buf, format="PNG")
+            return buf.getvalue()
+
+    def _capture_screenshot_b64(self) -> str:
+        return base64.b64encode(self.capture_png_bytes()).decode()
+
+    def _desktop_result(self, *, action: str, output: str, summary: str) -> ToolResult:
+        return ToolResult(
+            success=True,
+            output=output,
+            screenshot_b64=self._capture_screenshot_b64(),
+            metadata={
+                "frame_label": f"computer · {action}",
+                "summary": summary,
+            },
+        )
+
+    @staticmethod
+    def _summary_for_action(action: str, args: dict[str, Any]) -> str:
+        if action == "screenshot":
+            return "Capturing the desktop"
+        if action == "click":
+            return "Clicking on the desktop"
+        if action == "double_click":
+            return "Double-clicking on the desktop"
+        if action == "right_click":
+            return "Right-clicking on the desktop"
+        if action == "move":
+            return "Moving the cursor"
+        if action == "type":
+            text = str(args.get("text", "") or "")
+            return f"Typing {text!r}" if text else "Typing text on the desktop"
+        if action == "key":
+            text = str(args.get("text", "") or "")
+            return f"Pressing {text}" if text else "Pressing a key"
+        if action == "scroll":
+            return "Scrolling on the desktop"
+        if action == "drag":
+            return "Dragging on the desktop"
+        return "Preparing a desktop action"

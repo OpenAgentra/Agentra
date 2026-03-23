@@ -5,6 +5,7 @@ from agentra.tools.browser import BrowserTool
 from agentra.tools.computer import ComputerTool
 from agentra.tools.filesystem import FilesystemTool
 from agentra.tools.git_tool import GitTool
+from agentra.tools.local_system import LocalSystemTool
 from agentra.tools.terminal import TerminalTool
 
 __all__ = [
@@ -14,5 +15,6 @@ __all__ = [
     "ComputerTool",
     "FilesystemTool",
     "GitTool",
+    "LocalSystemTool",
     "TerminalTool",
 ]

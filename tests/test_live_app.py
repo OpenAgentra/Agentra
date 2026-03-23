@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -103,7 +104,7 @@ class FakeAgent:
             screenshot_b64=PNG_1X1_B64,
             metadata={
                 "frame_label": f"{tool_name} · {action}",
-                "summary": "Kullanıcı browser aracını kullandı.",
+                "summary": f"Kullanıcı {tool_name} aracını kullandı.",
                 "focus_x": 0.42,
                 "focus_y": 0.34,
             },
@@ -271,6 +272,63 @@ async def test_live_app_run_state_exposes_frames_assets_and_report(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_live_app_chooses_under_the_hood_policy_for_local_document_goal(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post(
+            "/runs",
+            json={"goal": "Masaustumdeki secondsun klasorunu bul ve icindeki PowerPoint dosyasini varsayilan uygulamayla ac"},
+        )
+        assert create_response.status_code == 200
+        await _wait_for_agent_creation(created_agents)
+
+    agent_config = created_agents[-1].config
+    assert agent_config.browser_headless is True
+    assert agent_config.local_execution_mode == "under_the_hood"
+    assert agent_config.desktop_fallback_policy == "pause_and_ask"
+
+
+@pytest.mark.asyncio
+async def test_live_app_chooses_visible_desktop_policy_for_visual_local_goal(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post(
+            "/runs",
+            json={"goal": "Masaustune git ve secondsun klasorune gir ve karsina cikan sunumu ac"},
+        )
+        assert create_response.status_code == 200
+        await _wait_for_agent_creation(created_agents)
+
+    agent_config = created_agents[-1].config
+    assert agent_config.browser_headless is True
+    assert agent_config.local_execution_mode == "visible"
+    assert agent_config.desktop_fallback_policy == "visible_control"
+
+
+@pytest.mark.asyncio
+async def test_live_app_respects_explicit_headless_override(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post(
+            "/runs",
+            json={"goal": "Open python.org and summarize it", "headless": False},
+        )
+        assert create_response.status_code == 200
+        await _wait_for_agent_creation(created_agents)
+
+    assert created_agents[-1].config.browser_headless is False
+
+
+@pytest.mark.asyncio
 async def test_live_app_event_stream_and_stop_endpoint(tmp_path: Path) -> None:
     created_agents: list[FakeAgent] = []
     app = _make_app(tmp_path, created_agents)
@@ -394,6 +452,31 @@ async def test_live_app_supports_pause_approval_question_and_manual_action(tmp_p
         assert "human_action" in event_types
         assert "tool_result" in event_types
 
+        key_response = await client.post(
+            f"/threads/{thread_id}/actions",
+            json={"tool": "browser", "args": {"action": "key", "key": "Enter"}},
+        )
+        assert key_response.status_code == 200
+        key_payload = key_response.json()
+        assert any(
+            event["type"] == "tool_result"
+            and event["metadata"].get("frame_label") == "browser · key"
+            for event in key_payload["active_run"]["events"]
+        )
+
+        computer_response = await client.post(
+            f"/threads/{thread_id}/actions",
+            json={"tool": "computer", "args": {"action": "click", "x": 240, "y": 160}},
+        )
+        assert computer_response.status_code == 200
+        computer_payload = computer_response.json()
+        assert any(
+            event["type"] == "tool_result"
+            and event["tool"] == "computer"
+            and event["metadata"].get("frame_label") == "computer · click"
+            for event in computer_payload["active_run"]["events"]
+        )
+
         resume_response = await client.post(f"/threads/{thread_id}/resume")
         assert resume_response.status_code == 200
         assert created_agents[-1].paused is False
@@ -408,9 +491,9 @@ async def test_live_app_exposes_live_browser_frame_route(tmp_path: Path) -> None
     manager = app.state.manager
     transport = httpx.ASGITransport(app=app)
 
-    async def fake_capture(thread_id: str) -> bytes | None:
+    async def fake_capture(thread_id: str):
         assert thread_id.startswith("thread-")
-        return b"png-live-frame"
+        return SimpleNamespace(data=b"jpeg-live-frame", media_type="image/jpeg")
 
     manager.capture_live_browser_frame = fake_capture
 
@@ -422,5 +505,84 @@ async def test_live_app_exposes_live_browser_frame_route(tmp_path: Path) -> None
         frame_response = await client.get(f"/threads/{thread_id}/live-frame")
 
     assert frame_response.status_code == 200
+    assert frame_response.headers["content-type"] == "image/jpeg"
+    assert frame_response.content == b"jpeg-live-frame"
+
+
+@pytest.mark.asyncio
+async def test_live_app_exposes_live_browser_stream_route(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    manager = app.state.manager
+    transport = httpx.ASGITransport(app=app)
+
+    async def fake_capture(thread_id: str):
+        assert thread_id.startswith("thread-")
+        return SimpleNamespace(data=b"jpeg-live-frame", media_type="image/jpeg")
+
+    manager.capture_live_browser_frame = fake_capture
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Open python.org live"})
+        assert create_response.status_code == 200
+        thread_id = create_response.json()["thread_id"]
+
+        async with client.stream("GET", f"/threads/{thread_id}/live-stream?stream=1") as stream_response:
+            assert stream_response.status_code == 200
+            assert stream_response.headers["content-type"].startswith("multipart/x-mixed-replace")
+            first_chunk = await stream_response.aiter_bytes().__anext__()
+
+    assert b"Content-Type: image/jpeg" in first_chunk
+    assert b"jpeg-live-frame" in first_chunk
+
+
+@pytest.mark.asyncio
+async def test_live_app_exposes_live_desktop_frame_route(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    manager = app.state.manager
+    transport = httpx.ASGITransport(app=app)
+
+    async def fake_capture(thread_id: str):
+        assert thread_id.startswith("thread-")
+        return SimpleNamespace(data=b"desktop-live-frame", media_type="image/png")
+
+    manager.capture_live_computer_frame = fake_capture
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Open desktop live"})
+        assert create_response.status_code == 200
+        thread_id = create_response.json()["thread_id"]
+
+        frame_response = await client.get(f"/threads/{thread_id}/desktop-frame")
+
+    assert frame_response.status_code == 200
     assert frame_response.headers["content-type"] == "image/png"
-    assert frame_response.content == b"png-live-frame"
+    assert frame_response.content == b"desktop-live-frame"
+
+
+@pytest.mark.asyncio
+async def test_live_app_exposes_live_desktop_stream_route(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    manager = app.state.manager
+    transport = httpx.ASGITransport(app=app)
+
+    async def fake_capture(thread_id: str):
+        assert thread_id.startswith("thread-")
+        return SimpleNamespace(data=b"desktop-live-frame", media_type="image/png")
+
+    manager.capture_live_computer_frame = fake_capture
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Open desktop stream"})
+        assert create_response.status_code == 200
+        thread_id = create_response.json()["thread_id"]
+
+        async with client.stream("GET", f"/threads/{thread_id}/desktop-stream?stream=1") as stream_response:
+            assert stream_response.status_code == 200
+            assert stream_response.headers["content-type"].startswith("multipart/x-mixed-replace")
+            first_chunk = await stream_response.aiter_bytes().__anext__()
+
+    assert b"Content-Type: image/png" in first_chunk
+    assert b"desktop-live-frame" in first_chunk

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -131,7 +133,7 @@ class ApprovalPolicyEngine:
                     rule_id="computer-direct-control",
                     risk_level="high",
                     matcher=lambda ctx: ctx.tool_name == "computer"
-                    and str(ctx.tool_args.get("action", "")).lower() != "screenshot",
+                    and _computer_action_requires_approval(ctx),
                     reason="Direct desktop control requires explicit user approval.",
                     summary="Doğrudan masaüstü kontrolü için kullanıcı onayı gerekiyor.",
                 ),
@@ -142,3 +144,102 @@ class ApprovalPolicyEngine:
 def _contains_any(payload: dict[str, Any], tokens: tuple[str, ...]) -> bool:
     flattened = " ".join(str(item).lower() for item in payload.values())
     return any(token in flattened for token in tokens)
+
+
+def _normalized_text(text: str) -> str:
+    folded = unicodedata.normalize("NFKD", str(text or "").casefold())
+    stripped = "".join(char for char in folded if not unicodedata.combining(char))
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
+def _goal_is_local_desktop_navigation(goal: str) -> bool:
+    normalized = _normalized_text(goal)
+    if not normalized:
+        return False
+    desktop_terms = (
+        "desktop",
+        "masaustu",
+        "klasor",
+        "folder",
+        "file explorer",
+        "explorer",
+        "pencere",
+        "window",
+        "taskbar",
+        "gorev cubugu",
+        "baslat",
+        "start menu",
+        "onedrive",
+    )
+    web_terms = (
+        "http://",
+        "https://",
+        "www.",
+        ".com",
+        ".org",
+        ".net",
+        "github",
+        "google",
+        "browser",
+        "tarayici",
+        "website",
+        "site",
+    )
+    return any(term in normalized for term in desktop_terms) and not any(term in normalized for term in web_terms)
+
+
+def _computer_action_requires_approval(context: ApprovalPolicyContext) -> bool:
+    action = str(context.tool_args.get("action", "")).lower()
+    if action == "screenshot":
+        return False
+
+    goal_is_desktop_nav = _goal_is_local_desktop_navigation(context.goal)
+    if goal_is_desktop_nav and action in {"move", "click", "double_click", "right_click", "scroll", "drag"}:
+        return False
+
+    if action == "type":
+        if goal_is_desktop_nav and not _contains_any(
+            context.tool_args,
+            ("password", "otp", "2fa", "captcha", "secret", "token", "code"),
+        ):
+            return False
+        return True
+
+    if action == "key":
+        key = _normalized_text(context.tool_args.get("text", ""))
+        safe_navigation_keys = {
+            "win+d",
+            "win+e",
+            "alt+tab",
+            "tab",
+            "shift+tab",
+            "arrowup",
+            "arrowdown",
+            "arrowleft",
+            "arrowright",
+            "escape",
+            "esc",
+            "enter",
+            "home",
+            "end",
+            "pagedown",
+            "pageup",
+        }
+        risky_keys = {
+            "alt+f4",
+            "ctrl+w",
+            "ctrl+q",
+            "ctrl+shift+esc",
+            "ctrl+alt+delete",
+            "shift+delete",
+            "win+r",
+            "win+x",
+            "delete",
+        }
+        if key in risky_keys:
+            return True
+        if goal_is_desktop_nav and key in safe_navigation_keys:
+            return False
+        return True
+
+    return True

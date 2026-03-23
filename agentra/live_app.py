@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from fastapi import Request as FastAPIRequest
 from pydantic import BaseModel, Field
 
 from agentra.config import AgentConfig
@@ -24,6 +25,7 @@ from agentra.logging_utils import (
 )
 from agentra.runtime import ThreadManager
 from agentra.run_report import RunReport
+from agentra.task_routing import choose_live_execution_policy
 
 RunSnapshot = dict[str, Any]
 EventPayload = dict[str, Any]
@@ -233,14 +235,16 @@ class LiveRunManager:
 
     def _config_for_request(self, request: RunCreateRequest) -> AgentConfig:
         overrides: dict[str, Any] = self.base_config.model_dump()
+        policy = choose_live_execution_policy(request.goal, requested_headless=request.headless)
+        overrides["local_execution_mode"] = policy.local_execution_mode
+        overrides["desktop_fallback_policy"] = policy.desktop_fallback_policy
         if request.provider:
             overrides["llm_provider"] = request.provider
             if not request.model:
                 overrides["llm_model"] = get_provider_spec(request.provider).default_model
         if request.model:
             overrides["llm_model"] = request.model
-        if request.headless is not None:
-            overrides["browser_headless"] = request.headless
+        overrides["browser_headless"] = policy.browser_headless
         if request.workspace:
             workspace_dir = Path(request.workspace)
             overrides["workspace_dir"] = workspace_dir
@@ -253,6 +257,12 @@ class LiveRunManager:
 def _generic_tool_label(tool: str) -> str:
     if not tool:
         return "Araç"
+    if tool == "browser":
+        return "Tarayıcı · İşlem"
+    if tool == "computer":
+        return "Masaüstü · İşlem"
+    if tool == "local_system":
+        return "Yerel Sistem · İşlem"
     return f"{tool.replace('_', ' ').title()} · İşlem"
 
 
@@ -276,6 +286,13 @@ def _parse_action_from_label(label: str | None) -> str | None:
     return None
 
 
+def _parse_tool_action_from_label(label: str | None) -> tuple[str | None, str | None]:
+    if not label or "·" not in label:
+        return (None, None)
+    tool, action = label.split("·", 1)
+    return (tool.strip().lower() or None, action.strip().lower() or None)
+
+
 def _browser_action_display(action: str, args: dict[str, Any] | None = None) -> tuple[str, str]:
     args = args or {}
     action = (action or "").lower()
@@ -290,8 +307,13 @@ def _browser_action_display(action: str, args: dict[str, Any] | None = None) -> 
             "Tarayıcı · Yaz",
             f"{selector} alanına yazılıyor" if selector else "Metin yazılıyor",
         )
+    if action == "drag":
+        return ("Tarayıcı · Sürükle", "Sayfada sürükleme yapılıyor")
     if action == "scroll":
         return ("Tarayıcı · Kaydır", "Sayfa kaydırılıyor")
+    if action == "key":
+        key = str(args.get("key") or "").strip()
+        return ("Tarayıcı · Tuş", f"{key} tuşuna basılıyor" if key else "Tuş gönderiliyor")
     if action == "screenshot":
         return ("Tarayıcı · Görüntü Al", "Ekran görüntüsü alınıyor")
     if action == "back":
@@ -309,6 +331,50 @@ def _browser_action_display(action: str, args: dict[str, Any] | None = None) -> 
     return ("Tarayıcı · İşlem", "Tarayıcı işlemi hazırlanıyor")
 
 
+def _computer_action_display(action: str, args: dict[str, Any] | None = None) -> tuple[str, str]:
+    args = args or {}
+    action = (action or "").lower()
+    if action == "screenshot":
+        return ("Masaüstü · Görüntü Al", "Masaüstü görüntüleniyor")
+    if action == "click":
+        return ("Masaüstü · Tıkla", "Masaüstünde tıklanıyor")
+    if action == "double_click":
+        return ("Masaüstü · Çift Tıkla", "Masaüstünde çift tıklanıyor")
+    if action == "right_click":
+        return ("Masaüstü · Sağ Tık", "Masaüstünde sağ tıklanıyor")
+    if action == "move":
+        return ("Masaüstü · İmleç Taşı", "İmleç masaüstünde taşınıyor")
+    if action == "type":
+        text = str(args.get("text") or "").strip()
+        return ("Masaüstü · Yaz", f"{text!r} yazılıyor" if text else "Masaüstüne yazılıyor")
+    if action == "key":
+        text = str(args.get("text") or "").strip()
+        return ("Masaüstü · Tuş", f"{text} tuşuna basılıyor" if text else "Tuş gönderiliyor")
+    if action == "scroll":
+        return ("Masaüstü · Kaydır", "Masaüstünde kaydırılıyor")
+    if action == "drag":
+        return ("Masaüstü · Sürükle", "Masaüstünde sürükleniyor")
+    return ("Masaüstü · İşlem", "Masaüstü işlemi hazırlanıyor")
+
+
+def _local_system_action_display(action: str, args: dict[str, Any] | None = None) -> tuple[str, str]:
+    del args
+    action = (action or "").lower()
+    if action == "resolve_known_folder":
+        return ("Yerel Sistem · Klasör Çöz", "Yerel klasör çözülüyor")
+    if action == "open_path":
+        return ("Yerel Sistem · Aç", "Dosya arka planda açılıyor")
+    return ("Yerel Sistem · İşlem", "Yerel işlem hazırlanıyor")
+
+
+def _tool_action_display(tool: str, action: str, args: dict[str, Any] | None = None) -> tuple[str, str]:
+    if tool == "computer":
+        return _computer_action_display(action, args)
+    if tool == "local_system":
+        return _local_system_action_display(action, args)
+    return _browser_action_display(action, args)
+
+
 def _tool_result_summary(event: dict[str, Any]) -> str:
     tool = str(event.get("tool", ""))
     metadata = event.get("metadata", {}) if isinstance(event.get("metadata"), dict) else {}
@@ -320,7 +386,9 @@ def _tool_result_summary(event: dict[str, Any]) -> str:
             "navigate": "Sayfa açıldı",
             "click": "Tıklama tamamlandı",
             "type": "Yazı girişi tamamlandı",
+            "drag": "Sürükleme tamamlandı",
             "scroll": "Kaydırma tamamlandı",
+            "key": "Tuş gönderildi",
             "screenshot": "Ekran görüntüsü alındı",
             "back": "Geri dönüldü",
             "forward": "İleri gidildi",
@@ -328,6 +396,29 @@ def _tool_result_summary(event: dict[str, Any]) -> str:
             "close_tab": "Sekme kapatıldı",
         }
         return mapping.get(action or "", _trim_text(event.get("result") or "Tarayıcı işlemi tamamlandı"))
+    if tool == "computer":
+        if not event.get("success"):
+            return _trim_text(event.get("result") or event.get("error") or "Masaüstü işlemi başarısız oldu.")
+        mapping = {
+            "screenshot": "Masaüstü görüntüsü alındı",
+            "click": "Masaüstü tıklaması tamamlandı",
+            "double_click": "Çift tıklama tamamlandı",
+            "right_click": "Sağ tıklama tamamlandı",
+            "move": "İmleç taşındı",
+            "type": "Yazı girişi tamamlandı",
+            "key": "Tuş gönderildi",
+            "scroll": "Kaydırma tamamlandı",
+            "drag": "Sürükleme tamamlandı",
+        }
+        return mapping.get(action or "", _trim_text(event.get("result") or "Masaüstü işlemi tamamlandı"))
+    if tool == "local_system":
+        if not event.get("success"):
+            return _trim_text(event.get("result") or event.get("error") or "Yerel işlem başarısız oldu.")
+        mapping = {
+            "resolve_known_folder": "Yerel klasör çözüldü",
+            "open_path": "Yerel öğe açıldı",
+        }
+        return mapping.get(action or "", _trim_text(event.get("result") or "Yerel işlem tamamlandı"))
     if event.get("success"):
         return _trim_text(event.get("result") or f"{tool} işlemi tamamlandı")
     return _trim_text(event.get("result") or event.get("error") or f"{tool} işlemi başarısız oldu")
@@ -338,8 +429,8 @@ def _display_label_for_event(event: dict[str, Any]) -> str:
     if event_type in {"tool_call", "visual_intent"}:
         tool = str(event.get("tool", ""))
         args = event.get("args", {}) if isinstance(event.get("args"), dict) else {}
-        if tool == "browser":
-            return _browser_action_display(str(args.get("action", "")), args)[0]
+        if tool in {"browser", "computer"}:
+            return _tool_action_display(tool, str(args.get("action", "")), args)[0]
         return _generic_tool_label(tool)
     if event_type == "screenshot":
         return _display_label_for_frame(event)
@@ -361,8 +452,8 @@ def _display_summary_for_event(event: dict[str, Any]) -> str:
     if event_type in {"tool_call", "visual_intent"}:
         tool = str(event.get("tool", ""))
         args = event.get("args", {}) if isinstance(event.get("args"), dict) else {}
-        if tool == "browser":
-            return _browser_action_display(str(args.get("action", "")), args)[1]
+        if tool in {"browser", "computer"}:
+            return _tool_action_display(tool, str(args.get("action", "")), args)[1]
         return _trim_text(event.get("summary") or f"{tool} aracı hazırlanıyor")
     if event_type == "screenshot":
         return _display_summary_for_frame(event)
@@ -378,16 +469,16 @@ def _display_summary_for_event(event: dict[str, Any]) -> str:
 
 
 def _display_label_for_frame(frame: dict[str, Any]) -> str:
-    action = _parse_action_from_label(str(frame.get("label") or frame.get("frame_label") or ""))
-    if action:
-        return _browser_action_display(action)[0]
+    tool, action = _parse_tool_action_from_label(str(frame.get("label") or frame.get("frame_label") or ""))
+    if tool and action:
+        return _tool_action_display(tool, action)[0]
     return "Görsel Kare"
 
 
 def _display_summary_for_frame(frame: dict[str, Any]) -> str:
-    action = _parse_action_from_label(str(frame.get("label") or frame.get("frame_label") or ""))
-    if action:
-        return _browser_action_display(action)[1]
+    tool, action = _parse_tool_action_from_label(str(frame.get("label") or frame.get("frame_label") or ""))
+    if tool and action:
+        return _tool_action_display(tool, action)[1]
     return _trim_text(frame.get("summary") or "Görsel güncelleme")
 
 
@@ -665,15 +756,97 @@ def create_live_app(
     @app.get("/threads/{thread_id}/live-frame")
     async def get_live_frame(thread_id: str) -> Response:
         try:
-            png_bytes = await manager.capture_live_browser_frame(thread_id)
+            frame = await manager.capture_live_browser_frame(thread_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Thread not found.") from exc
-        if not png_bytes:
+        if not frame:
             return Response(status_code=204)
         return Response(
-            content=png_bytes,
-            media_type="image/png",
+            content=frame.data,
+            media_type=frame.media_type,
             headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
+
+    @app.get("/threads/{thread_id}/desktop-frame")
+    async def get_desktop_frame(thread_id: str) -> Response:
+        try:
+            frame = await manager.capture_live_computer_frame(thread_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Thread not found.") from exc
+        if not frame:
+            return Response(status_code=204)
+        return Response(
+            content=frame.data,
+            media_type=frame.media_type,
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
+
+    @app.get("/threads/{thread_id}/live-stream")
+    async def get_live_stream(thread_id: str, request: FastAPIRequest) -> StreamingResponse:
+        try:
+            manager.get_thread(thread_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Thread not found.") from exc
+
+        boundary = "agentraframe"
+
+        async def frame_stream():
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    frame = await manager.capture_live_browser_frame(thread_id)
+                    if frame is None:
+                        await asyncio.sleep(0.04)
+                        continue
+                    header = (
+                        f"--{boundary}\r\n"
+                        f"Content-Type: {frame.media_type}\r\n"
+                        f"Content-Length: {len(frame.data)}\r\n\r\n"
+                    ).encode("ascii")
+                    yield header + frame.data + b"\r\n"
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                return
+
+        return StreamingResponse(
+            frame_stream(),
+            media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/threads/{thread_id}/desktop-stream")
+    async def get_desktop_stream(thread_id: str, request: FastAPIRequest) -> StreamingResponse:
+        try:
+            manager.get_thread(thread_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Thread not found.") from exc
+
+        boundary = "agentradesktop"
+
+        async def frame_stream():
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    frame = await manager.capture_live_computer_frame(thread_id)
+                    if frame is None:
+                        await asyncio.sleep(0.08)
+                        continue
+                    header = (
+                        f"--{boundary}\r\n"
+                        f"Content-Type: {frame.media_type}\r\n"
+                        f"Content-Length: {len(frame.data)}\r\n\r\n"
+                    ).encode("ascii")
+                    yield header + frame.data + b"\r\n"
+                    await asyncio.sleep(0.04)
+            except asyncio.CancelledError:
+                return
+
+        return StreamingResponse(
+            frame_stream(),
+            media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "X-Accel-Buffering": "no"},
         )
 
     @app.post("/threads/{thread_id}/pause")
@@ -1458,6 +1631,10 @@ def _app_styles_tv() -> str:
   background:
     linear-gradient(180deg, rgba(255,255,255,0.96), rgba(242,246,252,0.94) 7%, rgba(29,41,69,0.98) 7%, rgba(29,41,69,0.98) 100%);
 }
+.tv-screen:focus-visible {
+  outline: 2px solid rgba(255,255,255,0.92);
+  outline-offset: 2px;
+}
 .tv-screen.busy::after {
   content: "";
   position: absolute;
@@ -1491,6 +1668,9 @@ def _app_styles_tv() -> str:
   display: none;
   border-bottom-left-radius: 18px;
   border-bottom-right-radius: 18px;
+  user-select: none;
+  touch-action: none;
+  will-change: opacity, transform;
   transition: opacity 180ms ease, transform 220ms ease;
 }
 .tv-image.swapping {
@@ -1579,50 +1759,21 @@ def _app_styles_tv() -> str:
   line-height: 1.45;
   color: rgba(226, 236, 255, 0.88);
 }
-.manual-mode-row {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.mode-chip {
-  appearance: none;
-  border: 1px solid rgba(255,255,255,0.24);
-  background: rgba(255,255,255,0.08);
-  color: rgba(255,255,255,0.9);
-  border-radius: 999px;
-  padding: 8px 12px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  cursor: pointer;
-  transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
-}
-.mode-chip:hover:not(:disabled) {
-  transform: translateY(-1px);
-  background: rgba(255,255,255,0.12);
-}
-.mode-chip.active {
+.interact-button.active {
   background: rgba(255,255,255,0.92);
   color: #16203a;
   border-color: rgba(255,255,255,0.92);
   box-shadow: 0 8px 18px rgba(255,255,255,0.18);
 }
-.mode-chip:disabled {
-  opacity: 0.46;
-  cursor: not-allowed;
-}
-.tv-screen.manual-click .tv-image {
+.tv-screen.manual-interact .tv-image {
   cursor: crosshair;
-}
-.tv-screen.manual-type .tv-image {
-  cursor: text;
-}
-.tv-screen.manual-scroll .tv-image {
-  cursor: ns-resize;
 }
 .manual-inline-note {
   font-size: 12px;
   color: rgba(226, 236, 255, 0.82);
+}
+.manual-inline-note strong {
+  color: rgba(255,255,255,0.96);
 }
 .manual-dock .inline-error {
   min-height: 18px;
@@ -2381,7 +2532,7 @@ function mount() {
               <div class="tv-shell">
                 <div class="tv-screen" id="tv-screen">
                   <div class="tv-title" id="tv-frame-title">Agentra Canlı Kumanda</div>
-                  <img class="tv-image" id="tv-image" alt="Agentra canlı kare" />
+                  <img class="tv-image" id="tv-image" alt="Agentra canlı kare" decoding="async" fetchpriority="high" />
                   <div class="tv-empty" id="tv-empty"></div>
                   <div class="cursor-dot" id="cursor-dot"></div>
                   <div class="cursor-bubble" id="cursor-bubble"></div>
@@ -2979,9 +3130,9 @@ function mount() {
             </div>
             <div class="tv-stage">
               <div class="tv-shell">
-                <div class="tv-screen" id="tv-screen">
+                <div class="tv-screen" id="tv-screen" tabindex="0">
                   <div class="tv-title" id="tv-frame-title">Ajan · HAZIR</div>
-                  <img class="tv-image" id="tv-image" alt="Agentra canlı kare" />
+                  <img class="tv-image" id="tv-image" alt="Agentra canlı kare" decoding="async" fetchpriority="high" />
                   <div class="tv-empty" id="tv-empty"></div>
                   <div class="cursor-dot" id="cursor-dot"></div>
                   <div class="cursor-bubble" id="cursor-bubble"></div>
@@ -3066,8 +3217,15 @@ const state = {
   source: null,
   liveFrameUrl: null,
   liveFrameThreadId: null,
+  liveFrameSource: "browser",
+  liveFrameMode: "stream",
   liveFrameLoopToken: 0,
   liveFrameStamp: 0,
+  liveFrameTimer: null,
+  liveFrameLoadedAt: 0,
+  liveFrameErrorCount: 0,
+  liveFrameAbortController: null,
+  liveFramePumpActive: false,
   threadPollTimer: null,
   refreshInFlight: false,
   scrubPercent: 1,
@@ -3099,8 +3257,16 @@ const state = {
   },
   ui: {
     showAdvanced: false,
-    manualMode: "click",
     manualPending: false,
+    manualQueue: null,
+    controlLayer: "browser",
+    manualLayerOverride: null,
+    autoFollowLayer: true,
+    interactActive: false,
+    interactBuffer: "",
+    interactFlushTimer: null,
+    interactDrag: null,
+    interactSuppressClickUntil: 0,
   },
 };
 
@@ -3110,6 +3276,15 @@ function escapeHtml(value) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function buildAppUrl(path) {
+  const base = window.__agentraBaseUrl || window.location.origin || "";
+  try {
+    return new URL(path, base || "http://127.0.0.1").toString();
+  } catch (error) {
+    return path;
+  }
 }
 
 function shortText(value, limit = 220) {
@@ -3213,32 +3388,177 @@ function canDirectPreviewControl() {
   const thread = state.activeThread;
   const activeRun = activeRunForThread(thread);
   if (!canManualControl(thread) || !activeRun || !state.selectedRunId) return false;
-  if (state.historyMode) return false;
+  if (state.historyMode || !state.liveMode) return false;
   return activeRun.run_id === state.selectedRunId;
 }
 
-function manualModeText(mode) {
-  if (mode === "type") return "Yaz";
-  if (mode === "scroll") return "Kaydır";
-  return "Tıkla";
+function canStartInteract() {
+  const thread = state.activeThread;
+  const activeRun = activeRunForThread(thread);
+  if (!thread || !activeRun || !state.selectedRunId) return false;
+  if (state.historyMode || !state.liveMode) return false;
+  if (activeRun.run_id !== state.selectedRunId) return false;
+  return thread.status === "running" || canManualControl(thread);
 }
 
-function manualModeHint(mode, enabled) {
-  if (!enabled) {
-    if (!state.activeThread) return "Bir thread seç ya da yeni run başlat.";
-    if (state.historyMode) return "Manuel kontrol için aktif run'a dön.";
-    if (activeRunForThread(state.activeThread)) return "Kontrolü almak için önce pause et.";
-    return "Aktif run olmadığında manuel kontrol kapalıdır.";
+function interactReady() {
+  return Boolean(state.ui.interactActive) && canDirectPreviewControl();
+}
+
+function clearInteractFlushTimer() {
+  if (state.ui.interactFlushTimer !== null) {
+    window.clearTimeout(state.ui.interactFlushTimer);
+    state.ui.interactFlushTimer = null;
   }
-  if (mode === "type") return "Önce canlı görüntüde input alanına tıkla, sonra metni gönder.";
-  if (mode === "scroll") return "Canlı görüntü üzerinde mouse wheel ile kaydır veya miktar girip butonu kullan.";
-  return "Canlı görüntü üzerinde doğrudan tıklayarak sayfayı kontrol et.";
+}
+
+function resetInteractState() {
+  clearInteractFlushTimer();
+  state.ui.interactActive = false;
+  state.ui.interactBuffer = "";
+  state.ui.interactDrag = null;
+  state.ui.interactSuppressClickUntil = 0;
+}
+
+function ensureInteractState() {
+  if (!state.ui.interactActive && !state.ui.interactBuffer) return;
+  if (state.status === "completed" || state.status === "error" || !canDirectPreviewControl()) {
+    resetInteractState();
+  }
+}
+
+function interactHint() {
+  if (!state.activeThread) return "Bir thread seç ya da yeni run başlat.";
+  if (state.historyMode || !state.liveMode) return "Interact yalnızca aktif canlı run üzerinde kullanılabilir.";
+  const activeRun = activeRunForThread(state.activeThread);
+  if (!activeRun || activeRun.run_id !== state.selectedRunId) return "Önce aktif run'a dön.";
+  const layerLabel = currentControlLayerLabel();
+  if (state.activeThread.status === "running") return `Interact ajanı pause eder, sonra ${layerLabel.toLowerCase()} katmanında tıklayıp sürükleyebilir, yazabilir ve scroll yapabilirsin.`;
+  if (interactReady()) return `Interact açık. ${layerLabel} canlı görüntüsüne odaklanıp tıklayabilir, sürükleyebilir, yazabilir ve scroll yapabilirsin.`;
+  if (canDirectPreviewControl()) return `Interact'e bas, ardından ${layerLabel.toLowerCase()} katmanı üzerinden doğrudan kontrol et.`;
+  return "Interact şu anda kullanılamıyor.";
+}
+
+function interactStatusText() {
+  const parts = [state.ui.interactActive ? "Interact açık" : "Interact kapalı", `katman: ${currentControlLayerLabel()}`];
+  if (state.ui.manualPending) {
+    parts.push("işlem gönderiliyor");
+  } else if (state.ui.interactBuffer) {
+    parts.push(`bekleyen yazı: "${shortText(state.ui.interactBuffer, 24)}"`);
+  } else if (state.ui.interactActive) {
+    parts.push("tıkla, sürükle, yaz veya scroll yap");
+  }
+  return parts.join(" · ");
+}
+
+function interactSurface() {
+  return document.getElementById("tv-screen");
+}
+
+function focusInteractSurface() {
+  const surface = interactSurface();
+  surface?.focus({ preventScroll: true });
+}
+
+function isAgentraEditableTarget(target) {
+  if (!target || !(target instanceof Element)) return false;
+  return Boolean(target.closest("input, textarea, [contenteditable='true']"));
+}
+
+function isPrintableKeyEvent(event) {
+  return !event.ctrlKey && !event.metaKey && !event.altKey && !event.isComposing && event.key.length === 1;
+}
+
+function isInteractSpecialKey(key) {
+  return ["Enter", "Tab", "Backspace", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(key);
 }
 
 function displayedRunSummary() {
   const thread = state.activeThread;
   if (!thread || !state.selectedRunId) return null;
   return runSummaries(thread).find((item) => item.run_id === state.selectedRunId) || null;
+}
+
+function currentControlLayer() {
+  const manual = state.ui.manualLayerOverride;
+  if (manual === "desktop" || manual === "browser") return manual;
+  return state.ui.controlLayer === "desktop" ? "desktop" : "browser";
+}
+
+function latestVisualTool() {
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index];
+    if (!event || !event.type) continue;
+    if ((event.type === "visual_intent" || event.type === "tool_call" || event.type === "tool_result") && event.tool) {
+      if (event.tool === "computer") return "computer";
+      if (event.tool === "browser") return "browser";
+      if (event.tool === "local_system") return "local_system";
+      continue;
+    }
+    if (event.type === "screenshot") {
+      const label = String(event.frame_label || event.label || "");
+      if (label.startsWith("computer ·")) return "computer";
+      if (label.startsWith("browser ·")) return "browser";
+      if (label.startsWith("local_system ·")) return "local_system";
+    }
+  }
+  return null;
+}
+
+function preferredAutoLayer() {
+  const visualTool = latestVisualTool();
+  const thread = state.activeThread;
+  const activeRun = activeRunForThread(thread);
+  if (visualTool === "computer") return "desktop";
+  if (visualTool === "browser") return "browser";
+  if (visualTool === "local_system") return "browser";
+  if (activeRun && (activeRun.control_surface_hint === "desktop" || activeRun.control_surface_hint === "browser")) {
+    return activeRun.control_surface_hint;
+  }
+  if (state.browser.active) return "browser";
+  return "desktop";
+}
+
+function syncAutoControlLayer() {
+  if (!state.ui.autoFollowLayer || state.ui.interactActive) return;
+  if (state.historyMode || !state.liveMode) return;
+  const thread = state.activeThread;
+  const activeRun = activeRunForThread(thread);
+  if (!thread || !activeRun || activeRun.run_id !== state.selectedRunId) return;
+  if (thread.status !== "running") return;
+  const nextLayer = preferredAutoLayer();
+  if (nextLayer) state.ui.controlLayer = nextLayer;
+}
+
+function currentControlLayerLabel() {
+  return currentControlLayer() === "desktop" ? "Masaüstü" : "Tarayıcı";
+}
+
+function currentInteractTool() {
+  return currentControlLayer() === "desktop" ? "computer" : "browser";
+}
+
+function backForwardAvailable() {
+  return currentControlLayer() === "browser";
+}
+
+function canMirrorCurrentLayer() {
+  if (currentControlLayer() === "desktop") return true;
+  return Boolean(state.browser.active);
+}
+
+function liveFramePath(kind, threadId, stamp) {
+  const encodedThread = encodeURIComponent(threadId);
+  if (kind === "desktop") {
+    return {
+      stream: buildAppUrl(`/threads/${encodedThread}/desktop-stream?stream=${stamp}`),
+      frame: buildAppUrl(`/threads/${encodedThread}/desktop-frame?ts=${stamp}`),
+    };
+  }
+  return {
+    stream: buildAppUrl(`/threads/${encodedThread}/live-stream?stream=${stamp}`),
+    frame: buildAppUrl(`/threads/${encodedThread}/live-frame?ts=${stamp}`),
+  };
 }
 
 function setError(key, message) {
@@ -3278,18 +3598,24 @@ function currentFrame() {
 function wantsLiveMirror() {
   const thread = state.activeThread;
   const activeRun = activeRunForThread(thread);
-  if (!thread || !state.activeThreadId || !state.browser.active) return false;
+  if (!thread || !state.activeThreadId || !canMirrorCurrentLayer()) return false;
   if (state.historyMode || !state.liveMode) return false;
   if (!activeRun || !state.selectedRunId) return false;
   return activeRun.run_id === state.selectedRunId;
 }
 
 function releaseLiveFrameUrl() {
-  if (state.liveFrameUrl && state.liveFrameUrl.startsWith("blob:")) {
-    URL.revokeObjectURL(state.liveFrameUrl);
-  }
   state.liveFrameUrl = null;
   state.liveFrameStamp = 0;
+  state.liveFrameLoadedAt = 0;
+}
+
+function cancelLiveMirrorRequest() {
+  if (state.liveFrameTimer) {
+    window.clearTimeout(state.liveFrameTimer);
+    state.liveFrameTimer = null;
+  }
+  state.liveFrameAbortController = null;
 }
 
 function buildSteps(events) {
@@ -3502,67 +3828,95 @@ function disconnectStream() {
 function stopLiveMirror() {
   state.liveFrameLoopToken += 1;
   state.liveFrameThreadId = null;
+  state.liveFrameSource = "browser";
+  state.liveFrameMode = "stream";
+  state.liveFramePumpActive = false;
+  state.liveFrameErrorCount = 0;
+  cancelLiveMirrorRequest();
   releaseLiveFrameUrl();
 }
 
-function startLiveMirror(threadId) {
+function scheduleNextLiveFrame(threadId, source, delay = 0) {
+  if (!threadId) return;
+  cancelLiveMirrorRequest();
+  state.liveFrameTimer = window.setTimeout(() => {
+    state.liveFrameTimer = null;
+    if (state.liveFrameThreadId !== threadId || state.liveFrameSource !== source || !wantsLiveMirror()) return;
+    state.liveFrameStamp += 1;
+    state.liveFrameUrl = liveFramePath(source, threadId, state.liveFrameStamp).frame;
+    renderTV();
+  }, Math.max(0, delay));
+}
+
+function fallbackToLiveFramePolling(threadId, source) {
+  if (!threadId) return;
+  state.liveFrameMode = "poll";
+  state.liveFrameErrorCount = 0;
+  releaseLiveFrameUrl();
+  scheduleNextLiveFrame(threadId, source, 0);
+}
+
+function startLiveMirror(threadId, source) {
   stopLiveMirror();
   if (!threadId) return;
-  const token = state.liveFrameLoopToken;
   state.liveFrameThreadId = threadId;
-
-  async function pump() {
-    while (token === state.liveFrameLoopToken && state.liveFrameThreadId === threadId && wantsLiveMirror()) {
-      try {
-        const response = await fetch(`/threads/${threadId}/live-frame?ts=${Date.now()}`, {
-          cache: "no-store",
-        });
-        if (token !== state.liveFrameLoopToken || state.liveFrameThreadId !== threadId) return;
-        if (response.status === 204) {
-          await new Promise((resolve) => window.setTimeout(resolve, 90));
-          continue;
-        }
-        if (!response.ok) {
-          await new Promise((resolve) => window.setTimeout(resolve, 140));
-          continue;
-        }
-        const blob = await response.blob();
-        if (token !== state.liveFrameLoopToken || state.liveFrameThreadId !== threadId) return;
-        const nextUrl = URL.createObjectURL(blob);
-        const previousUrl = state.liveFrameUrl;
-        state.liveFrameUrl = nextUrl;
-        state.liveFrameStamp += 1;
-        renderTV();
-        if (previousUrl && previousUrl.startsWith("blob:")) URL.revokeObjectURL(previousUrl);
-      } catch (error) {
-        if (token !== state.liveFrameLoopToken || state.liveFrameThreadId !== threadId) return;
-        await new Promise((resolve) => window.setTimeout(resolve, 160));
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 45));
-    }
-  }
-
-  void pump();
+  state.liveFrameSource = source;
+  state.liveFrameMode = "stream";
+  state.liveFramePumpActive = true;
+  state.liveFrameStamp += 1;
+  state.liveFrameUrl = liveFramePath(source, threadId, state.liveFrameStamp).stream;
+  state.liveFrameTimer = window.setTimeout(() => {
+    state.liveFrameTimer = null;
+    if (
+      state.liveFrameThreadId !== threadId
+      || state.liveFrameSource !== source
+      || state.liveFrameMode !== "stream"
+      || state.liveFrameLoadedAt
+    ) return;
+    fallbackToLiveFramePolling(threadId, source);
+  }, 1400);
 }
 
 function syncLiveMirror() {
+  syncAutoControlLayer();
   const desiredThreadId = wantsLiveMirror() ? state.activeThreadId : null;
+  const desiredSource = currentControlLayer();
   if (!desiredThreadId) {
     stopLiveMirror();
     return;
   }
-  if (state.liveFrameThreadId === desiredThreadId && state.liveFrameUrl) {
+  if (state.liveFrameThreadId === desiredThreadId && state.liveFrameSource === desiredSource && state.liveFrameUrl) {
     return;
   }
-  if (state.liveFrameThreadId === desiredThreadId && !state.liveFrameUrl) {
+  startLiveMirror(desiredThreadId, desiredSource);
+}
+
+function handleLiveImageLoad() {
+  if (!wantsLiveMirror() || !state.liveFrameThreadId) return;
+  state.liveFrameLoadedAt = Date.now();
+  state.liveFrameErrorCount = 0;
+  if (state.liveFrameMode === "stream") {
+    cancelLiveMirrorRequest();
     return;
   }
-  startLiveMirror(desiredThreadId);
+  scheduleNextLiveFrame(state.liveFrameThreadId, state.liveFrameSource, 55);
+}
+
+function handleLiveImageError() {
+  if (!wantsLiveMirror() || !state.liveFrameThreadId) return;
+  if (state.liveFrameMode === "stream") {
+    fallbackToLiveFramePolling(state.liveFrameThreadId, state.liveFrameSource);
+    return;
+  }
+  state.liveFrameErrorCount += 1;
+  const retryDelay = Math.min(320, 70 + (state.liveFrameErrorCount * 40));
+  scheduleNextLiveFrame(state.liveFrameThreadId, state.liveFrameSource, retryDelay);
 }
 
 function clearRunState(options = {}) {
   if (options.disconnect !== false) disconnectStream();
   stopLiveMirror();
+  resetInteractState();
   state.runId = null;
   state.selectedRunId = null;
   state.goal = "";
@@ -3572,6 +3926,7 @@ function clearRunState(options = {}) {
   state.steps = [];
   state.audit = [];
   state.reportUrl = null;
+  state.liveMode = true;
   state.historyMode = false;
   state.activity = {
     mode: "idle",
@@ -3603,6 +3958,7 @@ function applySnapshot(snapshot, options = {}) {
   if (snapshot.thread_id) state.activeThreadId = snapshot.thread_id;
   state.historyMode = Boolean(options.history);
   updateBrowserState(snapshot);
+  syncAutoControlLayer();
   syncSelectionToFrames();
   state.activity = deriveActivity(state.events, state.frames);
   if (options.connect) {
@@ -3620,6 +3976,7 @@ function applyEvent(event) {
   if (event.type === "done" && state.status === "running") state.status = "completed";
   if (event.type === "error") state.status = "error";
   state.steps = buildSteps(state.events);
+  syncAutoControlLayer();
   syncSelectionToFrames();
   state.activity = deriveActivity(state.events, state.frames);
   render();
@@ -3886,23 +4243,28 @@ function renderStageManualDock() {
   if (!container) return;
   const thread = state.activeThread;
   const activeRun = activeRunForThread(thread);
-  const enabled = canDirectPreviewControl();
+  const previewEnabled = canDirectPreviewControl();
+  const canInteract = canStartInteract();
   const canPause = Boolean(activeRun) && thread?.status === "running";
   const canResume = Boolean(activeRun) && canManualControl(thread);
   const canReturnLive = Boolean(activeRun && state.historyMode && state.selectedRunId && state.selectedRunId !== activeRun.run_id);
   const pending = Boolean(state.ui.manualPending);
-  const dockDisabled = enabled && !pending ? "" : "disabled";
-  const typeMode = state.ui.manualMode === "type";
-  const scrollMode = state.ui.manualMode === "scroll";
+  const browserLayerActive = currentControlLayer() === "browser";
+  const desktopLayerActive = currentControlLayer() === "desktop";
+  const dockDisabled = previewEnabled && !pending && backForwardAvailable() ? "" : "disabled";
+  const interactLabel = state.ui.interactActive ? "Interact Açık" : (pending && canPause ? "Hazırlanıyor..." : "Interact");
 
   container.innerHTML = `
     <div class="manual-dock">
       <div class="manual-dock-head">
         <div class="manual-dock-copy">
           <div class="manual-dock-title">Canli Manuel Kontrol</div>
-          <div class="manual-dock-text">${escapeHtml(manualModeHint(state.ui.manualMode, enabled))}</div>
+          <div class="manual-dock-text">${escapeHtml(interactHint())}</div>
         </div>
         <div class="action-row">
+          <button type="button" class="action-button ${browserLayerActive ? "primary" : ""}" data-manual-layer="browser" ${pending ? "disabled" : ""}>Tarayıcı</button>
+          <button type="button" class="action-button ${desktopLayerActive ? "primary" : ""}" data-manual-layer="desktop" ${pending ? "disabled" : ""}>Masaüstü</button>
+          <button type="button" class="action-button primary interact-button ${state.ui.interactActive ? "active" : ""}" data-manual-action="interact" ${canInteract && !pending && !state.ui.interactActive ? "" : "disabled"}>${escapeHtml(interactLabel)}</button>
           <button type="button" class="action-button" data-thread-action="pause" ${canPause && !pending ? "" : "disabled"}>Pause</button>
           <button type="button" class="action-button" data-thread-action="resume" ${canResume && !pending ? "" : "disabled"}>Resume</button>
           ${canReturnLive ? `<button type="button" class="action-button primary" data-thread-action="return-live" ${pending ? "disabled" : ""}>Aktif run'a dön</button>` : ""}
@@ -3910,24 +4272,7 @@ function renderStageManualDock() {
           <button type="button" class="action-button" data-manual-action="forward" ${dockDisabled}>İleri</button>
         </div>
       </div>
-      <div class="manual-mode-row">
-        <button type="button" class="mode-chip ${state.ui.manualMode === "click" ? "active" : ""}" data-manual-mode="click" ${pending ? "disabled" : ""}>Tıkla</button>
-        <button type="button" class="mode-chip ${state.ui.manualMode === "type" ? "active" : ""}" data-manual-mode="type" ${pending ? "disabled" : ""}>Yaz</button>
-        <button type="button" class="mode-chip ${state.ui.manualMode === "scroll" ? "active" : ""}" data-manual-mode="scroll" ${pending ? "disabled" : ""}>Kaydır</button>
-      </div>
-      ${typeMode ? `
-        <div class="inline-form">
-          <input class="mini-input" type="text" value="${escapeHtml(state.drafts.typeText)}" data-manual-input="typeText" placeholder="Yazılacak metin" ${pending ? "disabled" : ""} />
-          <button type="button" class="action-button primary" data-manual-action="type-focused" ${enabled && state.drafts.typeText.trim() && !pending ? "" : "disabled"}>${pending ? "Gönderiliyor..." : "Yaziyi gonder"}</button>
-        </div>
-      ` : ""}
-      ${scrollMode ? `
-        <div class="inline-form">
-          <input class="mini-input" type="number" value="${escapeHtml(state.drafts.scrollAmount)}" data-manual-input="scrollAmount" placeholder="Kaydırma miktarı" ${pending ? "disabled" : ""} />
-          <button type="button" class="action-button" data-manual-action="scroll" ${enabled && !pending ? "" : "disabled"}>${pending ? "Gönderiliyor..." : "Kaydir"}</button>
-        </div>
-      ` : ""}
-      <div class="manual-inline-note">${escapeHtml(`Mod: ${manualModeText(state.ui.manualMode)}${pending ? " · işlem gönderiliyor" : ""}`)}</div>
+      <div class="manual-inline-note"><strong>Durum:</strong> ${escapeHtml(interactStatusText())}</div>
       <div class="inline-error" id="manual-dock-error">${escapeHtml(state.errors.manual || "")}</div>
     </div>
   `;
@@ -3946,10 +4291,8 @@ function renderTV() {
   const activeLabel = currentThreadTitle();
 
   screen.classList.toggle("busy", Boolean(overlay.busy));
-  screen.classList.toggle("manual-click", canDirectPreviewControl() && state.ui.manualMode === "click");
-  screen.classList.toggle("manual-type", canDirectPreviewControl() && state.ui.manualMode === "type");
-  screen.classList.toggle("manual-scroll", canDirectPreviewControl() && state.ui.manualMode === "scroll");
-  title.textContent = `${activeLabel} · ${currentRunStatusLabel()}`;
+  screen.classList.toggle("manual-interact", interactReady());
+  title.textContent = `${activeLabel} · ${currentRunStatusLabel()} · ${currentControlLayerLabel().toUpperCase()}`;
 
   if (!frame && !liveMirrorActive) {
     image.style.display = "none";
@@ -3960,7 +4303,7 @@ function renderTV() {
   } else {
     empty.style.display = "none";
     image.style.display = "block";
-    const displayKey = liveMirrorActive ? `live-${state.liveFrameStamp}` : frame.id;
+    const displayKey = liveMirrorActive ? `live-${state.liveFrameSource}-${state.liveFrameMode}-${state.liveFrameStamp}` : frame.id;
     const displaySrc = liveMirrorActive ? state.liveFrameUrl : frame.image_url;
     if (image.dataset.frameId !== displayKey) {
       if (liveMirrorActive) {
@@ -3972,6 +4315,12 @@ function renderTV() {
       image.src = displaySrc;
       image.dataset.frameId = displayKey;
     }
+  }
+
+  if (state.ui.interactActive) {
+    dot.style.display = "none";
+    bubble.style.display = "none";
+    return;
   }
 
   if (overlay.summary) {
@@ -4042,6 +4391,7 @@ function renderConsole() {
 }
 
 function render() {
+  ensureInteractState();
   renderHeader();
   renderConsole();
   renderStageManualDock();
@@ -4158,6 +4508,8 @@ function connectStream(runId) {
 }
 
 async function loadRun(runId, options = {}) {
+  if (options.live) state.liveMode = true;
+  if (options.history) state.liveMode = false;
   const snapshot = await fetchJson(`/runs/${runId}`);
   applySnapshot(snapshot, { connect: Boolean(options.live), history: Boolean(options.history) });
 }
@@ -4177,6 +4529,7 @@ async function syncThreadSnapshot(thread, options = {}) {
   if (options.preferLive && activeRun) {
     targetRunId = activeRun.run_id;
     live = true;
+    state.liveMode = true;
   } else if (state.historyMode && state.selectedRunId && runIds.includes(state.selectedRunId)) {
     targetRunId = state.selectedRunId;
   } else if (options.preferRunId && runIds.includes(options.preferRunId)) {
@@ -4198,6 +4551,7 @@ async function syncThreadSnapshot(thread, options = {}) {
   }
 
   if (activeRun && targetRunId === activeRun.run_id) {
+    if (live) state.liveMode = true;
     applySnapshot(activeRun, { connect: live, history: false });
     return;
   }
@@ -4306,21 +4660,28 @@ async function pauseActiveThread() {
     setError("thread", "");
     const snapshot = await fetchJson(`/threads/${state.activeThreadId}/pause`, { method: "POST" });
     await syncThreadSnapshot(snapshot, { preferLive: true });
+    return snapshot;
   } catch (error) {
     setError("thread", error.message);
     render();
+    return null;
   }
 }
 
 async function resumeActiveThread() {
   if (!state.activeThreadId) return;
+  resetInteractState();
+  state.ui.manualLayerOverride = null;
+  state.ui.autoFollowLayer = true;
   try {
     setError("thread", "");
     const snapshot = await fetchJson(`/threads/${state.activeThreadId}/resume`, { method: "POST" });
     await syncThreadSnapshot(snapshot, { preferLive: true });
+    return snapshot;
   } catch (error) {
     setError("thread", error.message);
     render();
+    return null;
   }
 }
 
@@ -4362,77 +4723,77 @@ async function submitQuestionAnswer(requestId) {
 }
 
 async function sendManualAction(tool, args) {
-  if (!state.activeThreadId || state.ui.manualPending) return;
-  state.ui.manualPending = true;
+  const threadId = state.activeThreadId;
+  if (!threadId) return null;
+  const runner = async () => {
+    if (state.activeThreadId !== threadId) return null;
+    state.ui.manualPending = true;
+    try {
+      setError("manual", "");
+      render();
+      const snapshot = await fetchJson(`/threads/${threadId}/actions`, {
+        method: "POST",
+        body: JSON.stringify({ tool, args }),
+      });
+      if (state.activeThreadId === threadId) {
+        await syncThreadSnapshot(snapshot, { preferLive: true });
+      }
+      return snapshot;
+    } catch (error) {
+      setError("manual", error.message);
+      render();
+      return null;
+    } finally {
+      state.ui.manualPending = false;
+      render();
+    }
+  };
+  const queued = Promise.resolve(state.ui.manualQueue).catch(() => {}).then(runner);
+  state.ui.manualQueue = queued;
   try {
-    setError("manual", "");
-    render();
-    const snapshot = await fetchJson(`/threads/${state.activeThreadId}/actions`, {
-      method: "POST",
-      body: JSON.stringify({ tool, args }),
-    });
-    await syncThreadSnapshot(snapshot, { preferLive: true });
-  } catch (error) {
-    setError("manual", error.message);
-    render();
+    return await queued;
   } finally {
-    state.ui.manualPending = false;
-    render();
+    if (state.ui.manualQueue === queued) state.ui.manualQueue = null;
   }
 }
 
+function selectManualLayer(layer) {
+  const nextLayer = layer === "desktop" ? "desktop" : "browser";
+  state.ui.autoFollowLayer = false;
+  state.ui.manualLayerOverride = nextLayer;
+  if (currentControlLayer() === nextLayer && state.ui.controlLayer === nextLayer) {
+    render();
+    return;
+  }
+  resetInteractState();
+  syncLiveMirror();
+  render();
+}
+
 async function handleManualAction(kind) {
+  if (kind === "interact") {
+    return startInteract();
+  }
   if (!canManualControl(state.activeThread)) {
     setError("manual", "Önce pause et veya kullanıcı bekleyen duruma gelmesini bekle.");
     render();
     return;
   }
-  if (kind === "back") return sendManualAction("browser", { action: "back" });
-  if (kind === "forward") return sendManualAction("browser", { action: "forward" });
-  if (kind === "scroll") {
-    return sendManualAction("browser", {
-      action: "scroll",
-      amount: Number.parseInt(state.drafts.scrollAmount || "0", 10) || 0,
-    });
+  if (kind === "back") {
+    if (!backForwardAvailable()) {
+      setError("manual", "Geri yalnızca tarayıcı katmanında kullanılabilir.");
+      render();
+      return;
+    }
+    return sendManualAction("browser", { action: "back" });
   }
-  if (kind === "click") {
-    if (!state.drafts.clickSelector.trim()) {
-      setError("manual", "Önce bir selector yaz.");
+  if (kind === "forward") {
+    if (!backForwardAvailable()) {
+      setError("manual", "İleri yalnızca tarayıcı katmanında kullanılabilir.");
       render();
       return;
     }
-    return sendManualAction("browser", {
-      action: "click",
-      selector: state.drafts.clickSelector.trim(),
-    });
-  }
-  if (kind === "type") {
-    if (!state.drafts.typeSelector.trim()) {
-      setError("manual", "Önce bir selector yaz.");
-      render();
-      return;
-    }
-    return sendManualAction("browser", {
-      action: "type",
-      selector: state.drafts.typeSelector.trim(),
-      text: state.drafts.typeText,
-    });
-  }
-  if (kind === "type-focused") {
-    if (!state.drafts.typeText.trim()) {
-      setError("manual", "Önce yazılacak metni gir.");
-      render();
-      return;
-    }
-    if (!canDirectPreviewControl()) {
-      setError("manual", state.historyMode ? "Önce aktif run'a dön." : "Önce pause et veya kullanıcı bekleyen duruma gelmesini bekle.");
-      render();
-      return;
-    }
-    return sendManualAction("browser", {
-      action: "type",
-      text: state.drafts.typeText,
-    });
+    return sendManualAction("browser", { action: "forward" });
   }
   if (kind === "advanced") {
     try {
@@ -4443,6 +4804,63 @@ async function handleManualAction(kind) {
       render();
     }
   }
+}
+
+function queueInteractText(text) {
+  if (!text) return;
+  state.ui.interactBuffer += text;
+  clearInteractFlushTimer();
+  state.ui.interactFlushTimer = window.setTimeout(() => {
+    void flushInteractTextBuffer();
+  }, 120);
+  render();
+}
+
+async function flushInteractTextBuffer() {
+  clearInteractFlushTimer();
+  const text = state.ui.interactBuffer;
+  if (!text) return true;
+  state.ui.interactBuffer = "";
+  render();
+  const tool = currentInteractTool();
+  const args = tool === "computer"
+    ? { action: "type", text }
+    : { action: "type", text };
+  await sendManualAction(tool, args);
+  focusInteractSurface();
+  return true;
+}
+
+async function sendInteractKey(key) {
+  await flushInteractTextBuffer();
+  if (!interactReady()) return;
+  const tool = currentInteractTool();
+  const args = tool === "computer"
+    ? { action: "key", text: key }
+    : { action: "key", key };
+  await sendManualAction(tool, args);
+  focusInteractSurface();
+}
+
+async function startInteract() {
+  if (!canStartInteract()) {
+    setError("manual", state.historyMode || !state.liveMode ? "Önce aktif canlı run'a dön." : "Interact şu anda kullanılamıyor.");
+    render();
+    return;
+  }
+  setError("manual", "");
+  if (!canDirectPreviewControl()) {
+    const snapshot = await pauseActiveThread();
+    if (!snapshot) return;
+  }
+  if (!canDirectPreviewControl()) {
+    setError("manual", "Interact için kontrol devri tamamlanamadı.");
+    render();
+    return;
+  }
+  state.ui.interactActive = true;
+  render();
+  focusInteractSurface();
 }
 
 function previewImageMetrics() {
@@ -4480,41 +4898,155 @@ function previewPointFromEvent(event) {
   };
 }
 
+function interactDragDistance(fromPoint, toPoint) {
+  if (!fromPoint || !toPoint) return 0;
+  return Math.hypot(Number(toPoint.x) - Number(fromPoint.x), Number(toPoint.y) - Number(fromPoint.y));
+}
+
+function handlePreviewPointerDown(event) {
+  if (!interactReady() || event.button !== 0) return;
+  const point = previewPointFromEvent(event);
+  if (!point) return;
+  event.preventDefault();
+  focusInteractSurface();
+  event.currentTarget?.setPointerCapture?.(event.pointerId);
+  state.ui.interactDrag = {
+    pointerId: event.pointerId,
+    startPoint: point,
+    lastPoint: point,
+    moved: false,
+  };
+}
+
+function handlePreviewPointerMove(event) {
+  const drag = state.ui.interactDrag;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  const point = previewPointFromEvent(event);
+  if (!point) return;
+  drag.lastPoint = point;
+  if (!drag.moved && interactDragDistance(drag.startPoint, point) >= 12) {
+    drag.moved = true;
+  }
+}
+
+async function handlePreviewPointerUp(event) {
+  const drag = state.ui.interactDrag;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  const point = previewPointFromEvent(event) || drag.lastPoint || drag.startPoint;
+  state.ui.interactDrag = null;
+  event.currentTarget?.releasePointerCapture?.(event.pointerId);
+  if (!drag.moved || !point || interactDragDistance(drag.startPoint, point) < 12) {
+    return;
+  }
+  event.preventDefault();
+  state.ui.interactSuppressClickUntil = Date.now() + 260;
+  focusInteractSurface();
+  await flushInteractTextBuffer();
+  const tool = currentInteractTool();
+  const args = tool === "computer"
+    ? {
+        action: "drag",
+        x: drag.startPoint.x,
+        y: drag.startPoint.y,
+        end_x: point.x,
+        end_y: point.y,
+      }
+    : {
+        action: "drag",
+        start_x: drag.startPoint.x,
+        start_y: drag.startPoint.y,
+        end_x: point.x,
+        end_y: point.y,
+        steps: 18,
+      };
+  await sendManualAction(tool, args);
+  focusInteractSurface();
+}
+
+function handlePreviewPointerCancel(event) {
+  const drag = state.ui.interactDrag;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  state.ui.interactDrag = null;
+  event.currentTarget?.releasePointerCapture?.(event.pointerId);
+}
+
 async function handlePreviewClick(event) {
-  if (!["click", "type"].includes(state.ui.manualMode)) return;
-  if (!canDirectPreviewControl()) {
-    setError("manual", state.historyMode ? "Önce aktif run'a dön." : "Önce pause et veya kullanıcı bekleyen duruma gelmesini bekle.");
-    render();
+  if (!interactReady()) return;
+  if (Date.now() < Number(state.ui.interactSuppressClickUntil || 0)) {
+    event.preventDefault();
     return;
   }
   const point = previewPointFromEvent(event);
   if (!point) return;
   event.preventDefault();
-  await sendManualAction("browser", {
+  focusInteractSurface();
+  await flushInteractTextBuffer();
+  await sendManualAction(currentInteractTool(), {
     action: "click",
     x: point.x,
     y: point.y,
   });
+  focusInteractSurface();
 }
 
 async function handlePreviewWheel(event) {
-  if (state.ui.manualMode !== "scroll") return;
-  if (!canDirectPreviewControl()) {
-    setError("manual", state.historyMode ? "Önce aktif run'a dön." : "Önce pause et veya kullanıcı bekleyen duruma gelmesini bekle.");
-    render();
-    return;
-  }
+  if (!interactReady()) return;
   const point = previewPointFromEvent(event);
   if (!point) return;
   event.preventDefault();
-  const fallback = Number.parseInt(state.drafts.scrollAmount || "0", 10) || 600;
-  const amount = Math.round(event.deltaY || fallback) || fallback;
-  await sendManualAction("browser", {
-    action: "scroll",
-    x: point.x,
-    y: point.y,
-    amount,
-  });
+  focusInteractSurface();
+  await flushInteractTextBuffer();
+  const amount = Math.round(event.deltaY || 600) || 600;
+  const tool = currentInteractTool();
+  const args = tool === "computer"
+    ? {
+        action: "scroll",
+        x: point.x,
+        y: point.y,
+        delta_y: amount,
+      }
+    : {
+        action: "scroll",
+        x: point.x,
+        y: point.y,
+        amount,
+      };
+  await sendManualAction(tool, args);
+  focusInteractSurface();
+}
+
+function handlePreviewKeydown(event) {
+  if (!interactReady() || isAgentraEditableTarget(event.target)) return;
+  if (isPrintableKeyEvent(event)) {
+    event.preventDefault();
+    queueInteractText(event.key);
+    return;
+  }
+  if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) return;
+  if (!isInteractSpecialKey(event.key)) return;
+  event.preventDefault();
+  if (event.key === "Backspace" && state.ui.interactBuffer) {
+    state.ui.interactBuffer = state.ui.interactBuffer.slice(0, -1);
+    if (state.ui.interactBuffer) {
+      clearInteractFlushTimer();
+      state.ui.interactFlushTimer = window.setTimeout(() => {
+        void flushInteractTextBuffer();
+      }, 120);
+    } else {
+      clearInteractFlushTimer();
+    }
+    render();
+    return;
+  }
+  void sendInteractKey(event.key);
+}
+
+function handlePreviewPaste(event) {
+  if (!interactReady() || isAgentraEditableTarget(event.target)) return;
+  const text = event.clipboardData?.getData("text") || "";
+  if (!text) return;
+  event.preventDefault();
+  queueInteractText(text.replace(/\\r\\n/g, "\\n"));
 }
 
 function openReport() {
@@ -4535,13 +5067,17 @@ function openLogs() {
 }
 
 async function openRunHistory(runId) {
+  resetInteractState();
   state.historyMode = true;
+  state.liveMode = false;
   await loadRun(runId, { live: false, history: true });
 }
 
 async function returnToLiveRun() {
   if (!state.activeThreadId) return;
+  resetInteractState();
   state.historyMode = false;
+  state.liveMode = true;
   await loadThreadDetail(state.activeThreadId, { preferLive: true });
 }
 
@@ -4570,7 +5106,9 @@ async function handleConsoleClick(event) {
 
   const threadSelect = event.target.closest("[data-thread-select]");
   if (threadSelect) {
+    resetInteractState();
     state.historyMode = false;
+    state.liveMode = true;
     await loadThreadDetail(threadSelect.getAttribute("data-thread-select"), { preferLive: true });
     return;
   }
@@ -4602,11 +5140,9 @@ async function handleConsoleClick(event) {
     return openRunHistory(historyAction.getAttribute("data-history-open"));
   }
 
-  const manualModeAction = event.target.closest("[data-manual-mode]");
-  if (manualModeAction) {
-    state.ui.manualMode = manualModeAction.getAttribute("data-manual-mode") || "click";
-    setError("manual", "");
-    render();
+  const manualLayer = event.target.closest("[data-manual-layer]");
+  if (manualLayer) {
+    selectManualLayer(manualLayer.getAttribute("data-manual-layer"));
     return;
   }
 
@@ -4686,7 +5222,7 @@ function mount() {
               <div class="tv-shell">
                 <div class="tv-screen" id="tv-screen">
                   <div class="tv-title" id="tv-frame-title">Ajan · HAZIR</div>
-                  <img class="tv-image" id="tv-image" alt="Agentra canlı kare" />
+                  <img class="tv-image" id="tv-image" alt="Agentra canlı kare" decoding="async" fetchpriority="high" />
                   <div class="tv-empty" id="tv-empty"></div>
                   <div class="cursor-dot" id="cursor-dot"></div>
                   <div class="cursor-bubble" id="cursor-bubble"></div>
@@ -4724,8 +5260,16 @@ function mount() {
   document.getElementById("stage-manual-dock").addEventListener("click", handleConsoleClick);
   document.getElementById("stage-manual-dock").addEventListener("input", handleConsoleInput);
   document.getElementById("run-history").addEventListener("click", handleConsoleClick);
+  document.getElementById("tv-image").addEventListener("load", handleLiveImageLoad);
+  document.getElementById("tv-image").addEventListener("error", handleLiveImageError);
+  document.getElementById("tv-image").addEventListener("pointerdown", handlePreviewPointerDown);
+  document.getElementById("tv-image").addEventListener("pointermove", handlePreviewPointerMove);
+  document.getElementById("tv-image").addEventListener("pointerup", (event) => { void handlePreviewPointerUp(event); });
+  document.getElementById("tv-image").addEventListener("pointercancel", handlePreviewPointerCancel);
   document.getElementById("tv-image").addEventListener("click", handlePreviewClick);
   document.getElementById("tv-image").addEventListener("wheel", handlePreviewWheel, { passive: false });
+  window.addEventListener("keydown", handlePreviewKeydown);
+  window.addEventListener("paste", handlePreviewPaste);
 
   setupScrubber();
   render();
@@ -4735,6 +5279,7 @@ function mount() {
 
 window.addEventListener("beforeunload", () => {
   disconnectStream();
+  stopLiveMirror();
   if (state.threadPollTimer) window.clearInterval(state.threadPollTimer);
 });
 

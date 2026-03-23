@@ -11,6 +11,7 @@ import pytest
 from agentra.tools.base import ToolResult
 from agentra.tools.filesystem import FilesystemTool
 from agentra.tools.git_tool import GitTool
+from agentra.tools.local_system import LocalSystemTool, ResolvedLocalPath
 from agentra.tools.terminal import TerminalTool
 
 
@@ -187,6 +188,58 @@ async def test_terminal_timeout(tmp_path):
     assert "timed out" in result.error.lower()
 
 
+# ── LocalSystemTool ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_local_system_resolve_known_folder_returns_wsl_and_windows_paths(monkeypatch):
+    tool = LocalSystemTool()
+
+    monkeypatch.setattr(
+        tool,
+        "_resolve_known_folder_sync",
+        lambda folder_key: ResolvedLocalPath(
+            requested=folder_key,
+            windows_path="C:\\Users\\ariba\\OneDrive\\Desktop",
+            wsl_path="/mnt/c/Users/ariba/OneDrive/Desktop",
+        ),
+    )
+
+    result = await tool.execute(action="resolve_known_folder", folder_key="desktop")
+
+    assert result.success
+    assert "/mnt/c/Users/ariba/OneDrive/Desktop" in result.output
+    assert result.metadata["windows_path"] == "C:\\Users\\ariba\\OneDrive\\Desktop"
+    assert result.metadata["wsl_path"] == "/mnt/c/Users/ariba/OneDrive/Desktop"
+
+
+@pytest.mark.asyncio
+async def test_local_system_open_path_uses_normalized_windows_target(monkeypatch):
+    tool = LocalSystemTool()
+    opened: list[str] = []
+
+    monkeypatch.setattr(
+        tool,
+        "_normalize_input_path",
+        lambda path: ResolvedLocalPath(
+            requested=path,
+            windows_path="C:\\Users\\ariba\\OneDrive\\Desktop\\secondsun\\deck.pptx",
+            wsl_path="/mnt/c/Users/ariba/OneDrive/Desktop/secondsun/deck.pptx",
+        ),
+    )
+    monkeypatch.setattr(tool, "_ensure_path_exists", lambda resolved: None)
+    monkeypatch.setattr(tool, "_open_path_sync", lambda resolved: opened.append(resolved.windows_path))
+
+    result = await tool.execute(
+        action="open_path",
+        path="/mnt/c/Users/ariba/OneDrive/Desktop/secondsun/deck.pptx",
+    )
+
+    assert result.success
+    assert opened == ["C:\\Users\\ariba\\OneDrive\\Desktop\\secondsun\\deck.pptx"]
+    assert result.metadata["frame_label"] == "local_system · open_path"
+
+
 # ── GitTool ───────────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -277,3 +330,15 @@ async def test_computer_click_requires_coords():
     # Either an error (no coords) or an ImportError (pyautogui not installed)
     # Both are acceptable; what matters is it doesn't crash unhandled.
     assert isinstance(result.success, bool)
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_preview_describes_desktop_action():
+    from agentra.tools.computer import ComputerTool  # noqa: PLC0415
+
+    tool = ComputerTool(allow=True)
+    preview = await tool.preview(action="click", x=120, y=80)
+
+    assert preview is not None
+    assert preview["frame_label"] == "computer · click"
+    assert "desktop" in preview["summary"].lower()
