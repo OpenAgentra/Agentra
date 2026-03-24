@@ -52,6 +52,17 @@ agentra/
 
 ---
 
+## Documentation
+
+Contributor-first project documentation lives in `docs/`:
+
+- [Docs Hub](docs/README.md)
+- [Architecture](docs/architecture.md)
+- [Features](docs/features.md)
+- [Policies](docs/policies.md)
+- [Interfaces](docs/interfaces.md)
+- [Artifacts](docs/artifacts.md)
+
 ## Quick Start
 
 ### 1 — Install
