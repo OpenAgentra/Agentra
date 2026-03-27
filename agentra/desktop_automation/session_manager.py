@@ -61,6 +61,9 @@ _VK_SPACE = 0x20
 _MK_LBUTTON = 0x0001
 _MK_RBUTTON = 0x0002
 _HIDDEN_SESSION_PREFIX = "desktop_session:"
+_HIDDEN_DIALOG_CLASS_NAMES = frozenset({"#32770", "Credential Dialog Xaml Host", "OperationStatusWindow"})
+_RISKY_WINDOWS_ACTIONS = frozenset({"invoke_control", "set_text", "type_keys"})
+_RISKY_COMPUTER_ACTIONS = frozenset({"click", "double_click", "right_click", "move", "type", "key", "scroll", "drag"})
 
 
 def _make_lparam(x: int, y: int) -> int:
@@ -418,6 +421,31 @@ class _HiddenDesktopBackend(NativeWindowsDesktopBackend):
         super().__init__(default_timeout=default_timeout)
         self._worker = worker
 
+    def execute(self, action: str, **kwargs: Any) -> DesktopActionVerification:
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action in _RISKY_WINDOWS_ACTIONS:
+            takeover = self._worker.guard_interaction(
+                action=normalized_action,
+                window_title=str(kwargs.get("window_title", "") or ""),
+                app=str(kwargs.get("app", "") or ""),
+                profile_id=str(kwargs.get("profile_id", "") or ""),
+                require_background_preview=True,
+            )
+            if takeover is not None:
+                return DesktopActionVerification(
+                    target=str(takeover.get("target") or kwargs.get("window_title") or kwargs.get("app") or "hidden desktop"),
+                    action=normalized_action,
+                    observed_outcome=str(takeover.get("content") or takeover.get("fallback_reason") or "Hidden desktop action paused."),
+                    success=False,
+                    verified=False,
+                    fallback_reason=str(takeover.get("fallback_reason") or takeover.get("content") or "Hidden desktop action paused."),
+                    details=takeover,
+                )
+        result = super().execute(action, **kwargs)
+        if result.success:
+            self._worker.session_status = "ready"
+        return result
+
     def launch_app(
         self,
         *,
@@ -492,6 +520,20 @@ class _HiddenDesktopBackend(NativeWindowsDesktopBackend):
             verified=True,
             details={"window_title": window.title, "window_handle": window.handle},
         )
+
+    def _resolve_window(
+        self,
+        *,
+        window_title: str | None = None,
+        app: str | None = None,
+        profile_id: str | None = None,
+    ) -> WindowInfo | None:
+        window = super()._resolve_window(window_title=window_title, app=app, profile_id=profile_id)
+        if window is not None:
+            return window
+        if window_title or app or profile_id:
+            return None
+        return self._worker.current_target_window()
 
     def type_keys(
         self,
@@ -660,6 +702,119 @@ class _Win32HiddenDesktopWorker:
         self.active_window_title = str(window_title or "")
         self.active_window_handle = int(window_handle or 0)
 
+    def current_target_window(self) -> WindowInfo | None:
+        return self._resolve_target_window(
+            window_title=self.active_window_title,
+            app=self.active_target_app,
+            profile_id=self.active_profile_id,
+        )
+
+    def guard_interaction(
+        self,
+        *,
+        action: str,
+        window_title: str = "",
+        app: str = "",
+        profile_id: str = "",
+        require_background_preview: bool,
+    ) -> dict[str, Any] | None:
+        windows = self._enumerated_windows()
+        if not windows:
+            self.session_status = "blocked_waiting_user"
+            self.compatibility_state = "preview_only"
+            self.fallback_reason = "No active hidden desktop window is available yet."
+            return self._desktop_takeover_payload(
+                action=action,
+                reason=self.fallback_reason,
+                summary="Arka plan masaustu hedefi hazir olmadigi icin kontrol size devredildi.",
+            )
+
+        has_target_hint = any(
+            str(value or "").strip()
+            for value in (window_title, app, profile_id, self.active_window_title, self.active_target_app, self.active_profile_id)
+        )
+        if not has_target_hint and len(windows) > 1:
+            self.session_status = "blocked_waiting_user"
+            self.compatibility_state = "preview_only"
+            self.fallback_reason = "Multiple hidden desktop windows are open and no target window has been pinned yet."
+            return self._desktop_takeover_payload(
+                action=action,
+                reason=(
+                    "Arka plan oturumunda birden fazla pencere acik ve hangi pencerenin kontrol edilecegi belli degil. "
+                    "Dogru pencereyi one alin veya manuel secimi tamamlayin; sonra Finish Control ile devam edin."
+                ),
+                summary="Arka plan masaustu hedefi secilmedigi icin kontrol size devredildi.",
+                windows=windows,
+            )
+
+        expected_window = self._resolve_target_window(window_title=window_title, app=app, profile_id=profile_id)
+        if expected_window is None and len(windows) > 1:
+            self.session_status = "blocked_waiting_user"
+            self.compatibility_state = "preview_only"
+            self.fallback_reason = "Multiple hidden desktop windows are open and the target is ambiguous."
+            return self._desktop_takeover_payload(
+                action=action,
+                reason=(
+                    "Arka plan oturumunda birden fazla pencere acik ve hedef pencere net degil. "
+                    "Dogru pencereyi secin veya manuel duzeltin; sonra Finish Control ile devam edin."
+                ),
+                summary="Arka plan masaustu hedefi belirsiz kaldigi icin kontrol size devredildi.",
+                windows=windows,
+            )
+        if expected_window is None:
+            expected_window = windows[0]
+
+        self.note_active_window(
+            profile_id=profile_id or guess_windows_app_profile(app or window_title or expected_window.title) or "",
+            app=app or self.active_target_app,
+            window_title=expected_window.title,
+            window_handle=expected_window.handle,
+        )
+
+        unexpected_dialog = self._unexpected_dialog_window(
+            windows=windows,
+            window_title=window_title,
+            app=app,
+            profile_id=profile_id,
+        )
+        if unexpected_dialog is not None:
+            self.session_status = "blocked_waiting_user"
+            self.compatibility_state = "fallback_required"
+            self.fallback_reason = (
+                f"Unexpected hidden desktop dialog detected: {unexpected_dialog.title or unexpected_dialog.class_name}."
+            )
+            return self._desktop_takeover_payload(
+                action=action,
+                reason=(
+                    "Arka plan oturumunda beklenmeyen bir pencere veya popup acildi. "
+                    "Durumu inceleyip gerekirse manuel tamamlayin; sonra Finish Control ile devam edin."
+                ),
+                summary="Beklenmeyen arka plan popup'i tespit edildigi icin kontrol size devredildi.",
+                window=unexpected_dialog,
+                windows=windows,
+            )
+
+        if require_background_preview:
+            attempt = self._capture_window(expected_window.handle)
+            self.capture_backend = attempt.backend
+            self.compatibility_state = attempt.compatibility_state
+            self.fallback_reason = attempt.fallback_reason
+            if attempt.data is None:
+                self.session_status = "blocked_waiting_user"
+                return self._desktop_takeover_payload(
+                    action=action,
+                    reason=(
+                        "Bu pencere arka planda guvenli onizleme ve denetim icin uyumlu degil. "
+                        "Gorunur kontrol veya manuel yardim gerektiriyor."
+                    ),
+                    summary="Arka plan denetimi uyumsuz kaldigi icin kontrol size devredildi.",
+                    window=expected_window,
+                    windows=windows,
+                )
+
+        self.session_status = "ready"
+        return None
+
     def probe_capture_backend(self) -> None:
         attempt = self._capture_current_window()
         self.capture_backend = attempt.backend
@@ -740,8 +895,7 @@ class _Win32HiddenDesktopWorker:
         if not ctypes.windll.user32.SetThreadDesktop(handle):
             raise RuntimeError("SetThreadDesktop failed for the hidden desktop worker.")
 
-    def _capture_current_window(self) -> _CaptureAttempt:
-        handle = self._current_window_handle()
+    def _capture_window(self, handle: int) -> _CaptureAttempt:
         if not handle:
             return _CaptureAttempt(
                 data=None,
@@ -760,15 +914,163 @@ class _Win32HiddenDesktopWorker:
             fallback_reason="No compatible capture backend succeeded for the hidden desktop window.",
         )
 
-    def _current_window_handle(self) -> int:
-        if self.active_window_handle:
-            return int(self.active_window_handle)
+    def _capture_current_window(self) -> _CaptureAttempt:
+        return self._capture_window(self._current_window_handle())
+
+    def _enumerated_windows(self) -> list[WindowInfo]:
         if self._backend is None:
-            return 0
-        windows = self._backend._enumerate_windows()  # noqa: SLF001
+            return []
+        return self._backend._enumerate_windows()  # noqa: SLF001
+
+    def _resolve_target_window(
+        self,
+        *,
+        window_title: str | None = None,
+        app: str | None = None,
+        profile_id: str | None = None,
+    ) -> WindowInfo | None:
+        windows = self._enumerated_windows()
         if not windows:
+            return None
+
+        normalized_title = _normalized_text(window_title or "")
+        normalized_app = _normalized_text(str(app or "").replace(".exe", ""))
+        resolved_profile_id = str(profile_id or self.active_profile_id or guess_windows_app_profile(app or window_title or "") or "").strip()
+        profile = get_windows_app_profile(resolved_profile_id)
+        title_tokens = [token for token in (normalized_title, normalized_app) if token]
+        if profile is not None:
+            title_tokens.extend(_normalized_text(token) for token in profile.window_title_tokens)
+        if self.active_window_title:
+            title_tokens.append(_normalized_text(self.active_window_title))
+
+        active_candidate = next((item for item in windows if item.handle == self.active_window_handle), None)
+        if title_tokens:
+            scored = sorted(
+                windows,
+                key=lambda item: self._window_match_score(item, title_tokens=title_tokens, active_handle=self.active_window_handle),
+                reverse=True,
+            )
+            if scored and (
+                self._window_matches_tokens(scored[0], title_tokens)
+                or (active_candidate is not None and scored[0].handle == active_candidate.handle)
+            ):
+                return scored[0]
+        if active_candidate is not None:
+            return active_candidate
+        if len(windows) == 1:
+            return windows[0]
+        scored = sorted(
+            windows,
+            key=lambda item: self._window_match_score(item, title_tokens=(), active_handle=self.active_window_handle),
+            reverse=True,
+        )
+        return scored[0] if scored else None
+
+    def _window_matches_tokens(self, window: WindowInfo, title_tokens: tuple[str, ...] | list[str]) -> bool:
+        normalized_window_title = _normalized_text(window.title)
+        return any(token and token in normalized_window_title for token in title_tokens)
+
+    def _window_match_score(
+        self,
+        window: WindowInfo,
+        *,
+        title_tokens: tuple[str, ...] | list[str],
+        active_handle: int,
+    ) -> int:
+        normalized_window_title = _normalized_text(window.title)
+        score = 0
+        if active_handle and window.handle == active_handle:
+            score += 80
+        if window.class_name not in _HIDDEN_DIALOG_CLASS_NAMES:
+            score += 20
+        if self.active_window_title and _normalized_text(self.active_window_title) == normalized_window_title:
+            score += 60
+        for token in title_tokens:
+            if token and token in normalized_window_title:
+                score += 40
+        return score
+
+    def _unexpected_dialog_window(
+        self,
+        *,
+        windows: list[WindowInfo],
+        window_title: str,
+        app: str,
+        profile_id: str,
+    ) -> WindowInfo | None:
+        if len(windows) <= 1:
+            return None
+        for window in windows:
+            if window.class_name not in _HIDDEN_DIALOG_CLASS_NAMES:
+                continue
+            if self._window_matches_expected(window, window_title=window_title, app=app, profile_id=profile_id):
+                continue
+            return window
+        return None
+
+    def _window_matches_expected(
+        self,
+        window: WindowInfo,
+        *,
+        window_title: str,
+        app: str,
+        profile_id: str,
+    ) -> bool:
+        normalized_window_title = _normalized_text(window.title)
+        resolved_profile_id = str(profile_id or self.active_profile_id or guess_windows_app_profile(app or window_title or "") or "").strip()
+        profile = get_windows_app_profile(resolved_profile_id)
+        tokens = [_normalized_text(window_title or ""), _normalized_text(str(app or "").replace(".exe", ""))]
+        if profile is not None:
+            tokens.extend(_normalized_text(token) for token in profile.window_title_tokens)
+        if self.active_window_title:
+            tokens.append(_normalized_text(self.active_window_title))
+        return any(token and token in normalized_window_title for token in tokens)
+
+    def _desktop_takeover_payload(
+        self,
+        *,
+        action: str,
+        reason: str,
+        summary: str,
+        window: WindowInfo | None = None,
+        windows: list[WindowInfo] | None = None,
+    ) -> dict[str, Any]:
+        observation = {
+            "window_title": window.title if window is not None else self.active_window_title,
+            "window_handle": window.handle if window is not None else self.active_window_handle,
+            "window_class_name": window.class_name if window is not None else "",
+            "visible_window_count": len(windows or []),
+        }
+        if windows:
+            observation["windows"] = [
+                {
+                    "title": item.title,
+                    "handle": item.handle,
+                    "class_name": item.class_name,
+                    "process_id": item.process_id,
+                }
+                for item in windows
+            ]
+        return {
+            "pause_kind": "desktop_control_takeover",
+            "summary": summary,
+            "content": reason,
+            "fallback_reason": reason,
+            "target": observation["window_title"] or self.active_target_app or "hidden desktop",
+            "compatibility_state": self.compatibility_state,
+            "capture_backend": self.capture_backend,
+            "desktop_observation": observation,
+            "window_title": observation["window_title"],
+            "window_handle": observation["window_handle"],
+            "window_class_name": observation["window_class_name"],
+            "visible_window_count": observation["visible_window_count"],
+            "action": action,
+        }
+
+    def _current_window_handle(self) -> int:
+        target = self.current_target_window()
+        if target is None:
             return 0
-        target = windows[0]
         self.note_active_window(
             profile_id=guess_windows_app_profile(target.title) or "",
             app=self.active_target_app,
@@ -779,7 +1081,22 @@ class _Win32HiddenDesktopWorker:
 
     def _execute_computer_action(self, action: str, **kwargs: Any) -> ToolResult:
         if action == "screenshot":
+            self.session_status = "ready"
             return self._computer_result(action="screenshot", output="Hidden desktop frame captured.", summary="Capturing hidden desktop frame")
+        if action in _RISKY_COMPUTER_ACTIONS:
+            takeover = self.guard_interaction(
+                action=action,
+                window_title=self.active_window_title,
+                app=self.active_target_app,
+                profile_id=self.active_profile_id,
+                require_background_preview=True,
+            )
+            if takeover is not None:
+                return ToolResult(
+                    success=False,
+                    error=str(takeover.get("content") or takeover.get("fallback_reason") or "Hidden desktop action paused."),
+                    metadata=takeover,
+                )
         handle = self._current_window_handle()
         if not handle:
             return ToolResult(
@@ -829,6 +1146,7 @@ class _Win32HiddenDesktopWorker:
         summary: str,
         capture_result_screenshot: bool = True,
     ) -> ToolResult:
+        self.session_status = "ready"
         metadata = {
             "frame_label": f"computer · {action}",
             "summary": summary,
@@ -845,6 +1163,7 @@ class _Win32HiddenDesktopWorker:
         self.fallback_reason = attempt.fallback_reason
         if attempt.data is None:
             return ToolResult(success=True, output=output, metadata=metadata)
+        self.session_status = "ready"
         return ToolResult(
             success=True,
             output=output,
