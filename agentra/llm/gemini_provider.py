@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import logging
 from typing import Any, Optional
 
 from agentra.config import AgentConfig
 from agentra.llm.base import LLMMessage, LLMProvider, LLMResponse, LLMSession, LLMToolResult
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_aiohttp_dns_error_alias() -> None:
+    try:
+        import aiohttp  # noqa: PLC0415
+    except ImportError:
+        return
+    if hasattr(aiohttp, "ClientConnectorDNSError"):
+        return
+    fallback = getattr(aiohttp, "ClientConnectorError", None)
+    if fallback is not None:
+        setattr(aiohttp, "ClientConnectorDNSError", fallback)
 
 
 class GeminiSession(LLMSession):
@@ -72,13 +88,25 @@ class GeminiProvider(LLMProvider):
         except ImportError as exc:
             raise ImportError("Install 'google-genai' to use GeminiProvider.") from exc
 
+        _ensure_aiohttp_dns_error_alias()
         self._genai = genai
         self._types = types
         self._config = config
-        self._client = genai.Client(
-            api_key=config.gemini_api_key or None,
+        self._client = self._create_client()
+
+    def _create_client(self) -> Any:
+        return self._genai.Client(
+            api_key=self._config.gemini_api_key or None,
             http_options=self._build_http_options(),
         )
+
+    async def _reset_client(self) -> None:
+        current = self._client
+        self._client = self._create_client()
+        try:
+            await current.aio.aclose()
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to close stale Gemini client", exc_info=True)
 
     def start_session(
         self,
@@ -136,11 +164,81 @@ class GeminiProvider(LLMProvider):
             tools=self._convert_tools(tools),
             automaticFunctionCalling=self._types.AutomaticFunctionCallingConfig(disable=True),
         )
-        return await self._client.aio.models.generate_content(
-            model=self._config.llm_model,
-            contents=contents,
-            config=config,
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await self._client.aio.models.generate_content(
+                    model=self._config.llm_model,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_transient_generate_error(exc) or attempt >= max_attempts:
+                    raise
+                delay = min(2.0, 0.35 * (2 ** (attempt - 1)))
+                logger.warning(
+                    "Transient Gemini request failure model=%s attempt=%d/%d error=%s; retrying in %.2fs",
+                    self._config.llm_model,
+                    attempt,
+                    max_attempts,
+                    exc,
+                    delay,
+                )
+                await self._reset_client()
+                await asyncio.sleep(delay)
+        raise RuntimeError("Gemini generation retry loop exhausted unexpectedly")
+
+    def _is_transient_generate_error(self, exc: Exception) -> bool:
+        try:
+            import aiohttp  # noqa: PLC0415
+        except ImportError:
+            aiohttp = None
+
+        transient_types: tuple[type[BaseException], ...] = (
+            asyncio.TimeoutError,
+            TimeoutError,
+            ConnectionError,
         )
+        if isinstance(exc, transient_types):
+            return True
+        if aiohttp is not None and isinstance(
+            exc,
+            (
+                aiohttp.ServerDisconnectedError,
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientOSError,
+                aiohttp.ClientPayloadError,
+            ),
+        ):
+            return True
+
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None:
+            status_code = getattr(exc, "code", None)
+        try:
+            if status_code is not None and int(status_code) >= 500:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        message = " ".join(
+            part
+            for part in (
+                str(exc),
+                str(getattr(exc, "status", "") or ""),
+                str(getattr(exc, "message", "") or ""),
+            )
+            if part
+        ).lower()
+        transient_markers = (
+            "server disconnected",
+            "connection reset",
+            "connection closed",
+            "temporarily unavailable",
+            "upstream connect error",
+            "remote host closed",
+        )
+        return any(marker in message for marker in transient_markers)
 
     def _build_http_options(self) -> Any:
         kwargs: dict[str, Any] = {"api_version": "v1beta"}

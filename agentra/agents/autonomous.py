@@ -9,19 +9,30 @@ is complete or the iteration limit is reached.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import unicodedata
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
 
-from agentra.approval_policy import ApprovalPolicyContext, ApprovalPolicyEngine
+from agentra.approval_policy import (
+    ApprovalPolicyContext,
+    ApprovalPolicyEngine,
+    browser_sensitive_input_kind,
+    browser_sensitive_takeover_kind,
+    content_requests_sensitive_input,
+)
 from agentra.config import AgentConfig
 from agentra.llm.base import LLMMessage, LLMProvider, LLMSession, LLMToolResult
 from agentra.llm.factory import get_embedding_provider, get_provider
 from agentra.logging_utils import exception_details_with_context
 from agentra.memory.embedding_memory import LongTermMemoryStore, ThreadWorkingMemory
 from agentra.memory.workspace import WorkspaceManager
+from agentra.task_routing import (
+    goal_mentions_web_target as routing_goal_mentions_web_target,
+    goal_prefers_native_windows_desktop_execution as routing_goal_prefers_native_windows_desktop_execution,
+)
 from agentra.tools.base import BaseTool, ToolResult
 from agentra.tools.browser import BrowserTool
 from agentra.tools.computer import ComputerTool
@@ -29,6 +40,12 @@ from agentra.tools.filesystem import FilesystemTool
 from agentra.tools.git_tool import GitTool
 from agentra.tools.local_system import LocalSystemTool
 from agentra.tools.terminal import TerminalTool
+from agentra.tools.windows_desktop import WindowsDesktopTool
+from agentra.windows_apps import (
+    get_windows_app_profile,
+    guess_windows_app_profile,
+    normalize_windows_app_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +65,10 @@ You are Agentra, an autonomous AI agent with full access to a computer.
 ## Tool routing rules
 - Use `browser` only for websites, web apps, URLs, and web pages.
 - Use `local_system` to resolve known local folders and open confirmed local files or folders with the OS default handler.
+- Use `windows_desktop` first for standard Windows apps such as Calculator, Notepad, Explorer, common dialogs, buttons, and text inputs.
 - Use `computer` only for visible desktop/UI tasks that truly require on-screen interaction.
 - Use `filesystem` to inspect local paths and contents. Use `terminal` only when `filesystem` or `local_system` cannot directly resolve the local task.
-- After every `computer` action, inspect the latest screenshot before repeating the same click. If the screen did not visibly change, stop guessing and reassess.
+- After every visible `computer` action, inspect the latest screenshot before repeating the same click. If the screen did not visibly change, stop guessing and reassess.
 - If the user asks what is inside a local folder, verify the contents with a successful local listing/read step (prefer `filesystem`) after opening it. Never invent contents from failed commands or blind clicks.
 - Ignore unrelated remembered context, unrelated open tabs, and unrelated previous-run state. Never substitute a different website, account, or task just because it was used before.
 - Do not take unrelated extra actions after the goal is already satisfied.
@@ -59,6 +77,7 @@ You are Agentra, an autonomous AI agent with full access to a computer.
 - Never delete files unless explicitly asked.
 - Do not execute commands that could cause irreversible damage without warning.
 - Confirm destructive actions with the user before proceeding.
+- Never ask the user to paste passwords, verification codes, recovery codes, or payment details into plain chat. If a sensitive browser field needs input or submit confirmation, emit the intended browser step and let runtime hand control to the user.
 - You operate inside the workspace directory: {workspace_dir}
 
 ## Current goal guidance
@@ -159,6 +178,48 @@ _LOCAL_DOCUMENT_OPEN_TERMS = (
     "word",
     "excel",
 )
+_PATH_STYLE_LOCAL_TERMS = (
+    "/mnt/",
+    "c:\\",
+    "d:\\",
+    "e:\\",
+    "\\users\\",
+    "/users/",
+    "appdata",
+    "downloads",
+    "documents",
+    "desktop/",
+)
+_AUTH_PAGE_TERMS = (
+    "login",
+    "log in",
+    "sign in",
+    "signin",
+    "password",
+    "passkey",
+    "verify",
+    "verification",
+    "2fa",
+    "otp",
+    "captcha",
+    "auth",
+)
+_PAYMENT_PAGE_TERMS = (
+    "payment",
+    "checkout",
+    "billing",
+    "credit card",
+    "debit card",
+    "card number",
+    "cvv",
+    "cvc",
+    "expiry",
+    "pay ",
+)
+_DESKTOP_GUARDRAIL_PATTERNS = (
+    r"(?:^|[;,.]|\band\b|\bbut\b|\bama\b)\s*(?:masaustu(?:mdeki|ndeki)?|desktop|diger|baska|other|any)[^.;,]{0,120}?(?:pencere|uygulama|window|app)[^.;,]{0,120}?(?:dokunma|dokunmadan|elleme|mudahale etme|touch(?:ing)?|interact(?: with)?|mess with|use)",
+    r"(?:^|[;,.]|\band\b|\bbut\b|\bama\b)\s*(?:hicbir|diger|baska|other|any)[^.;,]{0,80}?(?:pencere|uygulama|window|app)[^.;,]{0,120}?(?:dokunma|dokunmadan|elleme|mudahale etme|touch(?:ing)?|interact(?: with)?|mess with|use)",
+)
 _GOAL_STOPWORDS = {
     "the",
     "and",
@@ -213,6 +274,13 @@ def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
     return any(phrase in text for phrase in phrases)
 
 
+def _desktop_detection_text(goal: str) -> str:
+    cleaned = _normalized_text(goal)
+    for pattern in _DESKTOP_GUARDRAIL_PATTERNS:
+        cleaned = re.sub(pattern, " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _goal_tokens(text: str) -> set[str]:
     normalized = _normalized_text(text)
     tokens = set(re.findall(r"[a-z0-9]{4,}", normalized))
@@ -220,16 +288,15 @@ def _goal_tokens(text: str) -> set[str]:
 
 
 def _goal_mentions_web_target(goal: str) -> bool:
-    normalized = _normalized_text(goal)
-    if re.search(r"https?://|www\.", normalized):
-        return True
-    if re.search(r"\b[a-z0-9-]+\.(com|org|net|io|ai|app|dev|co|tr)\b", normalized):
-        return True
-    return _contains_any_phrase(normalized, _WEB_TERMS)
+    return routing_goal_mentions_web_target(goal)
+
+
+def _goal_prefers_native_windows_desktop_execution(goal: str) -> bool:
+    return routing_goal_prefers_native_windows_desktop_execution(goal)
 
 
 def _goal_mentions_desktop_surface(goal: str) -> bool:
-    normalized = _normalized_text(goal)
+    normalized = _desktop_detection_text(goal)
     if re.search(r"\b[a-z]:\\", goal, flags=re.IGNORECASE):
         return True
     if "onedrive" in normalized:
@@ -238,14 +305,14 @@ def _goal_mentions_desktop_surface(goal: str) -> bool:
 
 
 def _goal_requires_visual_desktop_control(goal: str) -> bool:
-    normalized = _normalized_text(goal)
+    normalized = _desktop_detection_text(goal)
     if not _goal_mentions_desktop_surface(goal):
         return False
     return _contains_any_phrase(normalized, _VISUAL_DESKTOP_ACTION_TERMS)
 
 
 def _goal_has_local_desktop_component(goal: str) -> bool:
-    normalized = _normalized_text(goal)
+    normalized = _desktop_detection_text(goal)
     if not _goal_mentions_desktop_surface(goal):
         return False
     return (
@@ -260,6 +327,73 @@ def _goal_has_mixed_web_and_local_desktop_components(goal: str) -> bool:
     return _goal_mentions_web_target(goal) and _goal_has_local_desktop_component(goal)
 
 
+def _goal_is_browser_only(goal: str) -> bool:
+    return _goal_mentions_web_target(goal) and not _goal_has_local_desktop_component(goal)
+
+
+def _goal_mentions_sensitive_web_entry(goal: str) -> bool:
+    normalized = _normalized_text(goal)
+    phrases = (
+        "password",
+        "parola",
+        "sifre",
+        "verification code",
+        "dogrulama kodu",
+        "otp",
+        "2fa",
+        "credit card",
+        "kredi kart",
+        "payment",
+        "odeme",
+    )
+    return _contains_any_phrase(normalized, phrases)
+
+
+def _latest_successful_browser_entry(tool_history: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for entry in reversed(tool_history):
+        if entry.get("tool") == "browser" and entry.get("success"):
+            return entry
+    return None
+
+
+def _browser_manual_takeover_recorded(tool_history: list[dict[str, Any]]) -> bool:
+    return any(
+        entry.get("tool") == "browser" and entry.get("manual_takeover")
+        for entry in tool_history
+    )
+
+
+def _browser_page_takeover_kind(goal: str, tool_history: list[dict[str, Any]]) -> str | None:
+    if not (_goal_is_browser_only(goal) and _goal_mentions_sensitive_web_entry(goal)):
+        return None
+    if _browser_manual_takeover_recorded(tool_history):
+        return None
+    entry = _latest_successful_browser_entry(tool_history)
+    if entry is None:
+        return None
+    metadata = entry.get("metadata") or {}
+    page_text = _normalized_text(
+        " ".join(
+            filter(
+                None,
+                (
+                    str(metadata.get("active_url", "") or ""),
+                    str(metadata.get("active_title", "") or ""),
+                    str(metadata.get("extracted_text", "") or ""),
+                    str(entry.get("result", "") or ""),
+                ),
+            )
+        )
+    )
+    if not page_text:
+        return None
+    if _contains_any_phrase(page_text, _PAYMENT_PAGE_TERMS):
+        return "payment"
+    if _contains_any_phrase(page_text, _AUTH_PAGE_TERMS):
+        return "secret"
+    return None
+
+
 def _goal_is_desktop_local_only(goal: str) -> bool:
     return _goal_has_local_desktop_component(goal) and not _goal_mentions_web_target(goal)
 
@@ -267,13 +401,13 @@ def _goal_is_desktop_local_only(goal: str) -> bool:
 def _goal_requests_folder_contents(goal: str) -> bool:
     if not _goal_has_local_desktop_component(goal):
         return False
-    return _contains_any_phrase(_normalized_text(goal), _FOLDER_CONTENT_TERMS)
+    return _contains_any_phrase(_desktop_detection_text(goal), _FOLDER_CONTENT_TERMS)
 
 
 def _goal_requests_local_document_open(goal: str) -> bool:
     if not _goal_has_local_desktop_component(goal):
         return False
-    return _contains_any_phrase(_normalized_text(goal), _LOCAL_DOCUMENT_OPEN_TERMS)
+    return _contains_any_phrase(_desktop_detection_text(goal), _LOCAL_DOCUMENT_OPEN_TERMS)
 
 
 def _memory_entry_matches_goal(goal: str, text: str) -> bool:
@@ -330,6 +464,75 @@ def _has_successful_local_open(tool_history: list[dict[str, Any]]) -> bool:
         and str((entry.get("args") or {}).get("action", "")).lower() == "open_path"
         for entry in tool_history
     )
+
+
+def _has_successful_native_desktop_action(tool_history: list[dict[str, Any]]) -> bool:
+    return any(entry.get("success") and entry.get("tool") == "windows_desktop" for entry in tool_history)
+
+
+def _has_verified_native_desktop_action(tool_history: list[dict[str, Any]]) -> bool:
+    return any(
+        entry.get("success")
+        and entry.get("tool") == "windows_desktop"
+        and bool((entry.get("metadata") or {}).get("verified"))
+        for entry in tool_history
+    )
+
+
+def _has_failed_native_desktop_action(tool_history: list[dict[str, Any]]) -> bool:
+    return any(entry.get("tool") == "windows_desktop" and not entry.get("success") for entry in tool_history)
+
+
+def _canonical_windows_desktop_launch_target(
+    *,
+    app: str | None = None,
+    profile_id: str | None = None,
+) -> tuple[str | None, str | None]:
+    normalized_profile = str(profile_id or "").strip().lower()
+    requested_app = str(app or "").strip()
+    if not normalized_profile and requested_app:
+        normalized_profile = str(guess_windows_app_profile(requested_app) or "").strip().lower()
+
+    normalized_app = normalize_windows_app_command(requested_app) if requested_app else ""
+    if not normalized_app and normalized_profile:
+        profile = get_windows_app_profile(normalized_profile)
+        if profile is not None:
+            normalized_app = profile.executable
+
+    return (
+        normalized_profile or None,
+        normalized_app.casefold() or None,
+    )
+
+
+def _has_successful_windows_desktop_launch(
+    tool_history: list[dict[str, Any]],
+    *,
+    app: str | None = None,
+    profile_id: str | None = None,
+) -> bool:
+    desired_profile, desired_app = _canonical_windows_desktop_launch_target(
+        app=app,
+        profile_id=profile_id,
+    )
+    if desired_profile is None and desired_app is None:
+        return False
+
+    for entry in reversed(tool_history):
+        if not entry.get("success") or entry.get("tool") != "windows_desktop" or entry.get("manual_takeover"):
+            continue
+        args = entry.get("args") or {}
+        if str(args.get("action", "")).lower() != "launch_app":
+            continue
+        prior_profile, prior_app = _canonical_windows_desktop_launch_target(
+            app=str(args.get("app", "") or ""),
+            profile_id=str(args.get("profile_id", "") or ""),
+        )
+        if desired_profile and prior_profile and desired_profile == prior_profile:
+            return True
+        if desired_app and prior_app and desired_app == prior_app:
+            return True
+    return False
 
 
 def _has_excessive_desktop_click_guessing(
@@ -483,6 +686,39 @@ class AutonomousAgent:
                         )
                         done_content = self._extract_done_content(response.content)
                         if done_content is not None:
+                            pending_takeover_event = self._prepare_sensitive_page_takeover_event(
+                                goal,
+                                tool_history,
+                            )
+                            if pending_takeover_event is not None:
+                                yield pending_takeover_event
+                                await self.take_control()
+                                refresh_result = await self._call_tool("browser", {"action": "screenshot"})
+                                async for result_event in self._emit_tool_result_events("browser", refresh_result):
+                                    yield result_event
+                                refresh_metadata = dict(getattr(refresh_result, "metadata", {}) or {})
+                                tool_history.append(
+                                    {
+                                        "tool": "browser",
+                                        "args": {"action": "screenshot"},
+                                        "success": refresh_result.success,
+                                        "manual_takeover": True,
+                                        "takeover_kind": pending_takeover_event.get("takeover_kind", ""),
+                                        "metadata": refresh_metadata,
+                                        "result": str(refresh_result),
+                                    }
+                                )
+                                self._session.append(
+                                    LLMMessage(
+                                        role="user",
+                                        content=(
+                                            "Runtime paused at a sensitive browser page and handed control to the "
+                                            "user. The user has now resumed. Inspect the refreshed browser state "
+                                            "and continue."
+                                        ),
+                                    )
+                                )
+                                continue
                             desktop_guard_message = self._done_guard_message(
                                 goal,
                                 tool_history,
@@ -495,6 +731,18 @@ class AutonomousAgent:
                             yield {"type": "done", "content": done_content}
                             return
                         if not response.tool_calls:
+                            if self._is_sensitive_user_question(response.content):
+                                self._session.append(
+                                    LLMMessage(
+                                        role="user",
+                                        content=(
+                                            "Do not ask for passwords, verification codes, or payment details in plain chat. "
+                                            "Emit the intended browser tool step instead; runtime will pause and hand "
+                                            "control to the user when the step is sensitive."
+                                        ),
+                                    )
+                                )
+                                continue
                             question_event = self._prepare_question_event(response.content)
                             if question_event is not None:
                                 yield question_event
@@ -509,6 +757,7 @@ class AutonomousAgent:
                             await self._wait_until_resumed()
                             tool_name: str = tool_call["name"]
                             tool_args: dict[str, Any] = tool_call["arguments"]
+                            execution_args: dict[str, Any] = dict(tool_args)
                             tool_call_id: str = tool_call.get("id", tool_name)
 
                             yield {
@@ -552,7 +801,52 @@ class AutonomousAgent:
                                 )
                                 continue
 
-                            preview = await self._preview_tool(tool_name, tool_args)
+                            takeover_event = self._prepare_sensitive_takeover_event(tool_name, execution_args)
+                            if takeover_event is not None:
+                                yield takeover_event
+                                await self.take_control()
+
+                                if tool_name == "browser":
+                                    refresh_result = await self._call_tool("browser", {"action": "screenshot"})
+                                    async for result_event in self._emit_tool_result_events("browser", refresh_result):
+                                        yield result_event
+
+                                result = ToolResult(
+                                    success=True,
+                                    output=(
+                                        "User took over this sensitive browser step manually. "
+                                        "Inspect the refreshed page state before deciding the next action."
+                                    ),
+                                    metadata={
+                                        "summary": "Kullanıcı hassas tarayıcı adımını manuel tamamladı.",
+                                        "takeover_kind": takeover_event.get("takeover_kind", ""),
+                                    },
+                                )
+                                tool_history.append(
+                                    {
+                                        "tool": tool_name,
+                                        "args": dict(execution_args),
+                                        "success": True,
+                                        "manual_takeover": True,
+                                        "metadata": {
+                                            **dict(getattr(refresh_result, "metadata", {}) or {}),
+                                            "takeover_kind": takeover_event.get("takeover_kind", ""),
+                                        },
+                                        "result": str(result),
+                                    }
+                                )
+                                async for result_event in self._emit_tool_result_events(tool_name, result):
+                                    yield result_event
+                                tool_results.append(
+                                    LLMToolResult(
+                                        tool_call_id=tool_call_id,
+                                        name=tool_name,
+                                        content=str(result),
+                                        success=True,
+                                    )
+                                )
+                                break
+
                             approval_event = self._prepare_approval_event(tool_name, tool_args)
 
                             if approval_event is not None:
@@ -584,20 +878,84 @@ class AutonomousAgent:
                                     )
                                     continue
 
+                            secret_input_event = self._prepare_sensitive_input_event(tool_name, execution_args)
+                            if secret_input_event is not None:
+                                yield secret_input_event
+                                secret_value = await self._wait_for_user_answer(str(secret_input_event["request_id"]))
+                                execution_args = dict(execution_args)
+                                execution_args["text"] = secret_value
+
+                            preview = await self._preview_tool(tool_name, execution_args)
+
                             if preview:
                                 yield {
                                     "type": "visual_intent",
                                     "tool": tool_name,
-                                    "args": tool_args,
+                                    "args": execution_args,
                                     **preview,
                                 }
 
-                            result = await self._call_tool(tool_name, tool_args)
+                            result = await self._call_tool(tool_name, execution_args)
+                            desktop_takeover_event = self._prepare_desktop_takeover_event(
+                                tool_name,
+                                execution_args,
+                                result,
+                            )
+                            if desktop_takeover_event is not None:
+                                yield desktop_takeover_event
+                                await self.take_control()
+
+                                refresh_result = await self._call_tool(
+                                    "computer",
+                                    {"action": "screenshot"},
+                                    bypass_pause=True,
+                                )
+                                async for result_event in self._emit_tool_result_events("computer", refresh_result):
+                                    yield result_event
+
+                                result = ToolResult(
+                                    success=True,
+                                    output=(
+                                        "User manually stabilized the visible desktop. "
+                                        "Inspect the refreshed desktop state before deciding the next action."
+                                    ),
+                                    metadata={
+                                        "summary": "Kullanici masaustu hedefini manuel duzeltti.",
+                                        "manual_takeover": True,
+                                        "pause_kind": desktop_takeover_event.get("pause_kind", ""),
+                                    },
+                                )
+                                tool_history.append(
+                                    {
+                                        "tool": tool_name,
+                                        "args": dict(execution_args),
+                                        "success": True,
+                                        "manual_takeover": True,
+                                        "metadata": {
+                                            **dict(getattr(refresh_result, "metadata", {}) or {}),
+                                            "pause_kind": desktop_takeover_event.get("pause_kind", ""),
+                                        },
+                                        "result": str(result),
+                                    }
+                                )
+                                async for result_event in self._emit_tool_result_events(tool_name, result):
+                                    yield result_event
+                                result_text = str(result)
+                                tool_results.append(
+                                    LLMToolResult(
+                                        tool_call_id=tool_call_id,
+                                        name=tool_name,
+                                        content=result_text,
+                                        success=True,
+                                    )
+                                )
+                                break
                             tool_history.append(
                                 {
                                     "tool": tool_name,
-                                    "args": dict(tool_args),
+                                    "args": dict(execution_args),
                                     "success": result.success,
+                                    "metadata": dict(getattr(result, "metadata", {}) or {}),
                                     "result": str(result),
                                 }
                             )
@@ -702,7 +1060,15 @@ class AutonomousAgent:
         for tool in self.tools.values():
             binder = getattr(tool, "bind_runtime", None)
             if callable(binder):
-                binder(browser_sessions=browser_sessions, thread_id=thread_id)
+                kwargs = {
+                    "browser_sessions": browser_sessions,
+                    "thread_id": thread_id,
+                    "controller": controller,
+                    "scheduler": scheduler,
+                    "run_id": run_id,
+                }
+                accepted = inspect.signature(binder).parameters
+                binder(**{key: value for key, value in kwargs.items() if key in accepted})
 
     async def take_control(self) -> None:
         """Pause the agent and let the user take over."""
@@ -717,22 +1083,39 @@ class AutonomousAgent:
         return await self._call_tool(tool_name, args, bypass_pause=True)
 
     def _register_default_tools(self) -> None:
+        browser_tool = BrowserTool(
+            headless=self.config.browser_headless,
+            browser_type=self.config.browser_type,
+            identity=self.config.browser_identity,
+            profile_name=self.config.browser_profile_name,
+        )
+        filesystem_tool = FilesystemTool(
+            workspace_dir=self.config.workspace_dir,
+            allow_write=self.config.allow_filesystem_write,
+        )
+        windows_desktop_tool = WindowsDesktopTool()
+        local_system_tool = LocalSystemTool()
+        computer_tool = ComputerTool(allow=self.config.allow_computer_control)
+        terminal_tool = TerminalTool(
+            cwd=self.config.workspace_dir,
+            allow=self.config.allow_terminal,
+        )
+        git_tool = GitTool(workspace_dir=self.config.workspace_dir)
+
+        desktop_preference = str(self.config.desktop_backend_preference or "visible").lower()
+        if desktop_preference == "native":
+            ordered_desktop_tools = [windows_desktop_tool, local_system_tool, computer_tool]
+        elif desktop_preference == "under_the_hood":
+            ordered_desktop_tools = [local_system_tool, windows_desktop_tool, computer_tool]
+        else:
+            ordered_desktop_tools = [computer_tool, windows_desktop_tool, local_system_tool]
+
         tools: list[BaseTool] = [
-            BrowserTool(
-                headless=self.config.browser_headless,
-                browser_type=self.config.browser_type,
-            ),
-            FilesystemTool(
-                workspace_dir=self.config.workspace_dir,
-                allow_write=self.config.allow_filesystem_write,
-            ),
-            LocalSystemTool(),
-            ComputerTool(allow=self.config.allow_computer_control),
-            TerminalTool(
-                cwd=self.config.workspace_dir,
-                allow=self.config.allow_terminal,
-            ),
-            GitTool(workspace_dir=self.config.workspace_dir),
+            browser_tool,
+            filesystem_tool,
+            *ordered_desktop_tools,
+            terminal_tool,
+            git_tool,
         ]
         for tool in tools:
             self.tools[tool.name] = tool
@@ -789,7 +1172,111 @@ class AutonomousAgent:
             "request_id": request.request_id,
             "content": request.prompt,
             "summary": request.summary,
+            "response_kind": request.response_kind,
         }
+
+    def _prepare_sensitive_input_event(self, tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any] | None:
+        if tool_name != "browser" or self._runtime_controller is None:
+            return None
+        sensitive_kind = browser_sensitive_input_kind(
+            tool_args,
+            goal=self._goal,
+            permission_mode=self.config.permission_mode,
+        )
+        if sensitive_kind is None or str(tool_args.get("text", "")).strip():
+            return None
+        creator = getattr(self._runtime_controller, "create_question", None)
+        if not callable(creator):
+            return None
+        if sensitive_kind == "payment":
+            prompt = "Bu alan icin odeme bilgisini guvenli alanda paylasin."
+            summary = "Guvenli odeme bilgisi gerekiyor."
+        else:
+            prompt = "Bu alan icin gizli veya kimlik dogrulama bilgisini guvenli alanda paylasin."
+            summary = "Guvenli gizli bilgi gerekiyor."
+        request = creator(prompt, summary, response_kind="secret")
+        return {
+            "type": "question_requested",
+            "request_id": request.request_id,
+            "content": request.prompt,
+            "summary": request.summary,
+            "response_kind": request.response_kind,
+        }
+
+    def _prepare_sensitive_takeover_event(self, tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any] | None:
+        if tool_name != "browser" or self.config.browser_headless:
+            return None
+        takeover_kind = browser_sensitive_takeover_kind(
+            tool_args,
+            goal=self._goal,
+            permission_mode=self.config.permission_mode,
+        )
+        if takeover_kind is None:
+            return None
+        return self._make_sensitive_takeover_event(tool_args=tool_args, takeover_kind=takeover_kind)
+
+    def _prepare_sensitive_page_takeover_event(
+        self,
+        goal: str,
+        tool_history: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if self.config.browser_headless:
+            return None
+        takeover_kind = _browser_page_takeover_kind(goal, tool_history)
+        if takeover_kind is None:
+            return None
+        latest_browser_entry = _latest_successful_browser_entry(tool_history)
+        tool_args = dict(latest_browser_entry.get("args", {})) if latest_browser_entry is not None else {}
+        return self._make_sensitive_takeover_event(tool_args=tool_args, takeover_kind=takeover_kind)
+
+    def _make_sensitive_takeover_event(
+        self,
+        *,
+        tool_args: dict[str, Any],
+        takeover_kind: str,
+    ) -> dict[str, Any]:
+        if takeover_kind == "payment":
+            content = (
+                "Odeme veya hassas dogrulama adimini tarayicida manuel tamamlayin. "
+                "Bitince Finish Control ile ajani devam ettirin."
+            )
+        else:
+            content = (
+                "Parola, kod veya giris onayi gereken bu adimi tarayicida manuel tamamlayin. "
+                "Bitince Finish Control ile ajani devam ettirin."
+            )
+        return {
+            "type": "paused",
+            "tool": "browser",
+            "args": tool_args,
+            "content": content,
+            "summary": "Hassas tarayici adimi icin kontrol size devredildi.",
+            "pause_kind": "sensitive_browser_takeover",
+            "takeover_kind": takeover_kind,
+        }
+
+    @staticmethod
+    def _prepare_desktop_takeover_event(
+        tool_name: str,
+        tool_args: dict[str, Any],
+        result: ToolResult,
+    ) -> dict[str, Any] | None:
+        if tool_name not in {"computer", "windows_desktop"}:
+            return None
+        metadata = dict(getattr(result, "metadata", {}) or {})
+        if str(metadata.get("pause_kind", "")) != "desktop_control_takeover":
+            return None
+        return {
+            "type": "paused",
+            "tool": tool_name,
+            "args": dict(tool_args),
+            "content": str(metadata.get("content") or result.error or "Masaustu kontrolu size devredildi."),
+            "summary": str(metadata.get("summary") or "Masaustu kontrolu size devredildi."),
+            "pause_kind": "desktop_control_takeover",
+        }
+
+    def _is_sensitive_user_question(self, content: str) -> bool:
+        return content_requests_sensitive_input(content)
 
     async def _wait_for_user_answer(self, request_id: str) -> str:
         if self._runtime_controller is None:
@@ -799,24 +1286,6 @@ class AutonomousAgent:
             raise RuntimeError("Runtime controller does not support user answers.")
         return await waiter(request_id)
 
-    def _prepare_approval_event(self, tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any] | None:
-        reason = self._approval_reason(tool_name, tool_args)
-        if reason is None or self._runtime_controller is None:
-            return None
-        creator = getattr(self._runtime_controller, "create_approval", None)
-        if not callable(creator):
-            return None
-        summary = f"{tool_name} aracı için kullanıcı onayı gerekiyor."
-        request = creator(tool_name, tool_args, summary, reason)
-        return {
-            "type": "approval_requested",
-            "request_id": request.request_id,
-            "tool": tool_name,
-            "args": tool_args,
-            "reason": reason,
-            "summary": summary,
-        }
-
     async def _wait_for_approval(self, request_id: str) -> bool:
         if self._runtime_controller is None:
             return True
@@ -824,37 +1293,6 @@ class AutonomousAgent:
         if not callable(waiter):
             return True
         return await waiter(request_id)
-
-    async def _emit_tool_result_events(self, tool_name: str, result: ToolResult) -> AsyncIterator[dict[str, Any]]:
-        if result.screenshot_b64:
-            screenshot_event = {"type": "screenshot", "data": result.screenshot_b64}
-            screenshot_event.update(
-                {
-                    key: value
-                    for key, value in result.metadata.items()
-                    if key in {"focus_x", "focus_y", "frame_label", "summary"}
-                }
-            )
-            await self.memory.add(
-                f"Screenshot after {tool_name}",
-                role="observation",
-                screenshot_b64=result.screenshot_b64,
-            )
-            yield screenshot_event
-
-        result_text = str(result)
-        await self.memory.add(result_text, role="observation")
-        tool_result_event = {
-            "type": "tool_result",
-            "tool": tool_name,
-            "result": result_text,
-            "success": result.success,
-        }
-        if result.metadata:
-            tool_result_event["metadata"] = result.metadata
-            if result.metadata.get("summary"):
-                tool_result_event["summary"] = result.metadata["summary"]
-        yield tool_result_event
 
     @asynccontextmanager
     async def _reserve_tool(self, tool: BaseTool):
@@ -880,6 +1318,14 @@ class AutonomousAgent:
             workspace_dir=self.config.workspace_dir,
             goal_guidance=self._goal_guidance(goal),
         )
+        if self.config.permission_mode == "full":
+            content += (
+                "\n\n## Full permission mode\n"
+                "- This run can use the user's real Chrome profile and local installed apps when helpful.\n"
+                "- For browser passwords, verification codes, payment details, and their immediate submit steps, pause and hand control to the user instead of collecting the value yourself.\n"
+                "- Purchases, money movement, account deletion, and similarly irreversible external actions still need explicit approval.\n"
+                "- Prefer the smarter real-environment path when the goal depends on the user's actual account or local app context.\n"
+            )
         return LLMMessage(role="system", content=content)
 
     def _goal_guidance(self, goal: str) -> str:
@@ -923,6 +1369,31 @@ class AutonomousAgent:
                         "1) resolve the Desktop path with `local_system`, 2) locate the exact folder "
                         "or file with `filesystem`, 3) open the confirmed item with "
                         "`local_system open_path`."
+                    )
+                return guidance
+            if self._should_prefer_native_desktop_execution(goal):
+                guidance = (
+                    "This goal targets a standard Windows desktop app. Prefer `windows_desktop` "
+                    "first: launch or focus the app, interact through native Windows automation, "
+                    "and verify the result after each step. Use `computer` only if native Windows "
+                    "automation cannot resolve the target control or the app is clearly custom-rendered."
+                )
+                if _goal_has_mixed_web_and_local_desktop_components(goal):
+                    guidance = (
+                        "This goal has both web and Windows desktop app steps. Use `browser` for the "
+                        "website part first, then switch to `windows_desktop` for the standard Windows "
+                        "app step. Do not say DONE after only the browser step."
+                    )
+                if "hesap makinesi" in _normalized_text(goal):
+                    guidance += (
+                        " For Calculator tasks, use `windows_desktop` to launch/focus Calculator, "
+                        "send the expression as keys, then call `read_status` with the expected "
+                        "result before you say DONE."
+                    )
+                if "not defteri" in _normalized_text(goal) or "notepad" in _normalized_text(goal):
+                    guidance += (
+                        " For Notepad tasks, prefer `set_text`, `type_keys`, `read_window_text`, and "
+                        "keyboard shortcuts through `windows_desktop` instead of visible clicking."
                     )
                 return guidance
             if _goal_has_mixed_web_and_local_desktop_components(goal):
@@ -972,10 +1443,20 @@ class AutonomousAgent:
                 "desktop/UI step, and only use `browser` for an explicitly requested website."
             )
         if _goal_mentions_web_target(goal):
-            return (
-                "This goal is web-oriented. Prefer `browser` for website actions and ignore "
-                "unrelated desktop or previous-run context."
+            guidance = (
+                "This goal is web-oriented. Use `browser` for the website actions and do not "
+                "switch to `computer` or other local desktop tools unless the user explicitly "
+                "asks for a local app, folder, or on-screen desktop step. Ignore unrelated "
+                "desktop or previous-run context."
             )
+            if _goal_is_browser_only(goal) and _goal_mentions_sensitive_web_entry(goal):
+                guidance += (
+                    " When the user asks you to reach a login/payment page, find a repo/account page, "
+                    "or attempt a sensitive entry, the task is complete once you reach the requested "
+                    "page and the user manually completes, skips, or declines the sensitive step. Do not "
+                    "keep iterating after that point."
+                )
+            return guidance
         return (
             "Pick the tool that directly matches the user's requested environment, and ignore "
             "unrelated memories or stale browser state."
@@ -986,6 +1467,15 @@ class AutonomousAgent:
             self.config.local_execution_mode == "under_the_hood"
             and _goal_has_local_desktop_component(goal)
         )
+
+    def _uses_native_desktop_execution(self, goal: str) -> bool:
+        return (
+            self.config.local_execution_mode == "native"
+            and _goal_has_local_desktop_component(goal)
+        )
+
+    def _should_prefer_native_desktop_execution(self, goal: str) -> bool:
+        return self._uses_native_desktop_execution(goal) or _goal_prefers_native_windows_desktop_execution(goal)
 
     def _desktop_path_guidance(self) -> str:
         workspace_text = str(self.config.workspace_dir).replace("\\", "/")
@@ -1027,29 +1517,6 @@ class AutonomousAgent:
         )
         return any(trigger in lowered for trigger in triggers)
 
-    @staticmethod
-    def _approval_reason(tool_name: str, tool_args: dict[str, Any]) -> str | None:
-        lowered = jsonless(tool_args)
-        if tool_name == "browser":
-            action = str(tool_args.get("action", "")).lower()
-            if action == "type" and any(token in lowered for token in ("password", "otp", "2fa", "captcha", "secret", "token")):
-                return "Secret or authentication data entry requires user approval."
-            if action in {"click", "type"} and any(token in lowered for token in ("submit", "post", "send", "share", "publish", "apply", "checkout", "pay", "confirm", "delete", "remove")):
-                return "This browser action may publish, submit, send, or otherwise have external effects."
-        if tool_name == "terminal":
-            if any(token in lowered for token in ("pip install", "npm install", "apt ", "brew ", "rm ", "del ", "git push", "shutdown", "restart")):
-                return "This terminal command may install software or perform important side effects."
-        if tool_name == "filesystem":
-            if str(tool_args.get("action", "")).lower() in {"delete", "move"}:
-                return "This filesystem action changes or removes existing files."
-        if tool_name == "git":
-            if str(tool_args.get("action", "")).lower() in {"reset", "checkout", "clone"}:
-                return "This git action can rewrite or materially change workspace state."
-        if tool_name == "computer":
-            if str(tool_args.get("action", "")).lower() != "screenshot":
-                return "Direct desktop control requires explicit user approval."
-        return None
-
     def _prepare_approval_event(self, tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any] | None:
         if self._runtime_controller is None:
             return None
@@ -1060,6 +1527,7 @@ class AutonomousAgent:
                 goal=self._goal,
                 thread_id=self._thread_id,
                 run_id=self._run_id,
+                permission_mode=self.config.permission_mode,
             )
         )
         if decision.action != "require_approval":
@@ -1094,6 +1562,12 @@ class AutonomousAgent:
         successful_tools_used: set[str],
         tool_history: list[dict[str, Any]],
     ) -> str | None:
+        if tool_name == "computer" and _goal_is_browser_only(goal):
+            return (
+                "This is a browser-only website task. Do not use the computer tool or visible "
+                "desktop automation. Stay in `browser`, and if the website flow is blocked there, "
+                "explain the blocker or ask the user instead of taking over the desktop."
+            )
         if tool_name == "browser":
             if "computer" in successful_tools_used:
                 return None
@@ -1107,16 +1581,47 @@ class AutonomousAgent:
                         "`local_system` plus `filesystem` to resolve and open the requested local "
                         "folder or file instead of using the browser."
                     )
+                if self._should_prefer_native_desktop_execution(goal):
+                    return (
+                        "This is a standard Windows desktop app task, not a web task. Use "
+                        "`windows_desktop` first, then fall back to `computer` only if native "
+                        "Windows automation cannot resolve the target."
+                    )
                 return (
                     "This goal is a local desktop/folder task. Use the computer tool to open the "
                     "requested folder or window on screen before using the browser."
                 )
             return None
+        if tool_name == "windows_desktop" and not _goal_has_local_desktop_component(goal):
+            return (
+                "Use `windows_desktop` only for Windows desktop app tasks. For browser-only goals, "
+                "stay in `browser`."
+            )
+        if tool_name == "windows_desktop":
+            action = str(tool_args.get("action", "")).lower()
+            if action == "launch_app" and _has_successful_windows_desktop_launch(
+                tool_history,
+                app=str(tool_args.get("app", "") or ""),
+                profile_id=str(tool_args.get("profile_id", "") or ""),
+            ):
+                return (
+                    "You already launched this Windows app in this run. Do not open another instance. "
+                    "Use `focus_window`, `list_windows`, `read_window_text`, or `read_status` to recover "
+                    "the existing app instead."
+                )
         if tool_name == "local_system" and self._uses_under_the_hood_local_execution(goal):
             action = str(tool_args.get("action", "")).lower()
             if action == "open_path" and not str(tool_args.get("path", "") or "").strip():
                 return "Resolve the exact local file or folder path before calling `local_system open_path`."
             return None
+        if tool_name == "local_system" and _goal_has_local_desktop_component(goal):
+            action = str(tool_args.get("action", "")).lower()
+            if action == "launch_app" and self._should_prefer_native_desktop_execution(goal):
+                return (
+                    "This is a standard Windows desktop app task. Do not use `local_system launch_app` "
+                    "as the primary path. Use `windows_desktop` `launch_app` or `focus_window` first, "
+                    "then verify the app state before considering any fallback."
+                )
         if tool_name == "terminal" and _goal_has_local_desktop_component(goal):
             command = str(tool_args.get("command", "") or "")
             lowered_command = command.casefold()
@@ -1148,6 +1653,12 @@ class AutonomousAgent:
                     "`local_system` and `filesystem`, then open the confirmed item with "
                     "`local_system open_path`. If you still cannot continue confidently, ask the "
                     "user instead of using the computer tool."
+                )
+            if self._should_prefer_native_desktop_execution(goal) and not _has_failed_native_desktop_action(tool_history):
+                return (
+                    "This run is configured for native Windows desktop automation. Use "
+                    "`windows_desktop` first for the standard app step, and only fall back to "
+                    "`computer` after a concrete native failure or an unsupported custom-rendered UI."
                 )
             if _recent_repeated_desktop_click(tool_args, tool_history):
                 return (
@@ -1191,7 +1702,22 @@ class AutonomousAgent:
                     "actual folder or file path with `filesystem` before you finish."
                 )
             return None
-        if _goal_has_local_desktop_component(goal) and "computer" not in successful_tools_used:
+        if self._should_prefer_native_desktop_execution(goal) and not _has_successful_native_desktop_action(tool_history):
+            return (
+                "This standard Windows app task is not complete yet. Use `windows_desktop` to "
+                "launch or focus the target app and verify the requested outcome before you say DONE."
+            )
+        if self._should_prefer_native_desktop_execution(goal) and "hesap makinesi" in _normalized_text(goal):
+            if not _has_verified_native_desktop_action(tool_history):
+                return (
+                    "Calculator tasks are complete only after the result is verified from the app. "
+                    "Use `windows_desktop` `read_status` with the expected value before you say DONE."
+                )
+        if (
+            _goal_has_local_desktop_component(goal)
+            and "computer" not in successful_tools_used
+            and not self._should_prefer_native_desktop_execution(goal)
+        ):
             if _goal_has_mixed_web_and_local_desktop_components(goal):
                 return (
                     "This goal also includes a local desktop/UI step. A completed website step does "
@@ -1356,8 +1882,3 @@ class AutonomousAgent:
                     await result
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Tool shutdown failed for %s: %s", tool.name, exc)
-
-
-def jsonless(value: dict[str, Any]) -> str:
-    """Collapse dict values into a lowercase string for lightweight heuristics."""
-    return " ".join(str(item).lower() for item in value.values())

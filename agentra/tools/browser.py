@@ -11,6 +11,7 @@ from agentra.tools.base import BaseTool, ToolResult
 
 _DEFAULT_FOCUS = (0.74, 0.2)
 _LIVE_REFRESH_INTERVALS = (0.2, 0.35)
+_SELECTOR_FOCUS_TIMEOUT_SECONDS = 0.75
 
 
 class BrowserTool(BaseTool):
@@ -32,9 +33,13 @@ class BrowserTool(BaseTool):
         self,
         headless: bool = False,
         browser_type: Literal["chromium", "firefox", "webkit"] = "chromium",
+        identity: Literal["isolated", "chrome_profile"] = "isolated",
+        profile_name: str = "Default",
     ) -> None:
         self._headless = headless
         self._browser_type = browser_type
+        self._identity = identity
+        self._profile_name = profile_name or "Default"
         self._playwright: Any = None
         self._browser: Any = None
         self._page: Any = None
@@ -83,6 +88,8 @@ class BrowserTool(BaseTool):
                 thread_id=self._thread_id,
                 browser_type=self._browser_type,
                 headless=self._headless,
+                identity=self._identity,
+                profile_name=self._profile_name,
             )
             snapshot = session.snapshot()
             if snapshot.active:
@@ -153,9 +160,15 @@ class BrowserTool(BaseTool):
                 thread_id=self._thread_id,
                 browser_type=self._browser_type,
                 headless=self._headless,
+                identity=self._identity,
+                profile_name=self._profile_name,
             )
             return await session.execute(**kwargs)
         action: str = kwargs.get("action", "")
+        capture_result_screenshot = bool(kwargs.get("capture_result_screenshot", True))
+        capture_follow_up_screenshots = bool(
+            kwargs.get("capture_follow_up_screenshots", capture_result_screenshot)
+        )
         for attempt in range(2):
             try:
                 await self._ensure_started()
@@ -163,12 +176,25 @@ class BrowserTool(BaseTool):
                     return await self._navigate(kwargs.get("url", ""))
                 if action == "click":
                     return await self._click(
-                        kwargs.get("selector"), kwargs.get("x"), kwargs.get("y")
+                        kwargs.get("selector"),
+                        kwargs.get("x"),
+                        kwargs.get("y"),
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
                     )
                 if action == "type":
-                    return await self._type(kwargs.get("selector"), kwargs.get("text", ""))
+                    return await self._type(
+                        kwargs.get("selector"),
+                        kwargs.get("text", ""),
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
+                    )
                 if action == "key":
-                    return await self._key(kwargs.get("key", ""))
+                    return await self._key(
+                        kwargs.get("key", ""),
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
+                    )
                 if action == "drag":
                     return await self._drag(
                         kwargs.get("start_x"),
@@ -176,10 +202,16 @@ class BrowserTool(BaseTool):
                         kwargs.get("end_x"),
                         kwargs.get("end_y"),
                         kwargs.get("steps", 14),
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
                     )
                 if action == "scroll":
                     return await self._scroll(
-                        kwargs.get("x", 0), kwargs.get("y", 0), kwargs.get("delta_y", 500)
+                        kwargs.get("x", 0),
+                        kwargs.get("y", 0),
+                        kwargs.get("delta_y", 500),
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
                     )
                 if action == "screenshot":
                     return await self._screenshot()
@@ -192,21 +224,25 @@ class BrowserTool(BaseTool):
                     return ToolResult(success=True, output="Waited.")
                 if action == "back":
                     await self._page.go_back()
-                    return await self._capture_visual_state(
+                    return await self._action_result(
                         output="Navigated back.",
                         frame_label="browser · back",
                         summary="Going back",
                         focus=self._default_focus(),
                         burst=True,
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
                     )
                 if action == "forward":
                     await self._page.go_forward()
-                    return await self._capture_visual_state(
+                    return await self._action_result(
                         output="Navigated forward.",
                         frame_label="browser · forward",
                         summary="Going forward",
                         focus=self._default_focus(),
                         burst=True,
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
                     )
                 if action == "new_tab":
                     self._page = await self._browser.new_page()
@@ -241,6 +277,8 @@ class BrowserTool(BaseTool):
                 thread_id=self._thread_id,
                 browser_type=self._browser_type,
                 headless=self._headless,
+                identity=self._identity,
+                profile_name=self._profile_name,
             )
             return await session.preview(**kwargs)
         """Return visual metadata before a browser action is executed."""
@@ -358,58 +396,84 @@ class BrowserTool(BaseTool):
         selector: Optional[str],
         x: Optional[float],
         y: Optional[float],
+        *,
+        capture_result_screenshot: bool = True,
+        capture_follow_up_screenshots: bool = True,
     ) -> ToolResult:
         if selector:
             focus = await self._selector_focus(selector)
             await self._page.click(selector, timeout=5000)
-            return await self._capture_visual_state(
+            return await self._action_result(
                 output=f"Clicked {selector!r}",
                 frame_label="browser · click",
                 summary=f"Clicking {selector}",
                 focus=focus,
                 burst=True,
+                capture_result_screenshot=capture_result_screenshot,
+                capture_follow_up_screenshots=capture_follow_up_screenshots,
             )
         if x is not None and y is not None:
             await self._page.mouse.click(x, y)
-            return await self._capture_visual_state(
+            return await self._action_result(
                 output=f"Clicked ({x}, {y})",
                 frame_label="browser · click",
                 summary="Clicking the page",
                 focus=(x, y),
                 burst=True,
+                capture_result_screenshot=capture_result_screenshot,
+                capture_follow_up_screenshots=capture_follow_up_screenshots,
             )
         return ToolResult(success=False, error="Provide selector or x,y coordinates.")
 
-    async def _type(self, selector: Optional[str], text: str) -> ToolResult:
+    async def _type(
+        self,
+        selector: Optional[str],
+        text: str,
+        *,
+        capture_result_screenshot: bool = True,
+        capture_follow_up_screenshots: bool = True,
+    ) -> ToolResult:
         if selector:
             focus = await self._selector_focus(selector)
             await self._page.fill(selector, text)
-            return await self._capture_visual_state(
+            return await self._action_result(
                 output=f"Typed into {selector!r}",
                 frame_label="browser · type",
                 summary=f"Typing into {selector}",
                 focus=focus,
                 burst=True,
+                capture_result_screenshot=capture_result_screenshot,
+                capture_follow_up_screenshots=capture_follow_up_screenshots,
             )
         await self._page.keyboard.type(text)
-        return await self._capture_visual_state(
+        return await self._action_result(
             output="Typed text.",
             frame_label="browser · type",
             summary="Typing text",
             focus=self._default_focus(y=0.56),
             burst=True,
+            capture_result_screenshot=capture_result_screenshot,
+            capture_follow_up_screenshots=capture_follow_up_screenshots,
         )
 
-    async def _key(self, key: str) -> ToolResult:
+    async def _key(
+        self,
+        key: str,
+        *,
+        capture_result_screenshot: bool = True,
+        capture_follow_up_screenshots: bool = True,
+    ) -> ToolResult:
         if not key:
             return ToolResult(success=False, error="key is required for 'key'")
         await self._page.keyboard.press(key)
-        return await self._capture_visual_state(
+        return await self._action_result(
             output=f"Pressed {key!r}.",
             frame_label="browser · key",
             summary=self._key_summary(key),
             focus=self._default_focus(y=0.56),
             burst=True,
+            capture_result_screenshot=capture_result_screenshot,
+            capture_follow_up_screenshots=capture_follow_up_screenshots,
         )
 
     async def _drag(
@@ -419,6 +483,9 @@ class BrowserTool(BaseTool):
         end_x: float | None,
         end_y: float | None,
         steps: int | None,
+        *,
+        capture_result_screenshot: bool = True,
+        capture_follow_up_screenshots: bool = True,
     ) -> ToolResult:
         if None in {start_x, start_y, end_x, end_y}:
             return ToolResult(success=False, error="start_x, start_y, end_x, and end_y are required for 'drag'")
@@ -427,23 +494,35 @@ class BrowserTool(BaseTool):
         await self._page.mouse.down()
         await self._page.mouse.move(float(end_x), float(end_y), steps=drag_steps)
         await self._page.mouse.up()
-        return await self._capture_visual_state(
+        return await self._action_result(
             output=f"Dragged ({start_x}, {start_y}) to ({end_x}, {end_y})",
             frame_label="browser · drag",
             summary="Dragging on the page",
             focus=(float(end_x), float(end_y)),
             burst=True,
+            capture_result_screenshot=capture_result_screenshot,
+            capture_follow_up_screenshots=capture_follow_up_screenshots,
         )
 
-    async def _scroll(self, x: float, y: float, delta_y: float) -> ToolResult:
+    async def _scroll(
+        self,
+        x: float,
+        y: float,
+        delta_y: float,
+        *,
+        capture_result_screenshot: bool = True,
+        capture_follow_up_screenshots: bool = True,
+    ) -> ToolResult:
         await self._page.mouse.wheel(delta_x=0, delta_y=delta_y)
         focus = (x, y) if x or y else self._default_focus(y=0.78)
-        return await self._capture_visual_state(
+        return await self._action_result(
             output=f"Scrolled {delta_y}px",
             frame_label="browser · scroll",
             summary="Scrolling the page",
             focus=focus,
             burst=True,
+            capture_result_screenshot=capture_result_screenshot,
+            capture_follow_up_screenshots=capture_follow_up_screenshots,
         )
 
     async def _screenshot(self) -> ToolResult:
@@ -452,6 +531,37 @@ class BrowserTool(BaseTool):
             frame_label="browser · screenshot",
             summary="Capturing a screenshot",
             focus=self._default_focus(),
+        )
+
+    async def _action_result(
+        self,
+        *,
+        output: str,
+        frame_label: str,
+        summary: str,
+        focus: tuple[float, float],
+        burst: bool = False,
+        capture_result_screenshot: bool = True,
+        capture_follow_up_screenshots: bool = True,
+    ) -> ToolResult:
+        if capture_result_screenshot:
+            return await self._capture_visual_state(
+                output=output,
+                frame_label=frame_label,
+                summary=summary,
+                focus=focus,
+                burst=burst and capture_follow_up_screenshots,
+            )
+        focus_x, focus_y = self._normalize_focus(*focus)
+        return ToolResult(
+            success=True,
+            output=output,
+            metadata={
+                "focus_x": focus_x,
+                "focus_y": focus_y,
+                "frame_label": frame_label,
+                "summary": summary,
+            },
         )
 
     async def _get_text(self, selector: Optional[str]) -> ToolResult:
@@ -567,8 +677,7 @@ class BrowserTool(BaseTool):
         return False
 
     async def _selector_focus(self, selector: str) -> tuple[float, float]:
-        locator = self._page.locator(selector).first
-        box = await locator.bounding_box()
+        box = await self._selector_box(selector)
         if box:
             return (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
         return self._default_focus()
@@ -576,11 +685,23 @@ class BrowserTool(BaseTool):
     async def _selector_focus_normalized(self, selector: str) -> tuple[float, float]:
         if self._page is None:
             return self._default_focus_normalized()
-        locator = self._page.locator(selector).first
-        box = await locator.bounding_box()
+        box = await self._selector_box(selector)
         if box:
             return self._normalize_focus(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
         return self._default_focus_normalized()
+
+    async def _selector_box(self, selector: str) -> dict[str, float] | None:
+        if self._page is None:
+            return None
+        locator = self._page.locator(selector).first
+        try:
+            box = await asyncio.wait_for(
+                locator.bounding_box(),
+                timeout=_SELECTOR_FOCUS_TIMEOUT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        return box
 
     def _normalize_focus(self, x: float, y: float) -> tuple[float, float]:
         size = self._page.viewport_size or {"width": 1280, "height": 720}

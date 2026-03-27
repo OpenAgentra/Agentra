@@ -13,13 +13,22 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 
-from agentra.approval_policy import ApprovalPolicyEngine
+from agentra.approval_policy import (
+    REDACTED_PLACEHOLDER,
+    ApprovalPolicyEngine,
+    redact_tool_args_for_storage,
+)
 from agentra.browser_runtime import BrowserSessionManager, LiveBrowserFrame
 from agentra.config import AgentConfig
+from agentra.desktop_automation.preview_windows import PreviewWindowManager
 from agentra.llm.registry import get_provider_spec
 from agentra.logging_utils import exception_details_with_context
 from agentra.run_report import RunReport
-from agentra.task_routing import choose_live_execution_policy
+from agentra.task_routing import (
+    choose_live_execution_policy,
+    goal_mentions_web_target,
+    goal_requests_real_browser_context,
+)
 
 RunSnapshot = dict[str, Any]
 EventPayload = dict[str, Any]
@@ -34,6 +43,43 @@ def _now_iso() -> str:
 def _slugify(value: str, *, default: str = "thread") -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug or default
+
+
+def _sanitize_tool_args_for_storage(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    *,
+    goal: str = "",
+    permission_mode: str = "default",
+) -> dict[str, Any]:
+    sanitized = redact_tool_args_for_storage(
+        tool_name,
+        tool_args,
+        goal=goal,
+        permission_mode=permission_mode,
+    )
+    if isinstance(sanitized, dict):
+        sanitized.pop("capture_result_screenshot", None)
+        sanitized.pop("capture_follow_up_screenshots", None)
+    return sanitized
+
+
+def _sanitize_event_for_storage(
+    event: dict[str, Any],
+    *,
+    goal: str,
+    permission_mode: str,
+) -> dict[str, Any]:
+    payload = dict(event)
+    tool_name = str(payload.get("tool", ""))
+    if isinstance(payload.get("args"), dict):
+        payload["args"] = _sanitize_tool_args_for_storage(
+            tool_name,
+            payload["args"],
+            goal=goal,
+            permission_mode=permission_mode,
+        )
+    return payload
 
 
 @dataclass
@@ -61,10 +107,12 @@ class UserInputRequest:
     request_id: str
     prompt: str
     summary: str
+    response_kind: str = "text"
     status: str = "pending"
     created_at: str = field(default_factory=_now_iso)
     responded_at: str | None = None
     answer: str | None = None
+    answer_redacted: bool = False
 
 
 @dataclass
@@ -116,6 +164,10 @@ class ThreadSession:
     question_requests: dict[str, UserInputRequest] = field(default_factory=dict)
     human_actions: list[HumanAction] = field(default_factory=list)
     controller: "ThreadRuntimeController | None" = None
+    stored_runs: list[dict[str, Any]] = field(default_factory=list)
+    recovered_from_disk: bool = False
+    restart_required: bool = False
+    restart_notice: str = ""
 
 
 class ExecutionScheduler:
@@ -154,27 +206,62 @@ class WorkspaceLedger:
         self.audit_path = thread_dir / "audit.jsonl"
         self.thread_dir.mkdir(parents=True, exist_ok=True)
 
-    def write_snapshot(self, thread: ThreadSession, runs: list[RunSession], *, browser: dict[str, Any] | None = None) -> None:
+    def write_snapshot(
+        self,
+        thread: ThreadSession,
+        runs: list[RunSession] | list[dict[str, Any]],
+        *,
+        browser: dict[str, Any] | None = None,
+    ) -> None:
+        run_entries: list[dict[str, Any]] = []
+        for item in runs:
+            if isinstance(item, RunSession):
+                run_entries.append(
+                    {
+                        "run_id": item.run_id,
+                        "goal": item.goal,
+                        "status": item.status,
+                        "permission_mode": item.config.permission_mode,
+                        "local_execution_mode": item.config.local_execution_mode,
+                        "desktop_execution_mode": item.config.desktop_execution_mode,
+                        "desktop_backend_preference": item.config.desktop_backend_preference,
+                        "started_at": item.started_at,
+                        "finished_at": item.finished_at,
+                        "report_path": str(item.report.html_path),
+                    }
+                )
+                continue
+            record = dict(item)
+            run_entries.append(
+                {
+                    "run_id": str(record.get("run_id", "")),
+                    "goal": str(record.get("goal", "")),
+                    "status": str(record.get("status", "running") or "running"),
+                    "permission_mode": str(record.get("permission_mode", thread.config.permission_mode)),
+                    "local_execution_mode": str(record.get("local_execution_mode", "")),
+                    "desktop_execution_mode": str(record.get("desktop_execution_mode", "")),
+                    "desktop_backend_preference": str(record.get("desktop_backend_preference", "")),
+                    "started_at": str(record.get("started_at", "")),
+                    "finished_at": record.get("finished_at"),
+                    "report_path": str(record.get("report_path", "")),
+                }
+            )
         payload = {
             "thread_id": thread.thread_id,
             "title": thread.title,
             "status": thread.status,
             "handoff_state": thread.handoff_state,
+            "permission_mode": thread.config.permission_mode,
+            "browser_identity": thread.config.browser_identity,
+            "browser_profile_name": thread.config.browser_profile_name,
             "created_at": thread.created_at,
             "current_run_id": thread.current_run_id,
             "workspace_dir": str(thread.workspace_dir),
             "memory_dir": str(thread.memory_dir),
             "long_term_memory_dir": str(thread.long_term_memory_dir),
             "runs": [
-                {
-                    "run_id": run.run_id,
-                    "goal": run.goal,
-                    "status": run.status,
-                    "started_at": run.started_at,
-                    "finished_at": run.finished_at,
-                    "report_path": str(run.report.html_path),
-                }
-                for run in runs
+                dict(item)
+                for item in run_entries
             ],
             "approvals": [asdict(item) for item in thread.approval_requests.values()],
             "questions": [asdict(item) for item in thread.question_requests.values()],
@@ -225,15 +312,23 @@ class ThreadRuntimeController:
         self._resume_event.set()
         self._approval_futures: dict[str, asyncio.Future[bool]] = {}
         self._question_futures: dict[str, asyncio.Future[str]] = {}
+        self._preview_window_manager = PreviewWindowManager()
 
     async def wait_until_resumed(self) -> None:
         await self._resume_event.wait()
 
     def pause(self) -> None:
         self._resume_event.clear()
+        self.restore_preview_windows()
 
     def resume(self) -> None:
         self._resume_event.set()
+
+    def prepare_for_visible_desktop_action(self) -> dict[str, Any] | None:
+        return self._preview_window_manager.prepare_for_visible_desktop_action()
+
+    def restore_preview_windows(self) -> int:
+        return self._preview_window_manager.restore_preview_windows()
 
     def create_approval(
         self,
@@ -268,11 +363,16 @@ class ThreadRuntimeController:
             return
         future.set_result(bool(approved))
 
-    def create_question(self, prompt: str, summary: str) -> UserInputRequest:
+    def create_question(self, prompt: str, summary: str, *, response_kind: str = "text") -> UserInputRequest:
         request_id = f"question-{self.thread_id}-{len(self._question_futures) + 1:03d}"
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._question_futures[request_id] = future
-        return UserInputRequest(request_id=request_id, prompt=prompt, summary=summary)
+        return UserInputRequest(
+            request_id=request_id,
+            prompt=prompt,
+            summary=summary,
+            response_kind=response_kind,
+        )
 
     async def wait_for_answer(self, request_id: str) -> str:
         future = self._question_futures[request_id]
@@ -305,10 +405,12 @@ class ThreadManager:
         self._threads: dict[str, ThreadSession] = {}
         self._runs: dict[str, RunSession] = {}
         self._run_to_thread: dict[str, str] = {}
+        self._persisted_run_artifacts: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._threads_root = self.base_config.workspace_dir / ".threads"
         self._registry_path = self._threads_root / "registry.json"
         self._threads_root.mkdir(parents=True, exist_ok=True)
+        self._restore_threads_from_disk()
 
     @property
     def active_run_id(self) -> str | None:
@@ -320,6 +422,146 @@ class ThreadManager:
             return None
         active.sort(key=lambda run: run.started_at)
         return active[-1].run_id
+
+    def _restore_threads_from_disk(self) -> None:
+        thread_dirs: dict[str, Path] = {}
+        if self._registry_path.exists():
+            try:
+                payload = json.loads(self._registry_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = []
+            for item in payload if isinstance(payload, list) else []:
+                thread_id = str(item.get("thread_id", "")).strip()
+                if thread_id:
+                    thread_dirs[thread_id] = self._threads_root / thread_id
+        for candidate in sorted(self._threads_root.glob("*/ledger.json")):
+            thread_dirs.setdefault(candidate.parent.name, candidate.parent)
+        for thread_id, thread_dir in thread_dirs.items():
+            ledger_path = thread_dir / "ledger.json"
+            if not ledger_path.exists():
+                continue
+            try:
+                payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                logger.debug("Skipping unreadable thread ledger thread_id=%s", thread_id, exc_info=True)
+                continue
+            restored = self._thread_from_ledger(thread_dir, payload)
+            if restored is None:
+                continue
+            self._threads[restored.thread_id] = restored
+            self.browser_sessions.note_thread_browser_defaults(
+                restored.thread_id,
+                identity=restored.config.browser_identity,
+                profile_name=restored.config.browser_profile_name,
+            )
+            self.browser_sessions.restore_thread_snapshot(restored.thread_id, payload.get("browser"))
+            for run_record in restored.stored_runs:
+                self._remember_persisted_run(restored.thread_id, run_record)
+
+    def _thread_from_ledger(self, thread_dir: Path, payload: dict[str, Any]) -> ThreadSession | None:
+        thread_id = str(payload.get("thread_id", thread_dir.name)).strip()
+        if not thread_id:
+            return None
+        stored_runs = [dict(item) for item in payload.get("runs", []) if isinstance(item, dict)]
+        run_ids = [str(item.get("run_id", "")).strip() for item in stored_runs if str(item.get("run_id", "")).strip()]
+        raw_current_run_id = payload.get("current_run_id")
+        if raw_current_run_id in {None, "", "None"}:
+            current_run_id = None
+        else:
+            current_run_id = str(raw_current_run_id).strip() or None
+        permission_mode = str(payload.get("permission_mode", self.base_config.permission_mode) or self.base_config.permission_mode)
+        browser_identity = str(payload.get("browser_identity", self.base_config.browser_identity) or self.base_config.browser_identity)
+        browser_profile_name = str(payload.get("browser_profile_name", self.base_config.browser_profile_name) or self.base_config.browser_profile_name)
+
+        workspace_dir = Path(str(payload.get("workspace_dir") or (thread_dir / "workspace")))
+        memory_dir = Path(str(payload.get("memory_dir") or (workspace_dir / ".memory")))
+        long_term_memory_dir = Path(
+            str(payload.get("long_term_memory_dir") or (self.base_config.workspace_dir / ".memory-global"))
+        )
+
+        overrides = self.base_config.model_dump()
+        overrides["workspace_dir"] = workspace_dir
+        overrides["memory_dir"] = memory_dir
+        overrides["long_term_memory_dir"] = long_term_memory_dir
+        overrides["permission_mode"] = permission_mode
+        overrides["browser_identity"] = browser_identity
+        overrides["browser_profile_name"] = browser_profile_name
+        if browser_identity == "chrome_profile":
+            overrides["browser_headless"] = False
+        config = AgentConfig(**overrides)
+
+        approvals = {
+            str(item.get("request_id", "")): ApprovalRequest(**item)
+            for item in payload.get("approvals", [])
+            if isinstance(item, dict) and str(item.get("request_id", "")).strip()
+        }
+        questions = {
+            str(item.get("request_id", "")): UserInputRequest(**item)
+            for item in payload.get("questions", [])
+            if isinstance(item, dict) and str(item.get("request_id", "")).strip()
+        }
+        human_actions = [
+            HumanAction(**item)
+            for item in payload.get("human_actions", [])
+            if isinstance(item, dict) and str(item.get("action_id", "")).strip()
+        ]
+
+        thread = ThreadSession(
+            thread_id=thread_id,
+            title=str(payload.get("title", thread_id)),
+            thread_dir=thread_dir,
+            workspace_dir=workspace_dir,
+            memory_dir=memory_dir,
+            long_term_memory_dir=long_term_memory_dir,
+            config=config,
+            ledger=WorkspaceLedger(thread_dir),
+            status=str(payload.get("status", "idle") or "idle"),
+            handoff_state=str(payload.get("handoff_state", "agent") or "agent"),
+            created_at=str(payload.get("created_at", _now_iso())),
+            current_run_id=current_run_id,
+            run_ids=run_ids,
+            approval_requests=approvals,
+            question_requests=questions,
+            human_actions=human_actions,
+            controller=ThreadRuntimeController(thread_id),
+            stored_runs=stored_runs,
+            recovered_from_disk=True,
+        )
+        current_run = next((item for item in stored_runs if str(item.get("run_id")) == current_run_id), None)
+        if current_run_id and self._run_record_is_non_terminal(current_run):
+            thread.restart_required = True
+            thread.restart_notice = (
+                "Sunucu yeniden baslatildi. Bu run canli olarak devam etmiyor; yeni bir run baslatip devam edin."
+            )
+        return thread
+
+    @staticmethod
+    def _run_record_is_non_terminal(record: dict[str, Any] | None) -> bool:
+        if not record:
+            return False
+        status = str(record.get("status", "") or "").strip().lower()
+        if status in {"completed", "error"}:
+            return False
+        finished_at = record.get("finished_at")
+        return not bool(finished_at)
+
+    def _remember_persisted_run(self, thread_id: str, record: dict[str, Any]) -> None:
+        run_id = str(record.get("run_id", "")).strip()
+        if not run_id:
+            return
+        report_path = Path(str(record.get("report_path", ""))) if record.get("report_path") else None
+        run_dir = report_path.parent if report_path else (self._threads_root / thread_id / "workspace" / ".runs" / run_id)
+        self._persisted_run_artifacts[run_id] = {
+            "thread_id": thread_id,
+            "run_id": run_id,
+            "goal": str(record.get("goal", "")),
+            "status": str(record.get("status", "running") or "running"),
+            "started_at": str(record.get("started_at", "")),
+            "finished_at": record.get("finished_at"),
+            "report_path": str(report_path) if report_path else str(run_dir / "index.html"),
+            "events_path": str(run_dir / "events.json"),
+            "run_dir": str(run_dir),
+        }
 
     async def start_run(self, request: Any) -> RunSnapshot:
         async with self._lock:
@@ -348,6 +590,9 @@ class ThreadManager:
             self._run_to_thread[run.run_id] = thread.thread_id
             thread.current_run_id = run.run_id
             thread.run_ids.append(run.run_id)
+            thread.recovered_from_disk = False
+            thread.restart_required = False
+            thread.restart_notice = ""
             thread.status = "running"
             thread.handoff_state = "agent"
             if thread.controller is None:
@@ -356,24 +601,43 @@ class ThreadManager:
             thread.ledger.append_entry(
                 "run_started",
                 run_id=run.run_id,
-                details={"goal": request.goal, "status": "running"},
+                details={
+                    "goal": request.goal,
+                    "status": "running",
+                    "permission_mode": config.permission_mode,
+                    "local_execution_mode": config.local_execution_mode,
+                    "desktop_execution_mode": config.desktop_execution_mode,
+                    "desktop_backend_preference": config.desktop_backend_preference,
+                },
             )
             self._persist_thread(thread)
             logger.info(
-                "Thread run started thread_id=%s run_id=%s provider=%s model=%s goal=%r workspace=%s",
+                "Thread run started thread_id=%s run_id=%s provider=%s model=%s permission_mode=%s local_execution_mode=%s desktop_execution_mode=%s desktop_backend_preference=%s goal=%r workspace=%s",
                 thread.thread_id,
                 run.run_id,
                 config.llm_provider,
                 config.llm_model,
+                config.permission_mode,
+                config.local_execution_mode,
+                config.desktop_execution_mode,
+                config.desktop_backend_preference,
                 request.goal,
                 thread.workspace_dir,
             )
+            if config.browser_identity == "chrome_profile" and goal_mentions_web_target(str(request.goal or "")):
+                self.browser_sessions.warmup_thread(
+                    thread_id=thread.thread_id,
+                    browser_type="chromium",
+                    headless=config.browser_headless,
+                    identity="chrome_profile",
+                    profile_name=config.browser_profile_name,
+                )
             run.task = asyncio.create_task(self._run_session(thread.thread_id, run.run_id))
             return self.snapshot_for_http(run)
 
     def list_threads_for_http(self) -> list[dict[str, Any]]:
         threads = sorted(self._threads.values(), key=lambda item: item.created_at, reverse=True)
-        return [self.thread_snapshot_for_http(thread) for thread in threads]
+        return [self.thread_summary_for_http(thread) for thread in threads]
 
     def get_thread(self, thread_id: str) -> ThreadSession:
         session = self._threads.get(thread_id)
@@ -462,6 +726,8 @@ class ThreadManager:
     ) -> dict[str, Any]:
         thread = self.get_thread(thread_id)
         request = thread.approval_requests[request_id]
+        if request.status != "pending":
+            return self.thread_snapshot_for_http(thread)
         request.status = "approved" if approved else "rejected"
         request.approved = approved
         request.decision_note = note or None
@@ -500,24 +766,37 @@ class ThreadManager:
     async def answer_question(self, thread_id: str, request_id: str, answer: str) -> dict[str, Any]:
         thread = self.get_thread(thread_id)
         request = thread.question_requests[request_id]
+        if request.status != "pending":
+            return self.thread_snapshot_for_http(thread)
         request.status = "answered"
-        request.answer = answer
         request.responded_at = _now_iso()
+        is_secret = request.response_kind == "secret"
+        if is_secret:
+            request.answer = None
+            request.answer_redacted = True
+        else:
+            request.answer = answer
         if thread.controller is not None:
             thread.controller.resolve_question(request_id, answer)
         thread.ledger.append_entry(
             "question_answered",
             run_id=thread.current_run_id,
-            details={"request_id": request_id, "answer": answer},
+            details={
+                "request_id": request_id,
+                "answer": REDACTED_PLACEHOLDER if is_secret else answer,
+                "answer_redacted": is_secret,
+            },
         )
 
         run = self.current_run(thread_id)
         if run is not None:
             payload = {
                 "type": "user_answer_received",
-                "content": answer,
-                "summary": "Kullanıcı yanıtı alındı.",
+                "content": REDACTED_PLACEHOLDER if is_secret else answer,
+                "summary": "Güvenli yanıt alındı." if is_secret else "Kullanıcı yanıtı alındı.",
                 "request_id": request_id,
+                "response_kind": request.response_kind,
+                "answer_redacted": is_secret,
             }
             stored = run.report.record(payload)
             await self._broadcast(run, {"kind": "event", "event": self._event_for_http(run.run_id, stored)})
@@ -526,16 +805,30 @@ class ThreadManager:
         self._persist_thread(thread)
         return self.thread_snapshot_for_http(thread)
 
-    async def human_action(self, thread_id: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    async def human_action(
+        self,
+        thread_id: str,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        return_snapshot: bool = True,
+    ) -> dict[str, Any]:
         thread = self.get_thread(thread_id)
         run = self.current_run(thread_id)
         if run is None or run.agent is None:
             raise ValueError("No active agent is available for this thread.")
 
+        stored_args = _sanitize_tool_args_for_storage(
+            tool,
+            args,
+            goal=run.goal,
+            permission_mode=thread.config.permission_mode,
+        )
+
         actor_note = {
             "type": "human_action",
             "tool": tool,
-            "args": args,
+            "args": stored_args,
             "content": "User performed a manual action.",
             "summary": f"Kullanıcı {tool} aracını kullandı.",
         }
@@ -547,12 +840,16 @@ class ThreadManager:
             raise ValueError("This agent does not support manual tool actions.")
 
         result = await performer(tool, args)
-        action = HumanAction(action_id=f"manual-{len(thread.human_actions) + 1:03d}", tool=tool, args=args)
+        action = HumanAction(
+            action_id=f"manual-{len(thread.human_actions) + 1:03d}",
+            tool=tool,
+            args=stored_args,
+        )
         thread.human_actions.append(action)
         thread.ledger.append_entry(
             "human_action",
             run_id=thread.current_run_id,
-            details={"action_id": action.action_id, "tool": tool, "args": args},
+            details={"action_id": action.action_id, "tool": tool, "args": stored_args},
         )
 
         if result.screenshot_b64:
@@ -606,6 +903,44 @@ class ThreadManager:
             args,
             result.success,
         )
+        if return_snapshot:
+            return self.thread_snapshot_for_http(thread)
+        return {
+            "ok": True,
+            "thread_id": thread.thread_id,
+            "run_id": run.run_id,
+            "action_id": action.action_id,
+            "tool": tool,
+            "success": result.success,
+            "manual_fast_path": True,
+        }
+
+    def update_thread_settings(
+        self,
+        thread_id: str,
+        *,
+        permission_mode: str | None = None,
+    ) -> dict[str, Any]:
+        thread = self.get_thread(thread_id)
+        changed = False
+        if permission_mode is not None:
+            next_mode = str(permission_mode or "").strip().lower() or "default"
+            if next_mode not in {"default", "full"}:
+                raise ValueError("Unsupported permission mode.")
+            if thread.config.permission_mode != next_mode:
+                thread.config.permission_mode = next_mode
+                thread.config.browser_identity = "chrome_profile" if next_mode == "full" else "isolated"
+                if next_mode == "full":
+                    thread.config.browser_headless = False
+                changed = True
+        if changed:
+            self.browser_sessions.note_thread_browser_defaults(
+                thread.thread_id,
+                identity=thread.config.browser_identity,
+                profile_name=thread.config.browser_profile_name,
+            )
+            self.thread_ledger_append_settings(thread, permission_mode=thread.config.permission_mode)
+            self._persist_thread(thread)
         return self.thread_snapshot_for_http(thread)
 
     def subscribe(self, run_id: str) -> asyncio.Queue[EventPayload]:
@@ -622,55 +957,241 @@ class ThreadManager:
     def snapshot_for_http(self, session: RunSession) -> RunSnapshot:
         snapshot = session.report.snapshot()
         thread = self.get_thread(session.thread_id)
-        policy = choose_live_execution_policy(
-            session.goal,
-            requested_headless=session.config.browser_headless,
+        return self._decorate_run_snapshot(
+            snapshot,
+            run_id=session.run_id,
+            thread=thread,
+            goal=session.goal,
+            run_config=session.config,
+            permission_mode=session.config.permission_mode,
+            browser_identity=session.config.browser_identity,
+            browser_profile_name=session.config.browser_profile_name,
+            browser_headless=session.config.browser_headless,
+            active=not session.completed.is_set() and thread.current_run_id == session.run_id,
         )
-        snapshot["active"] = not session.completed.is_set() and thread.current_run_id == session.run_id
-        snapshot["thread_id"] = thread.thread_id
-        snapshot["thread_title"] = thread.title
-        snapshot["thread_status"] = thread.status
-        snapshot["handoff_state"] = thread.handoff_state
-        snapshot["control_surface_hint"] = policy.control_surface_hint
-        snapshot["report_url"] = f"/runs/{session.run_id}/report"
-        snapshot["logs_url"] = self._logs_url(thread_id=thread.thread_id, run_id=session.run_id)
-        snapshot["events"] = [self._event_for_http(session.run_id, event) for event in snapshot["events"]]
-        snapshot["frames"] = [self._frame_for_http(session.run_id, frame) for frame in snapshot["frames"]]
-        snapshot["steps"] = _build_steps(snapshot["events"])
-        snapshot["approval_requests"] = [asdict(item) for item in thread.approval_requests.values()]
-        snapshot["question_requests"] = [asdict(item) for item in thread.question_requests.values()]
-        snapshot["audit"] = thread.ledger.entries(run_id=session.run_id)
-        snapshot.update(self.browser_sessions.snapshot_payload(thread.thread_id))
-        return snapshot
 
-    def thread_snapshot_for_http(self, thread: ThreadSession) -> dict[str, Any]:
-        current = self.current_run(thread.thread_id)
+    def thread_summary_for_http(self, thread: ThreadSession) -> dict[str, Any]:
+        active_summary = self._active_run_summary_for_thread(thread)
+        activity = self._activity_for_thread(thread, active_summary)
         return {
             "thread_id": thread.thread_id,
             "title": thread.title,
             "status": thread.status,
             "handoff_state": thread.handoff_state,
+            "permission_mode": thread.config.permission_mode,
+            "browser_identity": thread.config.browser_identity,
+            "browser_profile_name": thread.config.browser_profile_name,
             "created_at": thread.created_at,
             "workspace_dir": str(thread.workspace_dir),
             "memory_dir": str(thread.memory_dir),
             "long_term_memory_dir": str(thread.long_term_memory_dir),
             "current_run_id": thread.current_run_id,
             "logs_url": self._logs_url(thread_id=thread.thread_id, run_id=thread.current_run_id),
-            "runs": [
-                self._run_summary_for_http(self._runs[run_id])
-                for run_id in thread.run_ids
-                if run_id in self._runs
-            ],
+            "runs": self._run_summaries_for_http(thread),
             "approval_requests": [asdict(item) for item in thread.approval_requests.values()],
             "question_requests": [asdict(item) for item in thread.question_requests.values()],
-            "active_run": self.snapshot_for_http(current) if current is not None else None,
-            "audit": thread.ledger.entries(run_id=thread.current_run_id) if thread.current_run_id else [],
+            "active_run_summary": active_summary,
+            "activity": activity,
+            "activity_summary": str((activity or {}).get("summary") or ""),
+            "activity_title": str((activity or {}).get("title") or ""),
+            "recovered_from_disk": thread.recovered_from_disk,
+            "restart_required": thread.restart_required,
+            "restart_notice": thread.restart_notice,
             **self.browser_sessions.snapshot_payload(thread.thread_id),
         }
 
+    def thread_snapshot_for_http(self, thread: ThreadSession) -> dict[str, Any]:
+        active_snapshot = self._active_run_snapshot_for_thread(thread)
+        activity = active_snapshot.get("activity") if active_snapshot else None
+        return {
+            "thread_id": thread.thread_id,
+            "title": thread.title,
+            "status": thread.status,
+            "handoff_state": thread.handoff_state,
+            "permission_mode": thread.config.permission_mode,
+            "browser_identity": thread.config.browser_identity,
+            "browser_profile_name": thread.config.browser_profile_name,
+            "created_at": thread.created_at,
+            "workspace_dir": str(thread.workspace_dir),
+            "memory_dir": str(thread.memory_dir),
+            "long_term_memory_dir": str(thread.long_term_memory_dir),
+            "current_run_id": thread.current_run_id,
+            "logs_url": self._logs_url(thread_id=thread.thread_id, run_id=thread.current_run_id),
+            "runs": self._run_summaries_for_http(thread),
+            "approval_requests": [asdict(item) for item in thread.approval_requests.values()],
+            "question_requests": [asdict(item) for item in thread.question_requests.values()],
+            "active_run": active_snapshot,
+            "activity": activity,
+            "activity_summary": str((activity or {}).get("summary") or ""),
+            "activity_title": str((activity or {}).get("title") or ""),
+            "audit": thread.ledger.entries(run_id=thread.current_run_id) if thread.current_run_id else [],
+            "recovered_from_disk": thread.recovered_from_disk,
+            "restart_required": thread.restart_required,
+            "restart_notice": thread.restart_notice,
+            **self.browser_sessions.snapshot_payload(thread.thread_id),
+        }
+
+    def run_snapshot_for_http(self, run_id: str) -> RunSnapshot:
+        session = self._runs.get(run_id)
+        if session is not None:
+            return self.snapshot_for_http(session)
+        record = self._persisted_run_artifacts.get(run_id)
+        if record is None:
+            raise KeyError(run_id)
+        return self._load_persisted_run_snapshot(record)
+
+    def _decorate_run_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        run_id: str,
+        thread: ThreadSession,
+        goal: str,
+        run_config: AgentConfig | None,
+        permission_mode: str,
+        browser_identity: str,
+        browser_profile_name: str,
+        browser_headless: bool,
+        active: bool,
+    ) -> RunSnapshot:
+        policy = choose_live_execution_policy(goal, requested_headless=browser_headless)
+        payload = dict(snapshot)
+        payload["active"] = active
+        payload["thread_id"] = thread.thread_id
+        payload["thread_title"] = thread.title
+        payload["thread_status"] = thread.status
+        payload["handoff_state"] = thread.handoff_state
+        payload["permission_mode"] = permission_mode
+        payload["browser_identity"] = browser_identity
+        payload["browser_profile_name"] = browser_profile_name
+        payload["control_surface_hint"] = policy.control_surface_hint
+        payload["local_execution_mode"] = (
+            run_config.local_execution_mode if run_config is not None else policy.local_execution_mode
+        )
+        payload["desktop_execution_mode"] = (
+            run_config.desktop_execution_mode if run_config is not None else policy.desktop_execution_mode
+        )
+        payload["desktop_backend_preference"] = (
+            run_config.desktop_backend_preference if run_config is not None else policy.desktop_backend_preference
+        )
+        payload["report_url"] = f"/runs/{run_id}/report"
+        payload["logs_url"] = self._logs_url(thread_id=thread.thread_id, run_id=run_id)
+        payload["events"] = [self._event_for_http(run_id, event) for event in payload.get("events", [])]
+        payload["frames"] = [self._frame_for_http(run_id, frame) for frame in payload.get("frames", [])]
+        payload["steps"] = _build_steps(payload["events"])
+        payload["activity"] = _latest_activity(payload["events"])
+        payload["approval_requests"] = [asdict(item) for item in thread.approval_requests.values()]
+        payload["question_requests"] = [asdict(item) for item in thread.question_requests.values()]
+        payload["audit"] = thread.ledger.entries(run_id=run_id)
+        payload["recovered_from_disk"] = thread.recovered_from_disk
+        payload["restart_required"] = thread.restart_required and thread.current_run_id == run_id
+        payload["restart_notice"] = thread.restart_notice if payload["restart_required"] else ""
+        payload.update(self.browser_sessions.snapshot_payload(thread.thread_id))
+        return payload
+
+    def _run_summaries_for_http(self, thread: ThreadSession) -> list[dict[str, Any]]:
+        summaries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for run_id in thread.run_ids:
+            summary = self._run_summary_for_thread(thread, run_id)
+            if summary is None:
+                continue
+            normalized_run_id = str(summary.get("run_id", "")).strip()
+            if not normalized_run_id or normalized_run_id in seen:
+                continue
+            seen.add(normalized_run_id)
+            summaries.append(summary)
+        return summaries
+
+    def _run_summary_for_thread(self, thread: ThreadSession, run_id: str) -> dict[str, Any] | None:
+        live_run = self._runs.get(run_id)
+        if live_run is not None:
+            return self._run_summary_for_http(live_run)
+        record = next((item for item in thread.stored_runs if str(item.get("run_id", "")).strip() == run_id), None)
+        if record is None:
+            record = self._persisted_run_artifacts.get(run_id)
+        if record is None:
+            return None
+        return self._stored_run_summary_for_http(thread.thread_id, record)
+
+    def _stored_run_summary_for_http(self, thread_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        run_id = str(record.get("run_id", "")).strip()
+        thread = self.get_thread(thread_id)
+        return {
+            "run_id": run_id,
+            "goal": str(record.get("goal", "")),
+            "status": str(record.get("status", "running") or "running"),
+            "permission_mode": thread.config.permission_mode,
+            "started_at": str(record.get("started_at", "")),
+            "finished_at": record.get("finished_at"),
+            "report_url": f"/runs/{run_id}/report",
+            "logs_url": self._logs_url(thread_id=thread_id, run_id=run_id),
+        }
+
+    def _active_run_summary_for_thread(self, thread: ThreadSession) -> dict[str, Any] | None:
+        if not thread.current_run_id:
+            return None
+        summary = self._run_summary_for_thread(thread, thread.current_run_id)
+        if summary is None:
+            return None
+        activity = None
+        live_run = self._runs.get(thread.current_run_id)
+        if live_run is not None:
+            activity = self.snapshot_for_http(live_run).get("activity")
+        elif thread.restart_required:
+            activity = {
+                "title": "Devam gerekli",
+                "summary": thread.restart_notice,
+            }
+        compact = dict(summary)
+        compact["activity"] = activity
+        return compact
+
+    def _activity_for_thread(self, thread: ThreadSession, active_summary: dict[str, Any] | None) -> dict[str, Any] | None:
+        activity = active_summary.get("activity") if active_summary else None
+        if activity:
+            return activity
+        if thread.restart_required:
+            return {
+                "title": "Devam gerekli",
+                "summary": thread.restart_notice,
+            }
+        return None
+
+    def _active_run_snapshot_for_thread(self, thread: ThreadSession) -> dict[str, Any] | None:
+        if not thread.current_run_id:
+            return None
+        try:
+            return self.run_snapshot_for_http(thread.current_run_id)
+        except KeyError:
+            return None
+
+    def _load_persisted_run_snapshot(self, record: dict[str, Any]) -> RunSnapshot:
+        run_id = str(record.get("run_id", "")).strip()
+        thread_id = str(record.get("thread_id", "")).strip()
+        thread = self.get_thread(thread_id)
+        events_path = Path(str(record.get("events_path", "")))
+        if not events_path.exists():
+            raise KeyError(run_id)
+        payload = json.loads(events_path.read_text(encoding="utf-8"))
+        return self._decorate_run_snapshot(
+            payload,
+            run_id=run_id,
+            thread=thread,
+            goal=str(payload.get("goal", record.get("goal", ""))),
+            run_config=None,
+            permission_mode=thread.config.permission_mode,
+            browser_identity=thread.config.browser_identity,
+            browser_profile_name=thread.config.browser_profile_name,
+            browser_headless=thread.config.browser_headless,
+            active=False,
+        )
+
     async def capture_live_browser_frame(self, thread_id: str) -> LiveBrowserFrame | None:
-        self.get_thread(thread_id)
-        return await self.browser_sessions.capture_live_frame(thread_id)
+        thread = self.get_thread(thread_id)
+        frame = await self.browser_sessions.capture_live_frame(thread_id)
+        self._archive_live_debug_frame(thread, frame, source="live-browser")
+        return frame
 
     async def capture_live_computer_frame(self, thread_id: str) -> LiveBrowserFrame | None:
         thread = self.get_thread(thread_id)
@@ -686,7 +1207,41 @@ class ThreadManager:
             except Exception:  # noqa: BLE001
                 return None
 
-        return await asyncio.to_thread(_capture)
+        frame = await asyncio.to_thread(_capture)
+        self._archive_live_debug_frame(thread, frame, source="live-desktop")
+        return frame
+
+    def _archive_live_debug_frame(
+        self,
+        thread: ThreadSession,
+        frame: LiveBrowserFrame | None,
+        *,
+        source: str,
+    ) -> None:
+        if frame is None:
+            return
+        run = self.current_run(thread.thread_id)
+        if run is None:
+            return
+        saver = getattr(run.report.store, "save_debug_image_bytes", None)
+        if not callable(saver):
+            return
+        try:
+            saver(
+                frame.data,
+                source=source,
+                media_type=frame.media_type,
+                label=source,
+                dedupe=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Failed to archive debug frame thread_id=%s run_id=%s source=%s",
+                thread.thread_id,
+                run.run_id,
+                source,
+                exc_info=True,
+            )
 
     async def _run_session(self, thread_id: str, run_id: str) -> None:
         thread = self.get_thread(thread_id)
@@ -709,7 +1264,13 @@ class ThreadManager:
 
             generator = await agent.run(session.goal)
             async for raw_event in generator:
-                stored = session.report.record(raw_event)
+                stored = session.report.record(
+                    _sanitize_event_for_storage(
+                        raw_event,
+                        goal=session.goal,
+                        permission_mode=session.config.permission_mode,
+                    )
+                )
                 if stored["type"] == "done":
                     status = "completed"
                 elif stored["type"] == "error":
@@ -755,6 +1316,7 @@ class ThreadManager:
                 {"kind": "event", "event": self._event_for_http(session.run_id, stored)},
             )
         finally:
+            self.browser_sessions.cancel_warmup_thread(thread.thread_id)
             workspace_audit = self._capture_workspace_audit(thread, session)
             for entry in workspace_audit:
                 session.report.record_audit(entry)
@@ -772,6 +1334,7 @@ class ThreadManager:
                 thread.status = "idle"
             thread.handoff_state = "agent"
             if thread.controller is not None:
+                thread.controller.restore_preview_windows()
                 thread.controller.resume()
             thread.ledger.append_entry(
                 "run_finished",
@@ -797,7 +1360,12 @@ class ThreadManager:
             request = ApprovalRequest(
                 request_id=str(event["request_id"]),
                 tool=str(event.get("tool", "")),
-                args=dict(event.get("args", {})),
+                args=_sanitize_tool_args_for_storage(
+                    str(event.get("tool", "")),
+                    dict(event.get("args", {})),
+                    goal=self.current_run(thread.thread_id).goal if self.current_run(thread.thread_id) else "",
+                    permission_mode=thread.config.permission_mode,
+                ),
                 reason=str(event.get("reason", "")),
                 summary=str(event.get("summary", "")),
                 rule_id=str(event.get("rule_id", "") or "") or None,
@@ -821,6 +1389,7 @@ class ThreadManager:
                 request_id=str(event["request_id"]),
                 prompt=str(event.get("content", "")),
                 summary=str(event.get("summary", "")),
+                response_kind=str(event.get("response_kind", "text") or "text"),
             )
             thread.question_requests[request.request_id] = request
             thread.status = "blocked_waiting_user"
@@ -829,6 +1398,10 @@ class ThreadManager:
                 run_id=thread.current_run_id,
                 details={"request_id": request.request_id, "prompt": request.prompt},
             )
+        elif event_type == "paused":
+            thread.status = "paused_for_user"
+            thread.handoff_state = "user"
+            thread.controller.restore_preview_windows()
         elif event_type == "screenshot":
             thread.ledger.append_entry(
                 "artifact_recorded",
@@ -915,6 +1488,7 @@ class ThreadManager:
             payload["image_url"] = self._asset_url(run_id, str(image_path))
         payload["display_label"] = _display_label_for_event(payload)
         payload["display_summary"] = _display_summary_for_event(payload)
+        payload["activity"] = _activity_for_event_payload(payload)
         return payload
 
     def _frame_for_http(self, run_id: str, frame: dict[str, Any]) -> dict[str, Any]:
@@ -960,6 +1534,13 @@ class ThreadManager:
         overrides["workspace_dir"] = workspace_dir
         overrides["memory_dir"] = memory_dir
         overrides["long_term_memory_dir"] = long_term_memory_dir
+        explicit_permission_mode = getattr(request, "permission_mode", None)
+        if explicit_permission_mode:
+            overrides["permission_mode"] = request.permission_mode
+        elif goal_requests_real_browser_context(str(getattr(request, "goal", "") or "")):
+            overrides["permission_mode"] = "full"
+            overrides["browser_identity"] = "chrome_profile"
+            overrides["browser_headless"] = False
         config = AgentConfig(**overrides)
         thread = ThreadSession(
             thread_id=thread_id,
@@ -973,6 +1554,11 @@ class ThreadManager:
             controller=ThreadRuntimeController(thread_id),
         )
         self._threads[thread_id] = thread
+        self.browser_sessions.note_thread_browser_defaults(
+            thread.thread_id,
+            identity=thread.config.browser_identity,
+            profile_name=thread.config.browser_profile_name,
+        )
         self._persist_thread(thread)
         return thread
 
@@ -981,12 +1567,17 @@ class ThreadManager:
         overrides["workspace_dir"] = thread.workspace_dir
         overrides["memory_dir"] = thread.memory_dir
         overrides["long_term_memory_dir"] = thread.long_term_memory_dir
+        overrides["permission_mode"] = thread.config.permission_mode
+        overrides["browser_identity"] = thread.config.browser_identity
+        overrides["browser_profile_name"] = thread.config.browser_profile_name
         policy = choose_live_execution_policy(
             str(getattr(request, "goal", "") or ""),
             requested_headless=getattr(request, "headless", None),
         )
         overrides["local_execution_mode"] = policy.local_execution_mode
         overrides["desktop_fallback_policy"] = policy.desktop_fallback_policy
+        overrides["desktop_execution_mode"] = policy.desktop_execution_mode
+        overrides["desktop_backend_preference"] = policy.desktop_backend_preference
         if getattr(request, "provider", None):
             overrides["llm_provider"] = request.provider
             if not getattr(request, "model", None):
@@ -1009,8 +1600,11 @@ class ThreadManager:
         return f"{candidate}-{index}"
 
     def _persist_thread(self, thread: ThreadSession) -> None:
-        runs = [self._runs[run_id] for run_id in thread.run_ids if run_id in self._runs]
-        thread.ledger.write_snapshot(thread, runs, browser=self.browser_sessions.snapshot_payload(thread.thread_id))
+        run_records = self._thread_run_records_for_ledger(thread)
+        thread.stored_runs = [dict(item) for item in run_records]
+        thread.ledger.write_snapshot(thread, run_records, browser=self.browser_sessions.snapshot_payload(thread.thread_id))
+        for record in run_records:
+            self._remember_persisted_run(thread.thread_id, record)
         registry = []
         for item in sorted(self._threads.values(), key=lambda entry: entry.created_at):
             registry.append(
@@ -1018,6 +1612,7 @@ class ThreadManager:
                     "thread_id": item.thread_id,
                     "title": item.title,
                     "status": item.status,
+                    "permission_mode": item.config.permission_mode,
                     "created_at": item.created_at,
                     "current_run_id": item.current_run_id,
                     "workspace_dir": str(item.workspace_dir),
@@ -1025,17 +1620,167 @@ class ThreadManager:
             )
         self._registry_path.write_text(json.dumps(registry, indent=2), encoding="utf-8")
 
+    def _thread_run_records_for_ledger(self, thread: ThreadSession) -> list[dict[str, Any]]:
+        records_by_id: dict[str, dict[str, Any]] = {
+            str(item.get("run_id", "")).strip(): dict(item)
+            for item in thread.stored_runs
+            if str(item.get("run_id", "")).strip()
+        }
+        for run_id in thread.run_ids:
+            live_run = self._runs.get(run_id)
+            if live_run is not None:
+                records_by_id[run_id] = {
+                    "run_id": live_run.run_id,
+                    "goal": live_run.goal,
+                    "status": live_run.status,
+                    "permission_mode": live_run.config.permission_mode,
+                    "local_execution_mode": live_run.config.local_execution_mode,
+                    "desktop_execution_mode": live_run.config.desktop_execution_mode,
+                    "desktop_backend_preference": live_run.config.desktop_backend_preference,
+                    "started_at": live_run.started_at,
+                    "finished_at": live_run.finished_at,
+                    "report_path": str(live_run.report.html_path),
+                }
+        ordered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for run_id in thread.run_ids:
+            record = records_by_id.get(run_id)
+            if record is None or run_id in seen:
+                continue
+            ordered.append(record)
+            seen.add(run_id)
+        for run_id, record in records_by_id.items():
+            if run_id in seen:
+                continue
+            ordered.append(record)
+        return ordered
+
     @staticmethod
     def _run_summary_for_http(run: RunSession) -> dict[str, Any]:
         return {
             "run_id": run.run_id,
             "goal": run.goal,
             "status": run.status,
+            "permission_mode": run.config.permission_mode,
+            "local_execution_mode": run.config.local_execution_mode,
+            "desktop_execution_mode": run.config.desktop_execution_mode,
+            "desktop_backend_preference": run.config.desktop_backend_preference,
             "started_at": run.started_at,
             "finished_at": run.finished_at,
             "report_url": f"/runs/{run.run_id}/report",
             "logs_url": ThreadManager._logs_url(thread_id=run.thread_id, run_id=run.run_id),
         }
+
+    @staticmethod
+    def thread_ledger_append_settings(thread: ThreadSession, *, permission_mode: str) -> None:
+        thread.ledger.append_entry(
+            "thread_settings_updated",
+            run_id=thread.current_run_id,
+            details={"permission_mode": permission_mode},
+        )
+
+
+def _activity_channel_for_tool(tool_name: str) -> str:
+    mapping = {
+        "browser": "browser",
+        "computer": "desktop",
+        "windows_desktop": "desktop_native",
+        "filesystem": "filesystem",
+        "local_system": "local_system",
+        "terminal": "terminal",
+        "git": "workspace",
+    }
+    return mapping.get(tool_name, "agent")
+
+
+def _activity_visibility(tool_name: str) -> str:
+    if tool_name in {"browser", "computer", "windows_desktop"}:
+        return "visible"
+    if tool_name in {"filesystem", "local_system", "terminal", "git"}:
+        return "hidden"
+    return "background"
+
+
+def _activity_for_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("type", "event"))
+    tool_name = str(event.get("tool", "") or "")
+    channel = _activity_channel_for_tool(tool_name)
+    visibility = _activity_visibility(tool_name)
+    status = "idle"
+    if event_type == "phase":
+        channel = "agent"
+        visibility = "background"
+        status = "thinking" if str(event.get("phase", "")) == "thinking" else "preparing"
+    elif event_type == "thought":
+        channel = "agent"
+        visibility = "background"
+        status = "thinking"
+    elif event_type == "tool_call":
+        status = "running"
+    elif event_type == "visual_intent":
+        status = "preparing"
+    elif event_type == "screenshot":
+        frame_label = str(event.get("frame_label") or event.get("label") or "")
+        tool_name = frame_label.split("·", 1)[0].strip().lower() if "·" in frame_label else tool_name
+        channel = _activity_channel_for_tool(tool_name)
+        visibility = _activity_visibility(tool_name)
+        status = "visible_update"
+    elif event_type == "tool_result":
+        status = "completed" if event.get("success") else "error"
+    elif event_type in {"approval_requested", "question_requested"}:
+        channel = "agent"
+        visibility = "background"
+        status = "waiting"
+    elif event_type == "paused":
+        channel = "browser" if str(event.get("pause_kind", "")) == "sensitive_browser_takeover" else "agent"
+        visibility = "visible" if channel == "browser" else "background"
+        status = "waiting"
+    elif event_type == "resumed":
+        channel = "agent"
+        visibility = "background"
+        status = "completed"
+    elif event_type in {"approved", "user_answer_received", "done"}:
+        channel = "agent" if event_type == "done" else channel
+        visibility = "background" if event_type == "done" else visibility
+        status = "completed"
+    elif event_type in {"rejected", "error"}:
+        channel = "agent" if event_type == "error" else channel
+        visibility = "background" if event_type == "error" else visibility
+        status = "error"
+
+    payload = {
+        "channel": channel,
+        "visibility": visibility,
+        "status": status,
+        "title": str(event.get("display_label") or event.get("frame_label") or event.get("tool") or "İşlem"),
+        "summary": str(event.get("display_summary") or event.get("summary") or event.get("content") or ""),
+    }
+    if "focus_x" in event:
+        payload["focus_x"] = event.get("focus_x")
+    if "focus_y" in event:
+        payload["focus_y"] = event.get("focus_y")
+    if tool_name:
+        payload["tool"] = tool_name
+    args = event.get("args") if isinstance(event.get("args"), dict) else {}
+    if args:
+        target = args.get("path") or args.get("url") or args.get("selector") or args.get("folder_key")
+        if target:
+            payload["target"] = str(target)
+    return payload
+
+
+def _latest_activity(events: list[dict[str, Any]]) -> dict[str, Any]:
+    for event in reversed(events):
+        activity = event.get("activity")
+        if isinstance(activity, dict) and (activity.get("summary") or activity.get("title")):
+            return activity
+    return {
+        "channel": "agent",
+        "visibility": "background",
+        "status": "idle",
+        "title": "Hazır",
+        "summary": "",
+    }
 
 
 def _default_agent_factory(config: AgentConfig):

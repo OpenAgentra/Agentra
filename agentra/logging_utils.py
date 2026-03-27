@@ -130,6 +130,14 @@ def _provider_error_details(
     quota_markers = ("exceeded your current quota", "current quota", "billing details", "check your plan")
     auth_markers = ("invalid api key", "api key", "unauthorized", "permission denied")
     model_markers = ("model not found", "unknown model", "unsupported model")
+    transient_markers = (
+        "server disconnected",
+        "connection reset",
+        "connection closed",
+        "temporarily unavailable",
+        "upstream connect error",
+        "remote host closed",
+    )
 
     if status_code == 429 or "resource_exhausted" in message_text or "rate limit" in message_text:
         if any(marker in message_text for marker in quota_markers):
@@ -167,6 +175,14 @@ def _provider_error_details(
             "Choose a different model and retry."
         )
         hint = "Update the configured model name or switch to a model your account can access."
+    elif any(marker in message_text for marker in transient_markers):
+        error_kind = "provider_unavailable"
+        retryable = True
+        public_message = (
+            f"{provider_name} connection dropped while contacting {target}. "
+            "Try again shortly."
+        )
+        hint = "Retry after a short delay, or switch providers if the connection keeps dropping."
     elif status_code is not None and status_code >= 500:
         error_kind = "provider_unavailable"
         retryable = True

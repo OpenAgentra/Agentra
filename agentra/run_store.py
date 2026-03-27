@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from datetime import datetime
@@ -28,6 +29,7 @@ class RunStore:
         slug = _slugify(goal) or "run"
         self.run_dir = (workspace_dir / ".runs" / f"{timestamp}-{slug[:48]}").resolve()
         self.assets_dir = self.run_dir / "assets"
+        self.debug_images_dir = self.run_dir / "debug-images"
         self.events_path = self.run_dir / "events.json"
         self.html_path = self.run_dir / "index.html"
         self.run_id = self.run_dir.name
@@ -43,8 +45,10 @@ class RunStore:
         self._frames: list[dict[str, Any]] = []
         self._audit: list[dict[str, Any]] = []
         self._screenshot_index = 0
+        self._debug_image_index = 0
         self._pending_frame_id: str | None = None
         self._last_tool_call: dict[str, Any] | None = None
+        self._last_debug_digest_by_source: dict[str, str] = {}
 
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         self._write_events()
@@ -87,7 +91,8 @@ class RunStore:
             stored.setdefault("summary", self._plain_summary(str(stored.get("result", ""))))
 
         if event_type == "screenshot" and stored.get("data"):
-            stored["image_path"] = self._save_screenshot(str(stored["data"]))
+            image_bytes = base64.b64decode(str(stored["data"]))
+            stored["image_path"] = self._save_screenshot(image_bytes)
             stored.pop("data", None)
 
             frame_id = f"frame-{len(self._frames) + 1:03d}"
@@ -128,6 +133,12 @@ class RunStore:
                 }
             )
             self._pending_frame_id = frame_id
+            self.save_debug_image_bytes(
+                image_bytes,
+                source="run-screenshots",
+                media_type="image/png",
+                label=frame_label,
+            )
 
         self._events.append(stored)
         self._write_events()
@@ -176,12 +187,41 @@ class RunStore:
                 event["summary"] = summary
                 break
 
-    def _save_screenshot(self, b64: str) -> str:
+    def _save_screenshot(self, image_bytes: bytes) -> str:
         self._screenshot_index += 1
         filename = f"screenshot-{self._screenshot_index:03d}.png"
         path = self.assets_dir / filename
-        path.write_bytes(base64.b64decode(b64))
+        path.write_bytes(image_bytes)
         return f"assets/{filename}"
+
+    def save_debug_image_bytes(
+        self,
+        image_bytes: bytes,
+        *,
+        source: str,
+        media_type: str,
+        label: str | None = None,
+        dedupe: bool = False,
+    ) -> str | None:
+        source_name = _slugify(source) or "debug"
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        if dedupe and self._last_debug_digest_by_source.get(source_name) == digest:
+            return None
+        self._last_debug_digest_by_source[source_name] = digest
+
+        self._debug_image_index += 1
+        target_dir = self.debug_images_dir / source_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        label_name = _slugify(label or "")[:48]
+        filename = f"{self._debug_image_index:04d}-{digest[:12]}"
+        if label_name:
+            filename += f"-{label_name}"
+        filename += _image_extension_for_media_type(media_type)
+
+        path = target_dir / filename
+        path.write_bytes(image_bytes)
+        return str(path.relative_to(self.run_dir)).replace("\\", "/")
 
     def _write_events(self) -> None:
         payload = self.snapshot()
@@ -239,6 +279,29 @@ class RunStore:
                 return "Closing the tab"
             if action == "screenshot":
                 return "Capturing a screenshot"
+        if tool == "windows_desktop" and isinstance(args, dict):
+            action = str(args.get("action", "windows_desktop")).lower()
+            target = str(
+                args.get("app")
+                or args.get("window_title")
+                or args.get("profile_id")
+                or args.get("control_name")
+                or "the Windows app"
+            )
+            if action == "launch_app":
+                return f"Launching {target}"
+            if action == "focus_window":
+                return f"Focusing {target}"
+            if action == "wait_for_window":
+                return f"Waiting for {target}"
+            if action == "list_controls":
+                return f"Inspecting controls in {target}"
+            if action == "set_text":
+                return f"Setting text in {target}"
+            if action == "type_keys":
+                return f"Typing keys in {target}"
+            if action == "read_status":
+                return f"Verifying {target}"
         return self._plain_summary(f"Running {tool}")
 
     def _frame_label_from_tool_call(self, event: dict[str, Any] | None) -> str | None:
@@ -290,3 +353,12 @@ class RunStore:
 
 def _slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def _image_extension_for_media_type(media_type: str) -> str:
+    media = str(media_type or "").lower()
+    if "jpeg" in media or "jpg" in media:
+        return ".jpg"
+    if "webp" in media:
+        return ".webp"
+    return ".png"

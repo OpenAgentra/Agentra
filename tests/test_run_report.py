@@ -45,7 +45,9 @@ def test_run_report_writes_html_and_assets(tmp_path):
     assert payload["frames"][0]["summary"] == "Opening python.org"
 
     screenshot_files = list((report.run_dir / "assets").glob("*.png"))
+    debug_files = list((report.run_dir / "debug-images" / "run-screenshots").glob("*.png"))
     assert len(screenshot_files) == 1
+    assert len(debug_files) == 1
 
 
 def test_run_report_keeps_event_history(tmp_path):

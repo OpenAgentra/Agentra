@@ -1,0 +1,3 @@
+2026-03-27 05:20:39.705 windows_native.py[648] _control_text -> Find Control Timeout(10s): {ControlType: EditControl}
+2026-03-27 05:20:49.909 windows_native.py[654] _control_text -> Find Control Timeout(10s): {ControlType: EditControl}
+2026-03-27 05:20:59.981 windows_native.py[333] set_text -> 

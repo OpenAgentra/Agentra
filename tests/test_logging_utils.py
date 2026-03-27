@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import aiohttp
 from google.genai.errors import ClientError
 
 from agentra.logging_utils import exception_details_with_context
@@ -39,4 +40,22 @@ def test_exception_details_with_context_normalizes_gemini_quota_errors() -> None
     assert details["hint"] == (
         "Switch the thread to another provider/model, or add Gemini "
         "billing/credits before retrying."
+    )
+
+
+def test_exception_details_with_context_marks_server_disconnect_retryable() -> None:
+    details = exception_details_with_context(
+        aiohttp.ServerDisconnectedError(),
+        provider="gemini",
+        model="gemini-2.5-flash",
+    )
+
+    assert details["error_kind"] == "provider_unavailable"
+    assert details["retryable"] is True
+    assert details["public_message"] == (
+        "Gemini connection dropped while contacting model gemini-2.5-flash. "
+        "Try again shortly."
+    )
+    assert details["hint"] == (
+        "Retry after a short delay, or switch providers if the connection keeps dropping."
     )

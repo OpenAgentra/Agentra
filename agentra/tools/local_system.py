@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from agentra.tools.base import BaseTool, ToolResult
+from agentra.windows_apps import normalize_windows_app_command
 
 
 @dataclass
@@ -31,7 +32,9 @@ class LocalSystemTool(BaseTool):
     description = (
         "Resolve known local folders such as Desktop and open confirmed local files or "
         "folders with the operating system default handler without using visible terminal "
-        "windows. Prefer this for under-the-hood local desktop/file tasks."
+        "windows. Prefer this for under-the-hood local desktop/file tasks. Do not use "
+        "`launch_app` as the primary path for standard Windows apps like Calculator or "
+        "Notepad when `windows_desktop` is available."
     )
 
     @property
@@ -41,8 +44,8 @@ class LocalSystemTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["resolve_known_folder", "open_path"],
-                    "description": "Native local-system action to perform.",
+                    "enum": ["resolve_known_folder", "open_path", "launch_app"],
+                    "description": "Native local-system action to perform. Prefer `launch_app` only for hidden local flows, not standard Windows app automation.",
                 },
                 "folder_key": {
                     "type": "string",
@@ -52,6 +55,10 @@ class LocalSystemTool(BaseTool):
                 "path": {
                     "type": "string",
                     "description": "Resolved local file or folder path to open.",
+                },
+                "app": {
+                    "type": "string",
+                    "description": "Installed application name or executable to launch.",
                 },
             },
             "required": ["action"],
@@ -66,6 +73,9 @@ class LocalSystemTool(BaseTool):
             if action == "open_path":
                 path = str(kwargs.get("path", "") or "").strip()
                 return await self._open_path(path)
+            if action == "launch_app":
+                app = str(kwargs.get("app", "") or "").strip()
+                return await self._launch_app(app)
             return ToolResult(success=False, error=f"Unknown action: {action!r}")
         except Exception as exc:  # noqa: BLE001
             return ToolResult(success=False, error=str(exc), metadata={"summary": str(exc)})
@@ -81,6 +91,11 @@ class LocalSystemTool(BaseTool):
             return {
                 "frame_label": "local_system · open_path",
                 "summary": "Dosya arka planda aciliyor",
+            }
+        if action == "launch_app":
+            return {
+                "frame_label": "local_system · launch_app",
+                "summary": "Yerel uygulama başlatılıyor",
             }
         return None
 
@@ -121,6 +136,22 @@ class LocalSystemTool(BaseTool):
                 "resolved_path": resolved.wsl_path,
                 "windows_path": resolved.windows_path,
                 "wsl_path": resolved.wsl_path,
+            },
+        )
+
+    async def _launch_app(self, app: str) -> ToolResult:
+        if not app:
+            return ToolResult(success=False, error="app is required for launch_app")
+        resolved_app = self._normalize_app_command(app)
+        await asyncio.to_thread(self._launch_app_sync, resolved_app)
+        return ToolResult(
+            success=True,
+            output=f"Launched app with the OS shell: {resolved_app}",
+            metadata={
+                "summary": f"Launched {resolved_app}.",
+                "frame_label": "local_system · launch_app",
+                "app": resolved_app,
+                "requested_app": app,
             },
         )
 
@@ -241,6 +272,35 @@ class LocalSystemTool(BaseTool):
                 stderr=sink,
                 start_new_session=True,
             )
+
+    def _launch_app_sync(self, app: str) -> None:
+        if os.name == "nt":
+            os.startfile(app)  # type: ignore[attr-defined]
+            return
+        if self._running_in_wsl():
+            self._run_subprocess(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    "Start-Process",
+                    app,
+                ]
+            )
+            return
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        with open(os.devnull, "wb") as sink:
+            subprocess.Popen(  # noqa: S603
+                [opener, app],
+                stdout=sink,
+                stderr=sink,
+                start_new_session=True,
+            )
+
+    def _normalize_app_command(self, app: str) -> str:
+        return normalize_windows_app_command(app)
 
     def _powershell_stdout(self, script: str, *args: str) -> str:
         candidates = ["powershell.exe"] if self._running_in_wsl() or os.name == "nt" else []

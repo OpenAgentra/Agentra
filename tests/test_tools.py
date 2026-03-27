@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from agentra.tools.base import ToolResult
+from agentra.desktop_automation.models import DesktopActionVerification, WindowInfo
+from agentra.desktop_automation.windows_native import NativeWindowsDesktopBackend
 from agentra.tools.filesystem import FilesystemTool
 from agentra.tools.git_tool import GitTool
 from agentra.tools.local_system import LocalSystemTool, ResolvedLocalPath
@@ -240,6 +242,304 @@ async def test_local_system_open_path_uses_normalized_windows_target(monkeypatch
     assert result.metadata["frame_label"] == "local_system · open_path"
 
 
+@pytest.mark.asyncio
+async def test_local_system_launch_app_normalizes_common_aliases(monkeypatch):
+    tool = LocalSystemTool()
+    launched: list[str] = []
+
+    monkeypatch.setattr(tool, "_launch_app_sync", lambda app: launched.append(app))
+
+    result = await tool.execute(action="launch_app", app="Calculator")
+
+    assert result.success
+    assert launched == ["calc.exe"]
+    assert result.metadata["app"] == "calc.exe"
+    assert result.metadata["requested_app"] == "Calculator"
+
+
+@pytest.mark.asyncio
+async def test_windows_desktop_tool_reports_missing_backend(monkeypatch):
+    from agentra.tools.windows_desktop import WindowsDesktopTool  # noqa: PLC0415
+
+    tool = WindowsDesktopTool()
+    monkeypatch.setattr(tool, "_foreground_window_snapshot", lambda: None)
+    monkeypatch.setattr(tool._backend, "is_available", lambda: (False, "native backend unavailable"))
+
+    result = await tool.execute(action="launch_app", app="Calculator")
+
+    assert not result.success
+    assert "native backend unavailable" in result.error
+    assert result.metadata["desktop_execution_mode"] == "desktop_native"
+
+
+@pytest.mark.asyncio
+async def test_windows_desktop_tool_returns_structured_verification_metadata(monkeypatch):
+    from agentra.tools.windows_desktop import WindowsDesktopTool  # noqa: PLC0415
+
+    tool = WindowsDesktopTool()
+    monkeypatch.setattr(
+        tool._backend,
+        "execute",
+        lambda action, **kwargs: DesktopActionVerification(
+            target="Calculator",
+            action=action,
+            observed_outcome="639",
+            success=True,
+            verified=True,
+            details={"window_title": "Hesap Makinesi"},
+        ),
+    )
+
+    result = await tool.execute(action="read_status", app="Calculator", expected_text="639")
+
+    assert result.success
+    assert result.output == "639"
+    assert result.metadata["verified"] is True
+    assert result.metadata["window_title"] == "Hesap Makinesi"
+
+
+def test_native_windows_backend_launch_app_accepts_profile_id_without_explicit_app(monkeypatch):
+    backend = NativeWindowsDesktopBackend()
+    launched: list[list[str]] = []
+    waits: list[dict[str, object]] = []
+
+    monkeypatch.setattr(backend, "is_available", lambda: (True, None))
+    monkeypatch.setattr(
+        "agentra.desktop_automation.windows_native.subprocess.Popen",
+        lambda args: launched.append(list(args)) or object(),
+    )
+    monkeypatch.setattr(
+        backend,
+        "wait_for_window",
+        lambda **kwargs: (
+            waits.append(dict(kwargs))
+            or DesktopActionVerification(
+                target="calc.exe",
+                action="wait_for_window",
+                observed_outcome="Calculator ready.",
+                success=True,
+                verified=True,
+                details={"window_title": "Calculator"},
+            )
+        ),
+    )
+
+    result = backend.execute("launch_app", profile_id="calculator")
+
+    assert result.success is True
+    assert launched == [["calc.exe"]]
+    assert waits == [{"app": "calc.exe", "profile_id": "calculator", "timeout_sec": None}]
+    assert result.details["requested_app"] == "calc.exe"
+    assert result.details["app"] == "calc.exe"
+
+
+@pytest.mark.asyncio
+async def test_windows_desktop_tool_pauses_when_unrelated_window_is_foreground(monkeypatch):
+    from agentra.tools.windows_desktop import WindowsDesktopTool  # noqa: PLC0415
+
+    tool = WindowsDesktopTool()
+    monkeypatch.setattr(
+        tool,
+        "_foreground_window_snapshot",
+        lambda: {"window_handle": 99, "window_title": "Physics Notes - OneNote"},
+    )
+
+    result = await tool.execute(action="launch_app", profile_id="notepad")
+
+    assert result.success is False
+    assert result.metadata["pause_kind"] == "desktop_control_takeover"
+    assert "gorunur" in result.error.lower()
+
+
+def test_native_windows_backend_uses_calculator_button_sequence(monkeypatch):
+    backend = NativeWindowsDesktopBackend()
+    window = WindowInfo(handle=1, title="Hesap Makinesi")
+    invoked: list[str] = []
+    reads = iter(("before", "after"))
+
+    monkeypatch.setattr(backend, "_resolve_window", lambda **kwargs: window)
+    monkeypatch.setattr(
+        backend,
+        "_invoke_control_by_automation_id",
+        lambda _window, *, automation_id: (
+            invoked.append(automation_id)
+            or DesktopActionVerification(
+                target=automation_id,
+                action="invoke_control",
+                observed_outcome=f"Invoked {automation_id}",
+                success=True,
+                verified=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "read_window_text",
+        lambda **kwargs: DesktopActionVerification(
+            target=window.title,
+            action="read_window_text",
+            observed_outcome=next(reads),
+            success=True,
+            verified=True,
+        ),
+    )
+    monkeypatch.setattr(backend, "_calculator_status", lambda _window: "639")
+
+    result = backend.type_keys(app="Calculator", profile_id="calculator", text="482+157=")
+
+    assert result.success
+    assert invoked == [
+        "clearButton",
+        "num4Button",
+        "num8Button",
+        "num2Button",
+        "plusButton",
+        "num1Button",
+        "num5Button",
+        "num7Button",
+        "equalButton",
+    ]
+
+
+def test_native_windows_backend_reads_calculator_result_from_native_result_control(monkeypatch):
+    backend = NativeWindowsDesktopBackend()
+    window = WindowInfo(handle=1, title="Hesap Makinesi")
+
+    class FakeControl:
+        Name = "Ekran değeri 639"
+        AutomationId = "CalculatorResults"
+
+    monkeypatch.setattr(
+        backend,
+        "_resolve_control",
+        lambda _window, **kwargs: FakeControl() if kwargs.get("automation_id") == "CalculatorResults" else None,
+    )
+
+    assert backend._calculator_status(window) == "639"
+
+
+def test_native_windows_backend_keeps_incremental_calculator_state_between_type_calls(monkeypatch):
+    backend = NativeWindowsDesktopBackend()
+    window = WindowInfo(handle=1, title="Hesap Makinesi")
+    invoked: list[str] = []
+    reads = iter(
+        (
+            "before-1",
+            "after-1",
+            "before-2",
+            "after-2",
+            "before-3",
+            "after-3",
+            "before-4",
+            "after-4",
+        )
+    )
+    statuses = iter(("482", "482", "157", "639"))
+
+    monkeypatch.setattr(backend, "_resolve_window", lambda **kwargs: window)
+    monkeypatch.setattr(
+        backend,
+        "_invoke_control_by_automation_id",
+        lambda _window, *, automation_id: (
+            invoked.append(automation_id)
+            or DesktopActionVerification(
+                target=automation_id,
+                action="invoke_control",
+                observed_outcome=f"Invoked {automation_id}",
+                success=True,
+                verified=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "read_window_text",
+        lambda **kwargs: DesktopActionVerification(
+            target=window.title,
+            action="read_window_text",
+            observed_outcome=next(reads),
+            success=True,
+            verified=True,
+        ),
+    )
+    monkeypatch.setattr(backend, "_calculator_status", lambda _window: next(statuses))
+
+    assert backend.type_keys(app="Calculator", profile_id="calculator", text="482").success
+    assert backend.type_keys(app="Calculator", profile_id="calculator", text="+").success
+    assert backend.type_keys(app="Calculator", profile_id="calculator", text="157").success
+    assert backend.type_keys(app="Calculator", profile_id="calculator", text="=").success
+
+    assert invoked == [
+        "clearButton",
+        "num4Button",
+        "num8Button",
+        "num2Button",
+        "plusButton",
+        "num1Button",
+        "num5Button",
+        "num7Button",
+        "equalButton",
+    ]
+
+
+def test_native_windows_backend_translates_agent_send_keys_syntax():
+    translated = NativeWindowsDesktopBackend._translate_send_keys_text(
+        "{UP}{HOME}{SHIFT+END}{CTRL+C}{END}{DOWN}{CTRL+V}"
+    )
+
+    assert translated == "{Up}{Home}{Shift}{End}{Ctrl}c{End}{Down}{Ctrl}v"
+
+
+def test_native_windows_backend_uses_translated_send_keys_for_standard_windows_apps(monkeypatch):
+    backend = NativeWindowsDesktopBackend()
+    window = WindowInfo(handle=1, title="Adsiz - Not Defteri")
+
+    class FakeRoot:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def SendKeys(self, text: str, interval: float, waitTime: float) -> None:  # noqa: N802
+            self.sent.append(text)
+
+    root = FakeRoot()
+    reads = iter(("line1\nline2", "line1\nline2\nline2"))
+
+    monkeypatch.setattr(backend, "_resolve_window", lambda **kwargs: window)
+    monkeypatch.setattr(backend, "_control_root", lambda _window: root)
+    monkeypatch.setattr(
+        backend,
+        "focus_window",
+        lambda **kwargs: DesktopActionVerification(
+            target=window.title,
+            action="focus_window",
+            observed_outcome="Focused",
+            success=True,
+            verified=True,
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "read_window_text",
+        lambda **kwargs: DesktopActionVerification(
+            target=window.title,
+            action="read_window_text",
+            observed_outcome=next(reads),
+            success=True,
+            verified=True,
+        ),
+    )
+
+    result = backend.type_keys(
+        app="Notepad",
+        profile_id="notepad",
+        text="{UP}{HOME}{SHIFT+END}{CTRL+C}{END}{DOWN}{CTRL+V}",
+    )
+
+    assert result.success
+    assert root.sent == ["{Up}{Home}{Shift}{End}{Ctrl}c{End}{Down}{Ctrl}v"]
+    assert result.details["translated_text"] == "{Up}{Home}{Shift}{End}{Ctrl}c{End}{Down}{Ctrl}v"
+
+
 # ── GitTool ───────────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -342,3 +642,55 @@ async def test_computer_tool_preview_describes_desktop_action():
     assert preview is not None
     assert preview["frame_label"] == "computer · click"
     assert "desktop" in preview["summary"].lower()
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_pauses_when_agentra_window_is_foreground(monkeypatch):
+    from agentra.tools.computer import ComputerTool  # noqa: PLC0415
+
+    tool = ComputerTool(allow=True)
+    monkeypatch.setattr(
+        tool,
+        "_capture_desktop_observation",
+        lambda: {
+            "window_handle": 123,
+            "window_title": "Agentra - Live Preview",
+            "cursor_x": 40,
+            "cursor_y": 20,
+        },
+    )
+
+    result = await tool.execute(action="type", text="hello")
+
+    assert result.success is False
+    assert result.metadata["pause_kind"] == "desktop_control_takeover"
+    assert "Agentra" in result.error
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_pauses_when_desktop_state_drifted(monkeypatch):
+    from agentra.tools.computer import ComputerTool  # noqa: PLC0415
+
+    tool = ComputerTool(allow=True)
+    tool._last_observation = {
+        "window_handle": 100,
+        "window_title": "Untitled - Notepad",
+        "cursor_x": 80,
+        "cursor_y": 90,
+    }
+    monkeypatch.setattr(
+        tool,
+        "_capture_desktop_observation",
+        lambda: {
+            "window_handle": 200,
+            "window_title": "Another App",
+            "cursor_x": 140,
+            "cursor_y": 160,
+        },
+    )
+
+    result = await tool.execute(action="click", x=10, y=10)
+
+    assert result.success is False
+    assert result.metadata["pause_kind"] == "desktop_control_takeover"
+    assert "beklenmedik" in result.metadata["summary"]

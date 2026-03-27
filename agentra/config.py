@@ -83,12 +83,23 @@ class AgentConfig(BaseSettings):
     # ── Browser ────────────────────────────────────────────────────────────────
     browser_headless: bool = Field(default=False)
     browser_type: Literal["chromium", "firefox", "webkit"] = Field(default="chromium")
+    browser_identity: Literal["isolated", "chrome_profile"] = Field(default="isolated")
+    browser_profile_name: str = Field(default="Default")
 
     # ── Local execution policy ────────────────────────────────────────────────
-    local_execution_mode: Literal["visible", "under_the_hood"] = Field(default="visible")
+    local_execution_mode: Literal["visible", "under_the_hood", "native"] = Field(default="visible")
     desktop_fallback_policy: Literal["visible_control", "pause_and_ask"] = Field(
         default="visible_control"
     )
+    desktop_execution_mode: Literal["desktop_native", "desktop_visible", "desktop_hidden"] = Field(
+        default="desktop_visible"
+    )
+    desktop_backend_preference: Literal["native", "visible", "under_the_hood"] = Field(
+        default="visible"
+    )
+
+    # ── Permission mode ──────────────────────────────────────────────────────
+    permission_mode: Literal["default", "full"] = Field(default="default")
 
     # ── Safety ────────────────────────────────────────────────────────────────
     allow_terminal: bool = Field(default=True)
@@ -114,6 +125,12 @@ class AgentConfig(BaseSettings):
         openai_default = get_provider_spec("openai").default_model
         if not self.llm_model or (self.llm_provider != "openai" and self.llm_model == openai_default):
             self.llm_model = provider_default
+        if self.permission_mode == "full":
+            self.browser_identity = "chrome_profile"
+            self.browser_headless = False
+        elif self.browser_identity == "chrome_profile":
+            self.permission_mode = "full"
+            self.browser_headless = False
         return self
 
     @property

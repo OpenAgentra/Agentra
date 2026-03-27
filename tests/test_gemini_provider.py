@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import aiohttp
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 from google.genai import types
 
+import agentra.llm.gemini_provider as gemini_provider_module
 from agentra.config import AgentConfig
 from agentra.llm.base import LLMMessage, LLMToolResult
 from agentra.llm.gemini_provider import GeminiProvider
@@ -26,7 +29,10 @@ class FakeModels:
 
     async def generate_content(self, **kwargs):
         self.calls.append(kwargs)
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 class FakeAioClient:
@@ -227,3 +233,50 @@ async def test_gemini_provider_serializes_multimodal_user_messages(monkeypatch, 
     assert call["contents"][0].parts[1].inline_data.mime_type == "image/png"
     assert call["contents"][0].parts[1].inline_data.data.startswith(b"\x89PNG")
     assert response.content == "DONE: I can see the screenshot."
+
+
+def test_gemini_provider_backfills_missing_aiohttp_dns_error_alias(monkeypatch, tmp_path) -> None:
+    import aiohttp
+
+    state = _install_fake_client(monkeypatch, [_make_response(text="DONE: ok")])
+    monkeypatch.delattr(aiohttp, "ClientConnectorDNSError", raising=False)
+
+    GeminiProvider(_config(tmp_path))
+
+    assert aiohttp.ClientConnectorDNSError is aiohttp.ClientConnectorError
+    assert state["client"].init_kwargs["api_key"] == "test-key"
+
+
+@pytest.mark.asyncio
+async def test_gemini_provider_retries_transient_server_disconnect(monkeypatch, tmp_path) -> None:
+    import google.genai
+
+    created_clients: list[FakeClient] = []
+    response_batches = [
+        [aiohttp.ServerDisconnectedError()],
+        [_make_response(text="DONE: recovered after retry")],
+    ]
+
+    def fake_client(*, api_key=None, http_options=None):
+        responses = response_batches.pop(0)
+        client = FakeClient(responses, api_key=api_key, http_options=http_options)
+        created_clients.append(client)
+        return client
+
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr(google.genai, "Client", fake_client)
+    monkeypatch.setattr(gemini_provider_module.asyncio, "sleep", fake_sleep)
+
+    provider = GeminiProvider(_config(tmp_path))
+    response = await provider.complete([LLMMessage(role="user", content="Ping")])
+
+    assert response.content == "DONE: recovered after retry"
+    assert len(created_clients) == 2
+    assert created_clients[0].aio.closed is True
+    assert len(created_clients[0].aio.models.calls) == 1
+    assert len(created_clients[1].aio.models.calls) == 1
+    assert sleep_delays == [pytest.approx(0.35)]

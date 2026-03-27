@@ -161,14 +161,19 @@ async def test_live_app_root_renders_operator_console(tmp_path: Path) -> None:
         response = await client.get("/")
 
     assert response.status_code == 200
-    assert "Otonom Ajan - Görev Paneli" in response.text
+    assert "Ajan" in response.text
     assert "Logs" in response.text
     assert "Yeni Run" in response.text
     assert "Threadler" in response.text
     assert "Seçili Thread" in response.text
     assert "Bekleyen Onaylar" in response.text
     assert "Bekleyen Sorular" in response.text
+    assert "İzin modu" in response.text
+    assert "Default" in response.text
+    assert "Full" in response.text
     assert "Manuel Browser Kontrolleri" not in response.text
+    assert 'data-manual-layer="browser"' not in response.text
+    assert 'data-manual-layer="desktop"' not in response.text
     assert '<div class="section-title">Audit</div>' not in response.text
     assert "Yeni thread'de başlat" in response.text
     assert "Seçili thread'e ekle" in response.text
@@ -176,6 +181,8 @@ async def test_live_app_root_renders_operator_console(tmp_path: Path) -> None:
     assert "Agentra Canlı Kumanda" not in response.text
     assert "Sağlayıcı" not in response.text
     assert "Model" not in response.text
+    assert response.text.count("function mount()") == 1
+    assert response.text.count("async function startRun(") == 1
 
 
 @pytest.mark.asyncio
@@ -272,6 +279,56 @@ async def test_live_app_run_state_exposes_frames_assets_and_report(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_live_app_restores_persisted_threads_and_runs_after_restart(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Persist this run"})
+        assert create_response.status_code == 200
+        run_id = create_response.json()["run_id"]
+        thread_id = create_response.json()["thread_id"]
+        completed_snapshot = await _wait_for_completion(client, run_id)
+
+    restored_app = _make_app(tmp_path, [])
+    restored_transport = httpx.ASGITransport(app=restored_app)
+    async with httpx.AsyncClient(transport=restored_transport, base_url="http://testserver") as client:
+        threads_response = await client.get("/threads")
+        assert threads_response.status_code == 200
+        threads = threads_response.json()["threads"]
+        assert len(threads) == 1
+        assert threads[0]["thread_id"] == thread_id
+        assert threads[0]["current_run_id"] is None
+        assert threads[0]["active_run_summary"] is None
+        assert threads[0]["runs"][0]["run_id"] == run_id
+        assert "active_run" not in threads[0]
+
+        thread_response = await client.get(f"/threads/{thread_id}")
+        assert thread_response.status_code == 200
+        assert thread_response.json()["active_run"] is None
+        assert thread_response.json()["runs"][0]["run_id"] == run_id
+        assert thread_response.json()["recovered_from_disk"] is True
+        assert thread_response.json()["restart_required"] is False
+
+        run_response = await client.get(f"/runs/{run_id}")
+        assert run_response.status_code == 200
+        restored_snapshot = run_response.json()
+        assert restored_snapshot["run_id"] == run_id
+        assert restored_snapshot["status"] == "completed"
+        assert restored_snapshot["frames"][0]["image_url"].startswith(f"/runs/{run_id}/assets/")
+
+        asset_response = await client.get(restored_snapshot["frames"][0]["image_url"])
+        report_response = await client.get(restored_snapshot["report_url"])
+
+    assert completed_snapshot["run_id"] == run_id
+    assert asset_response.status_code == 200
+    assert asset_response.content
+    assert report_response.status_code == 200
+    assert "Agentra Run Report" in report_response.text
+
+
+@pytest.mark.asyncio
 async def test_live_app_chooses_under_the_hood_policy_for_local_document_goal(tmp_path: Path) -> None:
     created_agents: list[FakeAgent] = []
     app = _make_app(tmp_path, created_agents)
@@ -309,6 +366,33 @@ async def test_live_app_chooses_visible_desktop_policy_for_visual_local_goal(tmp
     assert agent_config.browser_headless is True
     assert agent_config.local_execution_mode == "visible"
     assert agent_config.desktop_fallback_policy == "visible_control"
+
+
+@pytest.mark.asyncio
+async def test_live_app_chooses_native_desktop_policy_for_standard_windows_app_goal(
+    tmp_path: Path,
+) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post(
+            "/runs",
+            json={
+                "goal": (
+                    "Masaustu katmaninda calis: Windows Hesap Makinesi'ni ac ve 482 + 157 "
+                    "islemini yap. Tarayici kullanma."
+                )
+            },
+        )
+        assert create_response.status_code == 200
+        await _wait_for_agent_creation(created_agents)
+
+    agent_config = created_agents[-1].config
+    assert agent_config.local_execution_mode == "native"
+    assert agent_config.desktop_execution_mode == "desktop_native"
+    assert agent_config.desktop_backend_preference == "native"
 
 
 @pytest.mark.asyncio
@@ -354,6 +438,125 @@ async def test_live_app_respects_explicit_headless_override(tmp_path: Path) -> N
         await _wait_for_agent_creation(created_agents)
 
     assert created_agents[-1].config.browser_headless is False
+
+
+@pytest.mark.asyncio
+async def test_live_app_new_thread_persists_permission_mode_and_browser_identity(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post(
+            "/runs",
+            json={"goal": "Open python.org with my real environment", "permission_mode": "full"},
+        )
+        assert create_response.status_code == 200
+        payload = create_response.json()
+        await _wait_for_agent_creation(created_agents)
+
+        thread_response = await client.get(f"/threads/{payload['thread_id']}")
+        assert thread_response.status_code == 200
+        thread_payload = thread_response.json()
+
+    agent_config = created_agents[-1].config
+    assert agent_config.permission_mode == "full"
+    assert agent_config.browser_identity == "chrome_profile"
+    assert agent_config.browser_headless is False
+    assert thread_payload["permission_mode"] == "full"
+    assert thread_payload["browser_identity"] == "chrome_profile"
+
+
+@pytest.mark.asyncio
+async def test_live_app_new_thread_infers_full_mode_from_real_browser_goal(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post(
+            "/runs",
+            json={"goal": "Chrome profilimi kullanarak GitHub hesabimi ac ve hesabima ait Agentra reposunu bul."},
+        )
+        assert create_response.status_code == 200
+        payload = create_response.json()
+        await _wait_for_agent_creation(created_agents)
+
+        thread_response = await client.get(f"/threads/{payload['thread_id']}")
+        assert thread_response.status_code == 200
+        thread_payload = thread_response.json()
+
+    agent_config = created_agents[-1].config
+    assert agent_config.permission_mode == "full"
+    assert agent_config.browser_identity == "chrome_profile"
+    assert agent_config.browser_headless is False
+    assert thread_payload["permission_mode"] == "full"
+    assert thread_payload["browser_identity"] == "chrome_profile"
+
+
+@pytest.mark.asyncio
+async def test_live_app_explicit_default_mode_overrides_real_browser_inference(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post(
+            "/runs",
+            json={
+                "goal": "Chrome profilimi kullanarak GitHub hesabimi ac ve hesabima ait Agentra reposunu bul.",
+                "permission_mode": "default",
+            },
+        )
+        assert create_response.status_code == 200
+        payload = create_response.json()
+        await _wait_for_agent_creation(created_agents)
+
+        thread_response = await client.get(f"/threads/{payload['thread_id']}")
+        assert thread_response.status_code == 200
+        thread_payload = thread_response.json()
+
+    agent_config = created_agents[-1].config
+    assert agent_config.permission_mode == "default"
+    assert agent_config.browser_identity == "isolated"
+    assert thread_payload["permission_mode"] == "default"
+    assert thread_payload["browser_identity"] == "isolated"
+
+
+@pytest.mark.asyncio
+async def test_live_app_thread_settings_endpoint_updates_future_runs(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first_response = await client.post("/runs", json={"goal": "First run on default mode"})
+        assert first_response.status_code == 200
+        first_payload = first_response.json()
+        await _wait_for_agent_creation(created_agents)
+        await _wait_for_completion(client, first_payload["run_id"])
+
+        update_response = await client.patch(
+            f"/threads/{first_payload['thread_id']}",
+            json={"permission_mode": "full"},
+        )
+        assert update_response.status_code == 200
+        assert update_response.json()["permission_mode"] == "full"
+
+        second_response = await client.post(
+            "/runs",
+            json={
+                "goal": "Second run with full mode",
+                "thread_id": first_payload["thread_id"],
+                "permission_mode": "default",
+            },
+        )
+        assert second_response.status_code == 200
+        await _wait_for_completion(client, second_response.json()["run_id"])
+
+    assert created_agents[0].config.permission_mode == "default"
+    assert created_agents[-1].config.permission_mode == "full"
+    assert created_agents[-1].config.browser_identity == "chrome_profile"
 
 
 @pytest.mark.asyncio
@@ -505,6 +708,28 @@ async def test_live_app_supports_pause_approval_question_and_manual_action(tmp_p
             for event in computer_payload["active_run"]["events"]
         )
 
+        fast_action_response = await client.post(
+            f"/threads/{thread_id}/actions",
+            json={
+                "tool": "browser",
+                "args": {
+                    "action": "click",
+                    "x": 120,
+                    "y": 80,
+                    "capture_result_screenshot": False,
+                    "capture_follow_up_screenshots": False,
+                },
+                "return_snapshot": False,
+            },
+        )
+        assert fast_action_response.status_code == 200
+        fast_payload = fast_action_response.json()
+        assert fast_payload["ok"] is True
+        assert fast_payload["tool"] == "browser"
+        assert fast_payload["success"] is True
+        assert fast_payload["manual_fast_path"] is True
+        assert "active_run" not in fast_payload
+
         resume_response = await client.post(f"/threads/{thread_id}/resume")
         assert resume_response.status_code == 200
         assert created_agents[-1].paused is False
@@ -565,6 +790,42 @@ async def test_live_app_exposes_live_browser_stream_route(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_live_app_archives_live_browser_frames_in_run_debug_images(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    manager = app.state.manager
+    transport = httpx.ASGITransport(app=app)
+
+    async def fake_capture(thread_id: str):
+        assert thread_id.startswith("thread-")
+        return SimpleNamespace(data=b"jpeg-live-frame", media_type="image/jpeg")
+
+    manager.browser_sessions.capture_live_frame = fake_capture
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Archive browser live debug images"})
+        assert create_response.status_code == 200
+        payload = create_response.json()
+        thread_id = payload["thread_id"]
+        run_id = payload["run_id"]
+
+        first = await client.get(f"/threads/{thread_id}/live-frame")
+        second = await client.get(f"/threads/{thread_id}/live-frame")
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        run_dir = manager.get_session(run_id).report.run_dir
+        debug_files = list((run_dir / "debug-images" / "live-browser").glob("*.jpg"))
+        assert len(debug_files) == 1
+
+        debug_response = await client.get(
+            f"/runs/{run_id}/debug-images/live-browser/{debug_files[0].name}"
+        )
+        assert debug_response.status_code == 200
+        assert debug_response.content == b"jpeg-live-frame"
+
+
+@pytest.mark.asyncio
 async def test_live_app_exposes_live_desktop_frame_route(tmp_path: Path) -> None:
     created_agents: list[FakeAgent] = []
     app = _make_app(tmp_path, created_agents)
@@ -614,3 +875,32 @@ async def test_live_app_exposes_live_desktop_stream_route(tmp_path: Path) -> Non
 
     assert b"Content-Type: image/png" in first_chunk
     assert b"desktop-live-frame" in first_chunk
+
+
+@pytest.mark.asyncio
+async def test_live_app_logs_page_lists_debug_images_for_run(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    manager = app.state.manager
+    transport = httpx.ASGITransport(app=app)
+
+    async def fake_capture(thread_id: str):
+        assert thread_id.startswith("thread-")
+        return SimpleNamespace(data=b"jpeg-live-frame", media_type="image/jpeg")
+
+    manager.browser_sessions.capture_live_frame = fake_capture
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post("/runs", json={"goal": "Show debug images in logs"})
+        assert create_response.status_code == 200
+        payload = create_response.json()
+
+        await client.get(f"/threads/{payload['thread_id']}/live-frame")
+        logs_response = await client.get(
+            "/logs",
+            params={"run_id": payload["run_id"], "thread_id": payload["thread_id"]},
+        )
+
+    assert logs_response.status_code == 200
+    assert "Debug Images" in logs_response.text
+    assert f"/runs/{payload['run_id']}/debug-images/live-browser/" in logs_response.text

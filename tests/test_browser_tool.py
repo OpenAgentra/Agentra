@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+import agentra.tools.browser as browser_module
 from agentra.tools.browser import BrowserTool
 
 
@@ -19,6 +22,16 @@ class FakeLocator:
 
     async def bounding_box(self) -> dict[str, float] | None:
         return self._box
+
+
+class SlowLocator:
+    @property
+    def first(self) -> "SlowLocator":
+        return self
+
+    async def bounding_box(self) -> dict[str, float] | None:
+        await asyncio.sleep(0.05)
+        return None
 
 
 class FakeMouse:
@@ -173,6 +186,23 @@ async def test_browser_preview_returns_visual_intent_metadata() -> None:
     assert preview["frame_label"] == "browser · click"
     assert preview["summary"] == "Clicking #cta"
     assert preview["focus_x"] == pytest.approx(0.2)
+    assert preview["focus_y"] == pytest.approx(0.2)
+
+
+@pytest.mark.asyncio
+async def test_browser_preview_fast_falls_back_when_selector_lookup_times_out(monkeypatch) -> None:
+    tool = BrowserTool(headless=True)
+    tool._page = FakePage()
+    tool._page.locator = lambda selector: SlowLocator()
+    monkeypatch.setattr(browser_module, "_SELECTOR_FOCUS_TIMEOUT_SECONDS", 0.01)
+
+    started = asyncio.get_running_loop().time()
+    preview = await tool.preview(action="click", selector="#missing")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert preview is not None
+    assert elapsed < 0.05
+    assert preview["focus_x"] == pytest.approx(0.74)
     assert preview["focus_y"] == pytest.approx(0.2)
 
 
