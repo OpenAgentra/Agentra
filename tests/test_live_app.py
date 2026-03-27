@@ -391,7 +391,7 @@ async def test_live_app_chooses_native_desktop_policy_for_standard_windows_app_g
 
     agent_config = created_agents[-1].config
     assert agent_config.local_execution_mode == "native"
-    assert agent_config.desktop_execution_mode == "desktop_native"
+    assert agent_config.desktop_execution_mode == "desktop_hidden"
     assert agent_config.desktop_backend_preference == "native"
 
 
@@ -538,10 +538,11 @@ async def test_live_app_thread_settings_endpoint_updates_future_runs(tmp_path: P
 
         update_response = await client.patch(
             f"/threads/{first_payload['thread_id']}",
-            json={"permission_mode": "full"},
+            json={"permission_mode": "full", "desktop_execution_mode": "desktop_hidden"},
         )
         assert update_response.status_code == 200
         assert update_response.json()["permission_mode"] == "full"
+        assert update_response.json()["desktop_execution_mode_override"] == "desktop_hidden"
 
         second_response = await client.post(
             "/runs",
@@ -557,6 +558,34 @@ async def test_live_app_thread_settings_endpoint_updates_future_runs(tmp_path: P
     assert created_agents[0].config.permission_mode == "default"
     assert created_agents[-1].config.permission_mode == "full"
     assert created_agents[-1].config.browser_identity == "chrome_profile"
+    assert created_agents[-1].config.desktop_execution_mode == "desktop_hidden"
+
+
+@pytest.mark.asyncio
+async def test_live_app_thread_snapshot_exposes_desktop_session_payload(tmp_path: Path) -> None:
+    created_agents: list[FakeAgent] = []
+    app = _make_app(tmp_path, created_agents)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        create_response = await client.post(
+            "/runs",
+            json={
+                "goal": (
+                    "Masaustu katmaninda calis: Windows Hesap Makinesi'ni ac ve 482 + 157 "
+                    "islemini yap. Tarayici kullanma."
+                )
+            },
+        )
+        assert create_response.status_code == 200
+        payload = create_response.json()
+
+        thread_response = await client.get(f"/threads/{payload['thread_id']}")
+        assert thread_response.status_code == 200
+        thread_payload = thread_response.json()
+
+    assert thread_payload["desktop_session"]["mode"] == "desktop_hidden"
+    assert thread_payload["desktop_session"]["desktop_backend"] == "hidden_windows"
 
 
 @pytest.mark.asyncio

@@ -1048,6 +1048,7 @@ class AutonomousAgent:
         thread_id: str | None = None,
         run_id: str | None = None,
         browser_sessions: Any = None,
+        desktop_sessions: Any = None,
         approval_engine: ApprovalPolicyEngine | None = None,
     ) -> None:
         """Attach thread-aware runtime primitives to the agent."""
@@ -1062,6 +1063,7 @@ class AutonomousAgent:
             if callable(binder):
                 kwargs = {
                     "browser_sessions": browser_sessions,
+                    "desktop_sessions": desktop_sessions,
                     "thread_id": thread_id,
                     "controller": controller,
                     "scheduler": scheduler,

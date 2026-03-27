@@ -31,10 +31,28 @@ class WindowsDesktopTool(BaseTool):
     def __init__(self) -> None:
         self._backend = NativeWindowsDesktopBackend()
         self._runtime_controller: Any = None
+        self._desktop_sessions: Any = None
+        self._thread_id: str | None = None
 
-    def bind_runtime(self, *, controller: Any = None, **_: Any) -> None:
+    def bind_runtime(
+        self,
+        *,
+        controller: Any = None,
+        desktop_sessions: Any = None,
+        thread_id: str | None = None,
+        **_: Any,
+    ) -> None:
         """Attach runtime helpers such as preview-window parking."""
         self._runtime_controller = controller
+        self._desktop_sessions = desktop_sessions
+        self._thread_id = thread_id
+
+    @property
+    def capabilities(self) -> tuple[str, ...]:
+        session_capability = self._hidden_session_capability()
+        if session_capability:
+            return (session_capability, "windows_desktop")
+        return super().capabilities
 
     @property
     def schema(self) -> dict[str, Any]:
@@ -117,6 +135,32 @@ class WindowsDesktopTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         action = str(kwargs.get("action", "") or "").strip().lower()
+        session_capability = self._hidden_session_capability()
+        if session_capability and self._desktop_sessions is not None and self._thread_id:
+            backend_kwargs = dict(kwargs)
+            backend_kwargs.pop("action", None)
+            try:
+                verification = await asyncio.to_thread(
+                    self._desktop_sessions.execute_windows_action,
+                    self._thread_id,
+                    action,
+                    **backend_kwargs,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return ToolResult(success=False, error=str(exc))
+            summary = verification.observed_outcome or verification.fallback_reason or "Hidden desktop action completed."
+            metadata = verification.metadata(
+                backend="hidden_windows",
+                desktop_execution_mode="desktop_hidden",
+                frame_label=f"windows_desktop · {action or 'action'}",
+                summary=summary,
+            )
+            return ToolResult(
+                success=verification.success,
+                output=verification.observed_outcome,
+                error="" if verification.success else verification.fallback_reason or verification.observed_outcome,
+                metadata=metadata,
+            )
         desktop_conflict = self._desktop_control_conflict(action, kwargs)
         if desktop_conflict is not None:
             return ToolResult(
@@ -141,6 +185,17 @@ class WindowsDesktopTool(BaseTool):
             error="" if verification.success else verification.fallback_reason or verification.observed_outcome,
             metadata=metadata,
         )
+
+    def _hidden_session_capability(self) -> str | None:
+        if self._desktop_sessions is None or not self._thread_id:
+            return None
+        capability = getattr(self._desktop_sessions, "hidden_capability", None)
+        if not callable(capability):
+            return None
+        try:
+            return capability(self._thread_id)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _prepare_visible_desktop_action(self, action: str) -> bool:
         normalized_action = str(action or "").strip().lower()

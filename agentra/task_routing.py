@@ -310,6 +310,16 @@ def goal_prefers_native_windows_desktop_execution(goal: str) -> bool:
     return not _contains_any_phrase(_desktop_detection_text(goal), _VISIBLE_DESKTOP_ONLY_TERMS)
 
 
+def goal_prefers_visible_desktop_execution(goal: str) -> bool:
+    if not goal_has_local_desktop_component(goal):
+        return False
+    normalized = _desktop_detection_text(goal)
+    return _contains_any_phrase(normalized, _VISIBLE_DESKTOP_PREFERENCE_TERMS) or _contains_any_phrase(
+        normalized,
+        _VISIBLE_DESKTOP_ONLY_TERMS,
+    )
+
+
 def goal_requests_real_browser_context(goal: str) -> bool:
     normalized = _normalized_text(goal)
     if not normalized:
@@ -353,30 +363,39 @@ def choose_live_execution_policy(
                 desktop_execution_mode="desktop_hidden",
                 desktop_backend_preference="under_the_hood",
             )
-        if goal_prefers_native_windows_desktop_execution(goal):
-            return LiveExecutionPolicy(
-                browser_headless=browser_headless,
-                local_execution_mode="native",
-                desktop_fallback_policy="visible_control",
-                control_surface_hint="browser" if goal_has_mixed_web_and_local_desktop_components(goal) else "desktop",
-                desktop_execution_mode="desktop_native",
-                desktop_backend_preference="native",
-            )
-        if goal_has_mixed_web_and_local_desktop_components(goal):
+        if goal_prefers_visible_desktop_execution(goal):
+            if goal_prefers_native_windows_desktop_execution(goal):
+                return LiveExecutionPolicy(
+                    browser_headless=browser_headless,
+                    local_execution_mode="native",
+                    desktop_fallback_policy="visible_control",
+                    control_surface_hint="browser" if goal_has_mixed_web_and_local_desktop_components(goal) else "desktop",
+                    desktop_execution_mode="desktop_native",
+                    desktop_backend_preference="native",
+                )
             return LiveExecutionPolicy(
                 browser_headless=browser_headless,
                 local_execution_mode="visible",
                 desktop_fallback_policy="visible_control",
-                control_surface_hint="browser",
+                control_surface_hint="browser" if goal_has_mixed_web_and_local_desktop_components(goal) else "desktop",
                 desktop_execution_mode="desktop_visible",
                 desktop_backend_preference="visible",
             )
+        if goal_prefers_native_windows_desktop_execution(goal):
+            return LiveExecutionPolicy(
+                browser_headless=browser_headless,
+                local_execution_mode="native",
+                desktop_fallback_policy="pause_and_ask",
+                control_surface_hint="browser" if goal_has_mixed_web_and_local_desktop_components(goal) else "desktop",
+                desktop_execution_mode="desktop_hidden",
+                desktop_backend_preference="native",
+            )
         return LiveExecutionPolicy(
             browser_headless=browser_headless,
-            local_execution_mode="visible",
-            desktop_fallback_policy="visible_control",
-            control_surface_hint="desktop",
-            desktop_execution_mode="desktop_visible",
+            local_execution_mode="native" if goal_has_mixed_web_and_local_desktop_components(goal) else "visible",
+            desktop_fallback_policy="pause_and_ask",
+            control_surface_hint="browser" if goal_has_mixed_web_and_local_desktop_components(goal) else "desktop",
+            desktop_execution_mode="desktop_hidden",
             desktop_backend_preference="visible",
         )
 

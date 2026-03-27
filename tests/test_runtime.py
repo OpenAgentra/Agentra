@@ -331,7 +331,7 @@ async def test_thread_manager_chooses_native_desktop_policy_for_standard_windows
     session = await _wait_for_run(manager, snapshot["run_id"])
 
     assert session.config.local_execution_mode == "native"
-    assert session.config.desktop_execution_mode == "desktop_native"
+    assert session.config.desktop_execution_mode == "desktop_hidden"
     assert session.config.desktop_backend_preference == "native"
     thread = manager.get_thread(snapshot["thread_id"])
     run_started_entries = [
@@ -341,8 +341,9 @@ async def test_thread_manager_chooses_native_desktop_policy_for_standard_windows
     assert run_started_entries
     details = run_started_entries[-1]["details"]
     assert details["local_execution_mode"] == "native"
-    assert details["desktop_execution_mode"] == "desktop_native"
+    assert details["desktop_execution_mode"] == "desktop_hidden"
     assert details["desktop_backend_preference"] == "native"
+    assert snapshot["desktop_session"]["mode"] == "desktop_hidden"
 
 
 @pytest.mark.asyncio
@@ -423,6 +424,65 @@ async def test_execution_scheduler_serializes_computer_capability() -> None:
         ["start:a", "end:a", "start:b", "end:b"],
         ["start:b", "end:b", "start:a", "end:a"],
     )
+
+
+@pytest.mark.asyncio
+async def test_execution_scheduler_allows_parallel_hidden_sessions() -> None:
+    scheduler = ExecutionScheduler()
+    order: list[str] = []
+
+    async def job(name: str) -> None:
+        async with scheduler.reserve((f"desktop_session:{name}",), thread_id=name, tool_name="computer"):
+            order.append(f"start:{name}")
+            await asyncio.sleep(0.02)
+            order.append(f"end:{name}")
+
+    await asyncio.gather(job("a"), job("b"))
+
+    assert order[0:2] == ["start:a", "start:b"] or order[0:2] == ["start:b", "start:a"]
+    assert set(order) == {"start:a", "end:a", "start:b", "end:b"}
+
+
+@pytest.mark.asyncio
+async def test_execution_scheduler_serializes_same_hidden_session() -> None:
+    scheduler = ExecutionScheduler()
+    order: list[str] = []
+
+    async def job(name: str) -> None:
+        async with scheduler.reserve(("desktop_session:shared",), thread_id=name, tool_name="computer"):
+            order.append(f"start:{name}")
+            await asyncio.sleep(0.02)
+            order.append(f"end:{name}")
+
+    await asyncio.gather(job("a"), job("b"))
+
+    assert order in (
+        ["start:a", "end:a", "start:b", "end:b"],
+        ["start:b", "end:b", "start:a", "end:a"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_execution_scheduler_does_not_block_hidden_session_on_visible_desktop_lock() -> None:
+    scheduler = ExecutionScheduler()
+    order: list[str] = []
+
+    async def visible_job() -> None:
+        async with scheduler.reserve(("computer",), thread_id="visible", tool_name="computer"):
+            order.append("visible:start")
+            await asyncio.sleep(0.03)
+            order.append("visible:end")
+
+    async def hidden_job() -> None:
+        await asyncio.sleep(0.005)
+        async with scheduler.reserve(("desktop_session:hidden",), thread_id="hidden", tool_name="computer"):
+            order.append("hidden:start")
+            await asyncio.sleep(0.01)
+            order.append("hidden:end")
+
+    await asyncio.gather(visible_job(), hidden_job())
+
+    assert order.index("hidden:start") < order.index("visible:end")
 
 
 @pytest.mark.asyncio

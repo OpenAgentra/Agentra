@@ -20,6 +20,7 @@ from agentra.approval_policy import (
 )
 from agentra.browser_runtime import BrowserSessionManager, LiveBrowserFrame
 from agentra.config import AgentConfig
+from agentra.desktop_automation import DesktopLiveFrame, DesktopSessionManager
 from agentra.desktop_automation.preview_windows import PreviewWindowManager
 from agentra.llm.registry import get_provider_spec
 from agentra.logging_utils import exception_details_with_context
@@ -168,6 +169,7 @@ class ThreadSession:
     recovered_from_disk: bool = False
     restart_required: bool = False
     restart_notice: str = ""
+    desktop_execution_mode_override: str | None = None
 
 
 class ExecutionScheduler:
@@ -175,6 +177,7 @@ class ExecutionScheduler:
 
     def __init__(self) -> None:
         self._computer_lock = asyncio.Lock()
+        self._hidden_session_locks: dict[str, asyncio.Lock] = {}
 
     @asynccontextmanager
     async def reserve(
@@ -185,16 +188,31 @@ class ExecutionScheduler:
         tool_name: str | None = None,
     ):
         del thread_id, tool_name
-        needs_computer = "computer" in set(capabilities)
-        if not needs_computer:
+        normalized = {str(item or "") for item in capabilities}
+        needs_computer = "computer" in normalized
+        hidden_sessions = sorted(
+            capability
+            for capability in normalized
+            if capability.startswith("desktop_session:")
+        )
+        if not needs_computer and not hidden_sessions:
             yield
             return
 
-        await self._computer_lock.acquire()
+        acquired_hidden: list[asyncio.Lock] = []
+        if needs_computer:
+            await self._computer_lock.acquire()
         try:
+            for capability in hidden_sessions:
+                lock = self._hidden_session_locks.setdefault(capability, asyncio.Lock())
+                await lock.acquire()
+                acquired_hidden.append(lock)
             yield
         finally:
-            self._computer_lock.release()
+            for lock in reversed(acquired_hidden):
+                lock.release()
+            if needs_computer:
+                self._computer_lock.release()
 
 
 class WorkspaceLedger:
@@ -212,6 +230,7 @@ class WorkspaceLedger:
         runs: list[RunSession] | list[dict[str, Any]],
         *,
         browser: dict[str, Any] | None = None,
+        desktop: dict[str, Any] | None = None,
     ) -> None:
         run_entries: list[dict[str, Any]] = []
         for item in runs:
@@ -252,6 +271,7 @@ class WorkspaceLedger:
             "status": thread.status,
             "handoff_state": thread.handoff_state,
             "permission_mode": thread.config.permission_mode,
+            "desktop_execution_mode_override": thread.desktop_execution_mode_override,
             "browser_identity": thread.config.browser_identity,
             "browser_profile_name": thread.config.browser_profile_name,
             "created_at": thread.created_at,
@@ -267,6 +287,7 @@ class WorkspaceLedger:
             "questions": [asdict(item) for item in thread.question_requests.values()],
             "human_actions": [asdict(item) for item in thread.human_actions],
             "browser": browser or {},
+            "desktop": desktop or {},
             "audit": self.entries(),
         }
         self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -402,6 +423,7 @@ class ThreadManager:
         self.scheduler = ExecutionScheduler()
         self.approval_engine = ApprovalPolicyEngine.default()
         self.browser_sessions = BrowserSessionManager()
+        self.desktop_sessions = DesktopSessionManager()
         self._threads: dict[str, ThreadSession] = {}
         self._runs: dict[str, RunSession] = {}
         self._run_to_thread: dict[str, str] = {}
@@ -455,6 +477,8 @@ class ThreadManager:
                 profile_name=restored.config.browser_profile_name,
             )
             self.browser_sessions.restore_thread_snapshot(restored.thread_id, payload.get("browser"))
+            self.desktop_sessions.note_thread_config(restored.thread_id, restored.config)
+            self.desktop_sessions.restore_thread_snapshot(restored.thread_id, payload.get("desktop"))
             for run_record in restored.stored_runs:
                 self._remember_persisted_run(restored.thread_id, run_record)
 
@@ -526,7 +550,12 @@ class ThreadManager:
             controller=ThreadRuntimeController(thread_id),
             stored_runs=stored_runs,
             recovered_from_disk=True,
+            desktop_execution_mode_override=(
+                str(payload.get("desktop_execution_mode_override", "") or "").strip() or None
+            ),
         )
+        if thread.desktop_execution_mode_override:
+            thread.config.desktop_execution_mode = thread.desktop_execution_mode_override
         current_run = next((item for item in stored_runs if str(item.get("run_id")) == current_run_id), None)
         if current_run_id and self._run_record_is_non_terminal(current_run):
             thread.restart_required = True
@@ -595,9 +624,14 @@ class ThreadManager:
             thread.restart_notice = ""
             thread.status = "running"
             thread.handoff_state = "agent"
+            thread.config.local_execution_mode = config.local_execution_mode
+            thread.config.desktop_fallback_policy = config.desktop_fallback_policy
+            thread.config.desktop_execution_mode = config.desktop_execution_mode
+            thread.config.desktop_backend_preference = config.desktop_backend_preference
             if thread.controller is None:
                 thread.controller = ThreadRuntimeController(thread.thread_id)
             thread.controller.resume()
+            self.desktop_sessions.note_thread_config(thread.thread_id, config)
             thread.ledger.append_entry(
                 "run_started",
                 run_id=run.run_id,
@@ -920,6 +954,7 @@ class ThreadManager:
         thread_id: str,
         *,
         permission_mode: str | None = None,
+        desktop_execution_mode: str | None = None,
     ) -> dict[str, Any]:
         thread = self.get_thread(thread_id)
         changed = False
@@ -933,13 +968,26 @@ class ThreadManager:
                 if next_mode == "full":
                     thread.config.browser_headless = False
                 changed = True
+        if desktop_execution_mode is not None:
+            next_desktop_mode = str(desktop_execution_mode or "").strip().lower()
+            if next_desktop_mode not in {"desktop_visible", "desktop_native", "desktop_hidden"}:
+                raise ValueError("Unsupported desktop execution mode.")
+            if thread.desktop_execution_mode_override != next_desktop_mode:
+                thread.desktop_execution_mode_override = next_desktop_mode
+                thread.config.desktop_execution_mode = next_desktop_mode
+                changed = True
         if changed:
+            self.desktop_sessions.note_thread_config(thread.thread_id, thread.config)
             self.browser_sessions.note_thread_browser_defaults(
                 thread.thread_id,
                 identity=thread.config.browser_identity,
                 profile_name=thread.config.browser_profile_name,
             )
-            self.thread_ledger_append_settings(thread, permission_mode=thread.config.permission_mode)
+            self.thread_ledger_append_settings(
+                thread,
+                permission_mode=thread.config.permission_mode,
+                desktop_execution_mode_override=thread.desktop_execution_mode_override,
+            )
             self._persist_thread(thread)
         return self.thread_snapshot_for_http(thread)
 
@@ -979,6 +1027,7 @@ class ThreadManager:
             "status": thread.status,
             "handoff_state": thread.handoff_state,
             "permission_mode": thread.config.permission_mode,
+            "desktop_execution_mode_override": thread.desktop_execution_mode_override,
             "browser_identity": thread.config.browser_identity,
             "browser_profile_name": thread.config.browser_profile_name,
             "created_at": thread.created_at,
@@ -998,6 +1047,7 @@ class ThreadManager:
             "restart_required": thread.restart_required,
             "restart_notice": thread.restart_notice,
             **self.browser_sessions.snapshot_payload(thread.thread_id),
+            **self.desktop_sessions.snapshot_payload(thread.thread_id),
         }
 
     def thread_snapshot_for_http(self, thread: ThreadSession) -> dict[str, Any]:
@@ -1009,6 +1059,7 @@ class ThreadManager:
             "status": thread.status,
             "handoff_state": thread.handoff_state,
             "permission_mode": thread.config.permission_mode,
+            "desktop_execution_mode_override": thread.desktop_execution_mode_override,
             "browser_identity": thread.config.browser_identity,
             "browser_profile_name": thread.config.browser_profile_name,
             "created_at": thread.created_at,
@@ -1029,6 +1080,7 @@ class ThreadManager:
             "restart_required": thread.restart_required,
             "restart_notice": thread.restart_notice,
             **self.browser_sessions.snapshot_payload(thread.thread_id),
+            **self.desktop_sessions.snapshot_payload(thread.thread_id),
         }
 
     def run_snapshot_for_http(self, run_id: str) -> RunSnapshot:
@@ -1087,6 +1139,7 @@ class ThreadManager:
         payload["restart_required"] = thread.restart_required and thread.current_run_id == run_id
         payload["restart_notice"] = thread.restart_notice if payload["restart_required"] else ""
         payload.update(self.browser_sessions.snapshot_payload(thread.thread_id))
+        payload.update(self.desktop_sessions.snapshot_payload(thread.thread_id))
         return payload
 
     def _run_summaries_for_http(self, thread: ThreadSession) -> list[dict[str, Any]]:
@@ -1193,21 +1246,14 @@ class ThreadManager:
         self._archive_live_debug_frame(thread, frame, source="live-browser")
         return frame
 
-    async def capture_live_computer_frame(self, thread_id: str) -> LiveBrowserFrame | None:
+    async def capture_live_computer_frame(
+        self,
+        thread_id: str,
+    ) -> LiveBrowserFrame | DesktopLiveFrame | None:
         thread = self.get_thread(thread_id)
         if not thread.config.allow_computer_control:
             return None
-
-        def _capture() -> LiveBrowserFrame | None:
-            from agentra.tools.computer import ComputerTool
-
-            try:
-                tool = ComputerTool(allow=True)
-                return LiveBrowserFrame(data=tool.capture_png_bytes(), media_type="image/png")
-            except Exception:  # noqa: BLE001
-                return None
-
-        frame = await asyncio.to_thread(_capture)
+        frame = await self.desktop_sessions.capture_live_frame(thread_id)
         self._archive_live_debug_frame(thread, frame, source="live-desktop")
         return frame
 
@@ -1259,6 +1305,7 @@ class ThreadManager:
                     thread_id=thread.thread_id,
                     run_id=session.run_id,
                     browser_sessions=self.browser_sessions,
+                    desktop_sessions=self.desktop_sessions,
                     approval_engine=self.approval_engine,
                 )
 
@@ -1559,6 +1606,7 @@ class ThreadManager:
             identity=thread.config.browser_identity,
             profile_name=thread.config.browser_profile_name,
         )
+        self.desktop_sessions.note_thread_config(thread.thread_id, thread.config)
         self._persist_thread(thread)
         return thread
 
@@ -1574,10 +1622,33 @@ class ThreadManager:
             str(getattr(request, "goal", "") or ""),
             requested_headless=getattr(request, "headless", None),
         )
-        overrides["local_execution_mode"] = policy.local_execution_mode
-        overrides["desktop_fallback_policy"] = policy.desktop_fallback_policy
-        overrides["desktop_execution_mode"] = policy.desktop_execution_mode
-        overrides["desktop_backend_preference"] = policy.desktop_backend_preference
+        effective_local_execution_mode = policy.local_execution_mode
+        effective_desktop_fallback_policy = policy.desktop_fallback_policy
+        effective_desktop_execution_mode = policy.desktop_execution_mode
+        effective_desktop_backend_preference = policy.desktop_backend_preference
+        override_mode = str(thread.desktop_execution_mode_override or "").strip().lower()
+        if policy.local_execution_mode != "under_the_hood" and override_mode:
+            effective_desktop_execution_mode = override_mode
+            if override_mode == "desktop_hidden":
+                effective_desktop_fallback_policy = "pause_and_ask"
+                if policy.desktop_backend_preference == "native":
+                    effective_local_execution_mode = "native"
+                    effective_desktop_backend_preference = "native"
+                else:
+                    effective_local_execution_mode = "visible"
+                    effective_desktop_backend_preference = "visible"
+            elif override_mode == "desktop_native":
+                effective_local_execution_mode = "native"
+                effective_desktop_fallback_policy = "visible_control"
+                effective_desktop_backend_preference = "native"
+            elif override_mode == "desktop_visible":
+                effective_local_execution_mode = "visible"
+                effective_desktop_fallback_policy = "visible_control"
+                effective_desktop_backend_preference = "visible"
+        overrides["local_execution_mode"] = effective_local_execution_mode
+        overrides["desktop_fallback_policy"] = effective_desktop_fallback_policy
+        overrides["desktop_execution_mode"] = effective_desktop_execution_mode
+        overrides["desktop_backend_preference"] = effective_desktop_backend_preference
         if getattr(request, "provider", None):
             overrides["llm_provider"] = request.provider
             if not getattr(request, "model", None):
@@ -1602,7 +1673,12 @@ class ThreadManager:
     def _persist_thread(self, thread: ThreadSession) -> None:
         run_records = self._thread_run_records_for_ledger(thread)
         thread.stored_runs = [dict(item) for item in run_records]
-        thread.ledger.write_snapshot(thread, run_records, browser=self.browser_sessions.snapshot_payload(thread.thread_id))
+        thread.ledger.write_snapshot(
+            thread,
+            run_records,
+            browser=self.browser_sessions.snapshot_payload(thread.thread_id),
+            desktop=self.desktop_sessions.snapshot_payload(thread.thread_id),
+        )
         for record in run_records:
             self._remember_persisted_run(thread.thread_id, record)
         registry = []
@@ -1672,11 +1748,19 @@ class ThreadManager:
         }
 
     @staticmethod
-    def thread_ledger_append_settings(thread: ThreadSession, *, permission_mode: str) -> None:
+    def thread_ledger_append_settings(
+        thread: ThreadSession,
+        *,
+        permission_mode: str,
+        desktop_execution_mode_override: str | None,
+    ) -> None:
         thread.ledger.append_entry(
             "thread_settings_updated",
             run_id=thread.current_run_id,
-            details={"permission_mode": permission_mode},
+            details={
+                "permission_mode": permission_mode,
+                "desktop_execution_mode_override": desktop_execution_mode_override,
+            },
         )
 
 
@@ -1704,8 +1788,13 @@ def _activity_visibility(tool_name: str) -> str:
 def _activity_for_event_payload(event: dict[str, Any]) -> dict[str, Any]:
     event_type = str(event.get("type", "event"))
     tool_name = str(event.get("tool", "") or "")
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     channel = _activity_channel_for_tool(tool_name)
     visibility = _activity_visibility(tool_name)
+    desktop_execution_mode = str(metadata.get("desktop_execution_mode", "") or "")
+    if desktop_execution_mode == "desktop_hidden" and tool_name in {"computer", "windows_desktop"}:
+        channel = "desktop_hidden"
+        visibility = "hidden"
     status = "idle"
     if event_type == "phase":
         channel = "agent"
@@ -1724,6 +1813,9 @@ def _activity_for_event_payload(event: dict[str, Any]) -> dict[str, Any]:
         tool_name = frame_label.split("·", 1)[0].strip().lower() if "·" in frame_label else tool_name
         channel = _activity_channel_for_tool(tool_name)
         visibility = _activity_visibility(tool_name)
+        if desktop_execution_mode == "desktop_hidden" and tool_name in {"computer", "windows_desktop"}:
+            channel = "desktop_hidden"
+            visibility = "hidden"
         status = "visible_update"
     elif event_type == "tool_result":
         status = "completed" if event.get("success") else "error"

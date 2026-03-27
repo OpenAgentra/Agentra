@@ -61,3 +61,41 @@ class DesktopActionVerification:
         }
         payload.update(self.details)
         return payload
+
+
+@dataclass(frozen=True)
+class DesktopLiveFrame:
+    """PNG-like live frame payload for a desktop session."""
+
+    data: bytes
+    media_type: str = "image/png"
+
+
+@dataclass
+class DesktopSessionSnapshot:
+    """Thread-scoped desktop session state exposed to runtime and HTTP snapshots."""
+
+    mode: str
+    session_status: str
+    active_target_app: str = ""
+    active_target_window: str = ""
+    capture_backend: str = ""
+    compatibility_state: str = "unknown"
+    fallback_reason: str = ""
+    session_id: str = ""
+    desktop_backend: str = ""
+    active_window_handle: int = 0
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "session_status": self.session_status,
+            "active_target_app": self.active_target_app,
+            "active_target_window": self.active_target_window,
+            "capture_backend": self.capture_backend,
+            "compatibility_state": self.compatibility_state,
+            "fallback_reason": self.fallback_reason,
+            "session_id": self.session_id,
+            "desktop_backend": self.desktop_backend,
+            "active_window_handle": self.active_window_handle,
+        }

@@ -298,6 +298,43 @@ async def test_windows_desktop_tool_returns_structured_verification_metadata(mon
     assert result.metadata["window_title"] == "Hesap Makinesi"
 
 
+@pytest.mark.asyncio
+async def test_windows_desktop_tool_routes_hidden_mode_through_session_manager() -> None:
+    from agentra.tools.windows_desktop import WindowsDesktopTool  # noqa: PLC0415
+
+    class FakeDesktopSessions:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict[str, object]]] = []
+
+        def hidden_capability(self, thread_id: str) -> str:
+            return f"desktop_session:{thread_id}"
+
+        def execute_windows_action(self, thread_id: str, action: str, **kwargs: object) -> DesktopActionVerification:
+            self.calls.append((thread_id, action, dict(kwargs)))
+            return DesktopActionVerification(
+                target="Calculator",
+                action=action,
+                observed_outcome="639",
+                success=True,
+                verified=True,
+                details={"window_title": "Hidden Calculator"},
+            )
+
+    tool = WindowsDesktopTool()
+    sessions = FakeDesktopSessions()
+    tool.bind_runtime(desktop_sessions=sessions, thread_id="thread-hidden")
+
+    result = await tool.execute(action="read_status", app="Calculator", expected_text="639")
+
+    assert result.success
+    assert result.output == "639"
+    assert result.metadata["desktop_execution_mode"] == "desktop_hidden"
+    assert sessions.calls == [
+        ("thread-hidden", "read_status", {"app": "Calculator", "expected_text": "639"})
+    ]
+    assert tool.capabilities == ("desktop_session:thread-hidden", "windows_desktop")
+
+
 def test_native_windows_backend_launch_app_accepts_profile_id_without_explicit_app(monkeypatch):
     backend = NativeWindowsDesktopBackend()
     launched: list[list[str]] = []
@@ -694,3 +731,34 @@ async def test_computer_tool_pauses_when_desktop_state_drifted(monkeypatch):
     assert result.success is False
     assert result.metadata["pause_kind"] == "desktop_control_takeover"
     assert "beklenmedik" in result.metadata["summary"]
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_routes_hidden_mode_through_session_manager() -> None:
+    from agentra.tools.computer import ComputerTool  # noqa: PLC0415
+
+    class FakeDesktopSessions:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict[str, object]]] = []
+
+        def hidden_capability(self, thread_id: str) -> str:
+            return f"desktop_session:{thread_id}"
+
+        def execute_computer_action(self, thread_id: str, action: str, **kwargs: object) -> ToolResult:
+            self.calls.append((thread_id, action, dict(kwargs)))
+            return ToolResult(
+                success=True,
+                output="hidden click ok",
+                metadata={"frame_label": "computer · click", "desktop_execution_mode": "desktop_hidden"},
+            )
+
+    tool = ComputerTool(allow=True)
+    sessions = FakeDesktopSessions()
+    tool.bind_runtime(desktop_sessions=sessions, thread_id="thread-hidden")
+
+    result = await tool.execute(action="click", x=12, y=34)
+
+    assert result.success
+    assert result.output == "hidden click ok"
+    assert sessions.calls == [("thread-hidden", "click", {"x": 12, "y": 34})]
+    assert tool.capabilities == ("desktop_session:thread-hidden",)

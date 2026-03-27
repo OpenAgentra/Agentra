@@ -65,7 +65,8 @@ class HumanActionRequest(BaseModel):
 
 
 class ThreadSettingsUpdateRequest(BaseModel):
-    permission_mode: Literal["default", "full"]
+    permission_mode: Literal["default", "full"] | None = None
+    desktop_execution_mode: Literal["desktop_visible", "desktop_native", "desktop_hidden"] | None = None
 
 
 @dataclass
@@ -894,6 +895,7 @@ def create_live_app(
             snapshot = manager.update_thread_settings(
                 thread_id,
                 permission_mode=payload.permission_mode,
+                desktop_execution_mode=payload.desktop_execution_mode,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Thread not found.") from exc
@@ -937,6 +939,7 @@ def create_live_app(
             raise HTTPException(status_code=404, detail="Thread not found.") from exc
 
         boundary = "agentraframe"
+        single_frame_only = request.query_params.get("stream") == "1"
 
         async def frame_stream():
             try:
@@ -953,6 +956,8 @@ def create_live_app(
                         f"Content-Length: {len(frame.data)}\r\n\r\n"
                     ).encode("ascii")
                     yield header + frame.data + b"\r\n"
+                    if single_frame_only:
+                        return
                     await asyncio.sleep(0.01)
             except asyncio.CancelledError:
                 return
@@ -971,6 +976,7 @@ def create_live_app(
             raise HTTPException(status_code=404, detail="Thread not found.") from exc
 
         boundary = "agentradesktop"
+        single_frame_only = request.query_params.get("stream") == "1"
 
         async def frame_stream():
             try:
@@ -987,6 +993,8 @@ def create_live_app(
                         f"Content-Length: {len(frame.data)}\r\n\r\n"
                     ).encode("ascii")
                     yield header + frame.data + b"\r\n"
+                    if single_frame_only:
+                        return
                     await asyncio.sleep(0.04)
             except asyncio.CancelledError:
                 return
@@ -2689,6 +2697,7 @@ function currentSurfaceStatusLabel() {
   const activity = state.activity || {};
   const channel = String(activity.channel || "").toLowerCase();
   if (channel === "desktop") return "MASAÜSTÜ";
+  if (channel === "desktop_hidden") return "ARKA PLAN MASAÜSTÜ";
   if (channel === "desktop_native") return "YEREL MASAÜSTÜ";
   if (channel === "local_system") return "YEREL SİSTEM";
   if (channel === "filesystem") return "DOSYA SİSTEMİ";
