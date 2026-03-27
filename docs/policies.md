@@ -57,11 +57,13 @@ This is why full mode can use a real browser profile but still pauses for high-r
 - `browser_headless`
 - `local_execution_mode`
 - `desktop_fallback_policy`
+- `desktop_execution_mode`
 
 The current policy model is:
 
 - browser-only goals default to browser-focused execution
-- goals with a visible local desktop component default to visible execution
+- eligible local GUI goals default to `desktop_hidden`
+- goals that explicitly request visible on-screen work still use `desktop_visible`
 - local folder/document goals can switch to `under_the_hood` execution when the goal wording implies path-driven or background local work
 - mixed web + local goals can still use `under_the_hood` local handling if the local portion looks like a file-resolution or document-open task
 
@@ -80,6 +82,17 @@ Agent guidance in this mode:
 - use `filesystem` or `terminal` only as helpers for path discovery, not as a substitute for visibly opening the requested item
 
 The usual desktop fallback is `visible_control`.
+
+### `desktop_hidden`
+
+Hidden desktop mode is the default GUI path for eligible local Windows app goals.
+
+Agent guidance in this mode:
+
+- prefer `windows_desktop` for structured Windows app tasks
+- use `computer` against the hidden session preview only when raw interaction is needed
+- do not silently switch to visible desktop control
+- if the session is unsafe or incompatible, pause and ask for explicit visible/manual fallback
 
 ### `under_the_hood`
 
@@ -140,11 +153,21 @@ Current completion rules include:
 
 Runtime coordination rules from `agentra/runtime.py`:
 
-- only one thread can hold the `computer` capability at a time
+- only one thread can hold visible real-desktop control at a time
+- multiple hidden desktop threads can run concurrently with isolated session locks
 - a thread can be paused into `paused_for_user`
 - approval or question events move the thread into `blocked_waiting_user`
 - responding to an approval or question returns the thread to `running` when appropriate
 - manual human actions are recorded as run events and thread audit entries
+
+## Hidden Desktop Safety Policy
+
+Background desktop execution has a hard safety guarantee:
+
+- it must not steal focus from the real desktop
+- it must not type into the user's current foreground app
+- it must not silently downgrade from hidden mode to visible mode
+- unknown popups, unsafe targets, and incompatible GPU/input surfaces pause and ask
 
 ## Memory Retrieval Policy
 

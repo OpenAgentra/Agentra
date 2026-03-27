@@ -1,10 +1,11 @@
 # Agentra Documentation
 
-This documentation set describes Agentra as it exists in the current repository. It is written for contributors first: the focus is on runtime behavior, operator surfaces, policy rules, interfaces, and persisted artifacts rather than roadmap items.
+This documentation set describes Agentra as it exists in the current repository. It is written for contributors first: the focus is on runtime behavior, operator surfaces, policy rules, interfaces, persisted artifacts, and architecture notes for major execution subsystems.
 
 ## Start Here
 
 - [Architecture](architecture.md) explains the main runtime components and how a goal moves through the system.
+- [Hidden Desktop Workers](hidden-desktop-workers.md) explains the same-machine hidden desktop worker model used for background Windows app execution.
 - [Features](features.md) lists the implemented user-facing and contributor-relevant capabilities.
 - [Policies](policies.md) documents permission modes, routing rules, guardrails, and completion rules.
 - [Interfaces](interfaces.md) is the reference for Python exports, config, CLI commands, HTTP endpoints, and tool schemas.
@@ -32,13 +33,14 @@ This documentation set describes Agentra as it exists in the current repository.
 ## Suggested Reading Order
 
 1. Read [Architecture](architecture.md) for the runtime map.
-2. Read [Policies](policies.md) before changing approvals, routing, or completion behavior.
-3. Use [Interfaces](interfaces.md) when modifying CLI flags, config fields, HTTP routes, or tool schemas.
-4. Use [Artifacts](artifacts.md) when debugging reports, thread state, or workspace persistence.
-5. Use [Features](features.md) when you need a high-level inventory of what is already implemented.
+2. Read [Hidden Desktop Workers](hidden-desktop-workers.md) before changing background desktop execution, preview routing, or compatibility probing.
+3. Read [Policies](policies.md) before changing approvals, routing, or completion behavior.
+4. Use [Interfaces](interfaces.md) when modifying CLI flags, config fields, HTTP routes, or tool schemas.
+5. Use [Artifacts](artifacts.md) when debugging reports, thread state, or workspace persistence.
+6. Use [Features](features.md) when you need a high-level inventory of what is already implemented.
 
 ## Scope Of This Docs Set
 
 - It documents current behavior from the repository code and tests.
-- It does not describe roadmap ideas, TODOs, or planned features.
+- It can include architecture notes for implemented subsystems that span multiple files.
 - It treats the root `README.md` as the landing page and this `docs/` directory as the contributor reference set.

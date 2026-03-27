@@ -161,6 +161,8 @@ The log view served at `/logs` reads from this persistent file.
 
 Live browser and desktop frames are served dynamically and are not stored as a dedicated artifact stream by default.
 
+Thread and run snapshots can also expose desktop session metadata such as mode, session status, active target window, capture backend, compatibility state, and fallback reason.
+
 Persisted visual artifacts appear when:
 
 - a run report stores screenshots in `.runs/<run-id>/assets/`
@@ -185,6 +187,7 @@ In the live runtime, checkpoint summaries are also mirrored into `workspace_chec
 - rendered timeline: `.runs/<run-id>/index.html`
 - thread snapshot: `.threads/<thread-id>/ledger.json`
 - thread audit trail: `.threads/<thread-id>/audit.jsonl`
+- hidden desktop compatibility/debug state: thread snapshot desktop session payload
 - working memory store: `workspace/.memory/index.json`
 - long-term memory store: `.memory-global/index.json`
 - application log: `.logs/agentra-app.log`

@@ -16,6 +16,7 @@ Both surfaces ultimately rely on the same core pieces:
 - `AgentConfig` for environment-backed configuration.
 - `AutonomousAgent` for the main ReAct loop.
 - `BaseTool` implementations for browser, desktop, filesystem, terminal, local-system, and git actions.
+- `DesktopSessionManager` for thread-scoped visible or hidden desktop execution surfaces.
 - provider implementations under `agentra/llm/` for model access and embeddings.
 - memory stores under `agentra/memory/`.
 - reporting and persistence primitives in `RunReport`, `RunStore`, and `WorkspaceLedger`.
@@ -71,15 +72,16 @@ It manages:
 - approval requests, question requests, and manual human actions.
 - event broadcasting for the live app.
 - browser-session snapshots and live frame access.
+- desktop-session snapshots and live frame access.
 - thread snapshots, run snapshots, and persisted ledger state.
 
-In the live app, `ThreadManager` is the primary runtime boundary between HTTP routes and agent execution.
+In the live app, `ThreadManager` is the primary runtime boundary between HTTP routes and agent execution. It also owns the thread-scoped browser and desktop session managers.
 
 ### `ExecutionScheduler`
 
-`ExecutionScheduler` serializes the `computer` capability across concurrent threads. Browser, filesystem, terminal, and other non-desktop capabilities do not share the same global lock.
+`ExecutionScheduler` coordinates visible and hidden desktop work separately. Visible desktop control stays globally exclusive, while hidden desktop sessions can run concurrently with thread-scoped locking. Browser, filesystem, terminal, and other non-desktop capabilities do not share the same global lock.
 
-This means Agentra can run multiple threads at once, but only one thread can actively use the desktop-control tool at a time.
+This means Agentra can run multiple threads at once, can run multiple hidden desktop sessions in parallel, and still protects the real visible desktop from concurrent raw control.
 
 ### Browser Runtime
 
@@ -100,6 +102,23 @@ The browser runtime supports two identities:
 - `chrome_profile`
 
 `chrome_profile` mode prepares a non-default launch clone of the user's Chrome profile and is used when permission mode is `full`.
+
+### Desktop Session Runtime
+
+The desktop stack is split across:
+
+- `agentra/tools/computer.py` for raw desktop actions.
+- `agentra/tools/windows_desktop.py` for structured Windows-native app automation.
+- `agentra/desktop_automation/` for backend/session/capture/input implementations.
+- `DesktopSessionManager` in `agentra/runtime.py` for thread-scoped visible or hidden desktop sessions.
+
+Desktop execution modes:
+
+- `desktop_visible`
+- `desktop_native`
+- `desktop_hidden`
+
+`desktop_hidden` runs eligible local GUI work inside same-machine hidden desktop sessions and exposes those sessions through the existing live desktop preview routes. See [Hidden Desktop Workers](hidden-desktop-workers.md) for the subsystem details.
 
 ### Memory Stores
 

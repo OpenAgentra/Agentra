@@ -45,8 +45,10 @@ For lifecycle context, read [Architecture](architecture.md). For behavior constr
 | `browser_type` | `AGENTRA_BROWSER_TYPE` | `chromium` | `chromium`, `firefox`, or `webkit` |
 | `browser_identity` | `AGENTRA_BROWSER_IDENTITY` | `isolated` | `chrome_profile` implies full mode |
 | `browser_profile_name` | `AGENTRA_BROWSER_PROFILE_NAME` | `Default` | Chrome profile directory name |
-| `local_execution_mode` | `AGENTRA_LOCAL_EXECUTION_MODE` | `visible` | `visible` or `under_the_hood` |
+| `local_execution_mode` | `AGENTRA_LOCAL_EXECUTION_MODE` | `visible` | `visible`, `under_the_hood`, or `native` |
 | `desktop_fallback_policy` | `AGENTRA_DESKTOP_FALLBACK_POLICY` | `visible_control` | `visible_control` or `pause_and_ask` |
+| `desktop_execution_mode` | `AGENTRA_DESKTOP_EXECUTION_MODE` | `desktop_visible` | `desktop_visible`, `desktop_native`, or `desktop_hidden` |
+| `desktop_backend_preference` | `AGENTRA_DESKTOP_BACKEND_PREFERENCE` | `visible` | `visible`, `native`, or `under_the_hood` |
 | `permission_mode` | `AGENTRA_PERMISSION_MODE` | `default` | `default` or `full` |
 | `allow_terminal` | `AGENTRA_ALLOW_TERMINAL` | `True` | Enables terminal tool |
 | `allow_filesystem_write` | `AGENTRA_ALLOW_FILESYSTEM_WRITE` | `True` | Enables write-capable filesystem operations |
@@ -199,6 +201,7 @@ Fields:
 Fields:
 
 - `permission_mode`
+- `desktop_execution_mode`
 
 ## Tool Surface Reference
 
@@ -207,7 +210,8 @@ The model-facing tools are implemented under `agentra/tools/`.
 | Tool | Schema shape | Supported actions or fields | Notes |
 | --- | --- | --- | --- |
 | `browser` | `action` enum plus action-specific args | `navigate`, `click`, `type`, `key`, `drag`, `scroll`, `screenshot`, `get_text`, `get_html`, `wait`, `back`, `forward`, `new_tab`, `close_tab` | Can bind to shared thread browser sessions |
-| `computer` | `action` enum plus coordinates/text | `screenshot`, `click`, `double_click`, `right_click`, `move`, `type`, `key`, `scroll`, `drag` | Full desktop control surface |
+| `computer` | `action` enum plus coordinates/text | `screenshot`, `click`, `double_click`, `right_click`, `move`, `type`, `key`, `scroll`, `drag` | Backend-selected desktop control surface for visible or hidden sessions |
+| `windows_desktop` | `action` enum plus Windows app args | `launch_app`, `focus_window`, `wait_for_window`, `list_windows`, `list_controls`, `invoke_control`, `set_text`, `type_keys`, `read_window_text`, `read_status` | Structured Windows app automation; uses the thread desktop session context |
 | `filesystem` | `action` enum plus `path`, `content`, `destination`, `recursive` | `read`, `write`, `append`, `list`, `mkdir`, `delete`, `exists`, `copy`, `move`, `cwd` | Path resolution can be workspace-relative |
 | `terminal` | structured command request | `command`, optional `cwd`, optional `timeout` | Output is truncated and timed out defensively |
 | `local_system` | `action` enum plus local OS args | `resolve_known_folder`, `open_path`, `launch_app` | Bridges WSL paths and Windows-native open behavior |

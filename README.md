@@ -15,6 +15,7 @@ Agentra is the open-source alternative to ChatGPT's "computer use" feature — a
 |---|---|---|
 | Web browsing | ✅ | ✅ |
 | Desktop control | ❌ | ✅ |
+| Hidden desktop workers | ❌ | ✅ |
 | Filesystem access | ❌ | ✅ |
 | Terminal / shell | ❌ | ✅ |
 | Multi-agent orchestration | ❌ | ✅ |
@@ -23,7 +24,7 @@ Agentra is the open-source alternative to ChatGPT's "computer use" feature — a
 | Git-tracked workspace | ❌ | ✅ |
 | Persistent visual memory | ❌ | ✅ |
 
-You give Agentra a natural-language goal — _"Apply to 10 Python jobs on LinkedIn"_, _"Summarise all PDFs in my Downloads folder"_, _"Set up a new Django project"_ — and it works through it step-by-step, using whatever tools it needs.  You can watch every action in real time and take back control at any moment.
+You give Agentra a natural-language goal — _"Apply to 10 Python jobs on LinkedIn"_, _"Summarise all PDFs in my Downloads folder"_, _"Set up a new Django project"_ — and it works through it step-by-step, using whatever tools it needs. You can watch every action in real time, keep long-running browser or desktop work inside live preview surfaces, and take back control at any moment.
 
 ---
 
@@ -58,6 +59,7 @@ Contributor-first project documentation lives in `docs/`:
 
 - [Docs Hub](docs/README.md)
 - [Architecture](docs/architecture.md)
+- [Hidden Desktop Workers](docs/hidden-desktop-workers.md)
 - [Features](docs/features.md)
 - [Policies](docs/policies.md)
 - [Interfaces](docs/interfaces.md)
@@ -150,6 +152,9 @@ Full mouse and keyboard control of any GUI application — not just the browser.
 # The agent can take screenshots, click, type, scroll, drag on the desktop
 config = AgentConfig(allow_computer_control=True)
 ```
+
+### 🪟 Background Desktop Workers
+Eligible Windows app tasks can run inside same-machine hidden desktop workers instead of the visible user desktop. Agentra keeps the existing live preview and `Interact` flow, but routes preview input to the worker session so background runs do not steal focus from the real desktop.
 
 ### 📁 Filesystem Access
 Read, write, copy, move and delete files anywhere on disk.

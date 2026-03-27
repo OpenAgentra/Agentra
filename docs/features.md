@@ -94,6 +94,19 @@ The computer tool supports:
 
 Desktop live frames are also exposed by the live runtime when computer control is enabled.
 
+### Hidden Desktop Workers
+
+Agentra supports same-machine hidden desktop workers for eligible local GUI threads.
+
+In that flow:
+
+- a thread gets a dedicated hidden desktop session instead of using the real interactive desktop
+- the existing desktop preview routes expose the worker frame
+- `Interact` routes clicks, keys, drags, and wheel input into the worker session rather than the user's visible desktop
+- incompatible or unsafe surfaces pause and ask instead of silently switching to visible control
+
+This is the default execution path for eligible local Windows app goals.
+
 ### Under-The-Hood Local Execution
 
 Agentra also supports a non-visible local execution path for many local file and document goals.
@@ -103,6 +116,8 @@ In that flow the agent prefers:
 - `local_system` to resolve Desktop-like folders and open confirmed local files or folders with the OS default handler
 - `filesystem` to inspect resolved local paths
 - `terminal` only when the other local tools cannot resolve the task directly
+
+This path is separate from hidden desktop workers. Under-the-hood execution is for local tasks that do not need a GUI session at all.
 
 ## Filesystem, Terminal, Local System, And Git Tools
 
