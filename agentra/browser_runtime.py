@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from agentra.tools.base import ToolResult
+from agentra.tools.visual_diff import compute_image_hash, images_are_similar
 
 _DEFAULT_FOCUS = (0.74, 0.2)
 _LIVE_REFRESH_INTERVALS = (0.2, 0.35)
@@ -1046,12 +1048,21 @@ Write-Output $moved
 class BrowserSession:
     """A single thread-scoped browser context shared by agent and user."""
 
-    def __init__(self, thread_id: str, runtime: BrowserRuntime) -> None:
+    def __init__(
+        self,
+        thread_id: str,
+        runtime: BrowserRuntime,
+        screenshot_format: str = "png",
+        screenshot_quality: int = 85,
+    ) -> None:
         self.thread_id = thread_id
         self.runtime = runtime
+        self._screenshot_format = screenshot_format
+        self._screenshot_quality = screenshot_quality
         self._context: Any = None
         self._pages: list[Any] = []
         self._page: Any = None
+        self._last_screenshot_hash: str | None = None
         self._snapshot = BrowserSnapshot(identity=runtime.identity, profile_name=runtime.profile_name)
         self._start_lock = asyncio.Lock()
 
@@ -1563,6 +1574,20 @@ class BrowserSession:
         metadata = self._metadata(summary="", extracted_text=extracted_text)
         return ToolResult(success=True, output=output, metadata=metadata)
 
+    async def _capture_browser_screenshot(self) -> bytes:
+        """Capture a browser screenshot in the configured format."""
+        fmt = self._screenshot_format
+        if fmt == "jpeg":
+            return await self._page.screenshot(type="jpeg", quality=self._screenshot_quality)
+        png_bytes = await self._page.screenshot(type="png")
+        if fmt == "webp":
+            from PIL import Image as _Image  # noqa: PLC0415
+            img = _Image.open(io.BytesIO(png_bytes))
+            buf = io.BytesIO()
+            img.save(buf, format="WEBP", quality=self._screenshot_quality)
+            return buf.getvalue()
+        return png_bytes
+
     async def _capture_visual_state(
         self,
         *,
@@ -1572,13 +1597,24 @@ class BrowserSession:
         focus: tuple[float, float],
         burst: bool = False,
     ) -> ToolResult:
-        png_bytes = await self._page.screenshot(type="png")
+        img_bytes = await self._capture_browser_screenshot()
         await self._refresh_snapshot()
         focus_x, focus_y = self._normalize_focus(*focus)
+        current_hash = compute_image_hash(img_bytes)
+        no_change = images_are_similar(self._last_screenshot_hash, current_hash)
+        self._last_screenshot_hash = current_hash
+        metadata = self._metadata(
+            summary=summary,
+            frame_label=frame_label,
+            focus_x=focus_x,
+            focus_y=focus_y,
+        )
+        metadata["no_change"] = no_change
+        metadata["image_format"] = self._screenshot_format
         return ToolResult(
             success=True,
             output=output,
-            screenshot_b64=base64.b64encode(png_bytes).decode(),
+            screenshot_b64=base64.b64encode(img_bytes).decode(),
             extra_screenshots=await self._capture_follow_up_frames(
                 frame_label=frame_label,
                 summary=summary,
@@ -1586,12 +1622,7 @@ class BrowserSession:
                 focus_y=focus_y,
                 enabled=burst,
             ),
-            metadata=self._metadata(
-                summary=summary,
-                frame_label=frame_label,
-                focus_x=focus_x,
-                focus_y=focus_y,
-            ),
+            metadata=metadata,
         )
 
     def _metadata(

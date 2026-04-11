@@ -8,9 +8,12 @@ import ctypes
 import io
 import math
 import os
+import uuid
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from agentra.tools.base import BaseTool, ToolResult
+from agentra.tools.visual_diff import compute_image_hash, images_are_similar
 
 
 class ComputerTool(BaseTool):
@@ -29,9 +32,23 @@ class ComputerTool(BaseTool):
         "IDEs, native apps — anything that cannot be reached via a browser."
     )
 
-    def __init__(self, allow: bool = True) -> None:
+    def __init__(
+        self,
+        allow: bool = True,
+        screenshot_format: str = "png",
+        screenshot_quality: int = 85,
+    ) -> None:
         self._allow = allow
+        self._screenshot_format = screenshot_format
+        self._screenshot_quality = screenshot_quality
         self._last_observation: dict[str, Any] | None = None
+        self._last_screenshot_hash: str | None = None
+        self._last_screenshot_raw: bytes = b""
+        self._recording: bool = False
+        self._recording_frames: list[bytes] = []
+        self._recording_task: asyncio.Task[None] | None = None
+        self._recording_fps: int = 4
+        self._workspace_dir: Path | None = None
         self._runtime_controller: Any = None
         self._desktop_sessions: Any = None
         self._thread_id: str | None = None
@@ -82,6 +99,9 @@ class ComputerTool(BaseTool):
                         "key",
                         "scroll",
                         "drag",
+                        "list_monitors",
+                        "start_recording",
+                        "stop_recording",
                     ],
                     "description": "Desktop action to perform.",
                 },
@@ -99,6 +119,26 @@ class ComputerTool(BaseTool):
                 "delta_y": {
                     "type": "number",
                     "description": "Vertical scroll amount (positive = down).",
+                },
+                "region_x": {
+                    "type": "number",
+                    "description": "Left edge of capture region (pixels). Optional, for screenshot action.",
+                },
+                "region_y": {
+                    "type": "number",
+                    "description": "Top edge of capture region (pixels). Optional, for screenshot action.",
+                },
+                "region_width": {
+                    "type": "number",
+                    "description": "Width of capture region (pixels). Optional, for screenshot action.",
+                },
+                "region_height": {
+                    "type": "number",
+                    "description": "Height of capture region (pixels). Optional, for screenshot action.",
+                },
+                "monitor": {
+                    "type": "integer",
+                    "description": "Monitor index (0=all combined, 1=primary, 2=secondary...). Optional, for screenshot action.",
                 },
             },
             "required": ["action"],
@@ -138,8 +178,14 @@ class ComputerTool(BaseTool):
             )
 
         try:
-            if action == "screenshot":
-                result = self._take_screenshot()
+            if action == "list_monitors":
+                result = self._list_monitors()
+            elif action == "start_recording":
+                return await self._start_recording()
+            elif action == "stop_recording":
+                return await self._stop_recording()
+            elif action == "screenshot":
+                result = self._take_screenshot(**kwargs)
             elif action == "click":
                 result = self._click(
                     kwargs.get("x"),
@@ -334,16 +380,120 @@ class ComputerTool(BaseTool):
             "window_title": str(title_buffer.value or "").strip(),
         }
 
-    def _take_screenshot(self) -> ToolResult:
+    def _take_screenshot(self, **kwargs: Any) -> ToolResult:
+        region = self._extract_region(kwargs)
+        monitor_idx = int(kwargs.get("monitor", 0) or 0)
+        img_bytes = self.capture_screenshot_bytes(region=region, monitor=monitor_idx)
+        self._last_screenshot_raw = img_bytes
+        screenshot_b64 = base64.b64encode(img_bytes).decode()
+        changed = self._check_screenshot_change(img_bytes)
+        summary = "Capturing the desktop"
+        if region:
+            summary = f"Capturing region ({region[0]},{region[1]} {region[2]}x{region[3]})"
+        elif monitor_idx > 0:
+            summary = f"Capturing monitor {monitor_idx}"
         return ToolResult(
             success=True,
             output="Screenshot taken.",
-            screenshot_b64=self._capture_screenshot_b64(),
+            screenshot_b64=screenshot_b64,
             metadata={
                 "frame_label": "computer · screenshot",
-                "summary": "Capturing the desktop",
+                "summary": summary,
+                "no_change": not changed,
+                "image_format": self._screenshot_format,
             },
         )
+
+    def _list_monitors(self) -> ToolResult:
+        import json  # noqa: PLC0415
+        monitors = self.list_monitors()
+        return ToolResult(
+            success=True,
+            output=json.dumps(monitors, indent=2),
+            metadata={"frame_label": "computer · list_monitors", "summary": "Listing available monitors"},
+        )
+
+    async def _start_recording(self) -> ToolResult:
+        if self._recording:
+            return ToolResult(success=False, error="Recording is already in progress.")
+        self._recording = True
+        self._recording_frames = []
+
+        async def _capture_loop() -> None:
+            interval = 1.0 / self._recording_fps
+            while self._recording:
+                try:
+                    frame = self.capture_screenshot_bytes(fmt="png")
+                    self._recording_frames.append(frame)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(interval)
+
+        self._recording_task = asyncio.create_task(_capture_loop())
+        return ToolResult(
+            success=True,
+            output=f"Recording started at {self._recording_fps} FPS.",
+            metadata={"frame_label": "computer · start_recording", "summary": "Started screen recording"},
+        )
+
+    async def _stop_recording(self) -> ToolResult:
+        if not self._recording:
+            return ToolResult(success=False, error="No recording in progress.")
+        self._recording = False
+        if self._recording_task is not None:
+            self._recording_task.cancel()
+            try:
+                await self._recording_task
+            except asyncio.CancelledError:
+                pass
+            self._recording_task = None
+
+        frames = self._recording_frames
+        self._recording_frames = []
+        if not frames:
+            return ToolResult(success=False, error="No frames were captured during recording.")
+
+        from PIL import Image as _Image  # noqa: PLC0415
+
+        images = [_Image.open(io.BytesIO(f)) for f in frames]
+        buf = io.BytesIO()
+        duration = int(1000 / self._recording_fps)
+        images[0].save(
+            buf,
+            format="GIF",
+            save_all=True,
+            append_images=images[1:],
+            duration=duration,
+            loop=0,
+        )
+        gif_bytes = buf.getvalue()
+
+        save_dir = self._workspace_dir or Path.cwd() / "workspace"
+        recordings_dir = save_dir / ".memory" / "recordings"
+        recordings_dir.mkdir(parents=True, exist_ok=True)
+        gif_path = recordings_dir / f"{uuid.uuid4().hex[:12]}.gif"
+        gif_path.write_bytes(gif_bytes)
+
+        return ToolResult(
+            success=True,
+            output=f"Recording saved: {gif_path} ({len(frames)} frames, {len(gif_bytes)} bytes)",
+            metadata={
+                "frame_label": "computer · stop_recording",
+                "summary": "Stopped screen recording and saved GIF",
+                "recording_path": str(gif_path),
+                "frame_count": len(frames),
+            },
+        )
+
+    @staticmethod
+    def _extract_region(kwargs: dict[str, Any]) -> tuple[int, int, int, int] | None:
+        rx = kwargs.get("region_x")
+        ry = kwargs.get("region_y")
+        rw = kwargs.get("region_width")
+        rh = kwargs.get("region_height")
+        if all(v is not None for v in (rx, ry, rw, rh)):
+            return (int(rx), int(ry), int(rw), int(rh))
+        return None
 
     def _click(
         self,
@@ -470,24 +620,97 @@ class ComputerTool(BaseTool):
             capture_result_screenshot=capture_result_screenshot,
         )
 
-    def capture_png_bytes(self) -> bytes:
+    def capture_screenshot_bytes(
+        self,
+        fmt: str | None = None,
+        quality: int | None = None,
+        region: tuple[int, int, int, int] | None = None,
+        monitor: int = 0,
+    ) -> bytes:
+        """Capture the screen and return image bytes in the requested format.
+
+        *fmt* defaults to the configured ``screenshot_format`` (png/jpeg/webp).
+        *quality* defaults to the configured ``screenshot_quality``.
+        *region* is an optional ``(x, y, width, height)`` crop rectangle.
+        *monitor* selects which display (0 = all combined, 1+ = individual).
+        """
+        fmt = (fmt or self._screenshot_format).lower()
+        quality = quality if quality is not None else self._screenshot_quality
+
         try:
             import mss  # noqa: PLC0415
-            import mss.tools  # noqa: PLC0415
 
             with mss.mss() as sct:
-                monitor = sct.monitors[0]  # all monitors combined
-                img = sct.grab(monitor)
-                return mss.tools.to_png(img.rgb, img.size)
+                if region is not None:
+                    rx, ry, rw, rh = region
+                    grab_area = {"left": int(rx), "top": int(ry), "width": int(rw), "height": int(rh)}
+                else:
+                    if monitor < 0 or monitor >= len(sct.monitors):
+                        raise ValueError(
+                            f"Monitor index {monitor} out of range. "
+                            f"Available: 0-{len(sct.monitors) - 1}"
+                        )
+                    grab_area = sct.monitors[monitor]
+                grab = sct.grab(grab_area)
+                if fmt == "png":
+                    import mss.tools  # noqa: PLC0415
+                    return mss.tools.to_png(grab.rgb, grab.size)
+                from PIL import Image as _Image  # noqa: PLC0415
+                pil_img = _Image.frombytes("RGB", grab.size, bytes(grab.rgb))
         except ImportError:
             import pyautogui  # noqa: PLC0415
+            pil_img = pyautogui.screenshot(region=region)
+            if fmt == "png":
+                buf = io.BytesIO()
+                pil_img.save(buf, format="PNG")
+                return buf.getvalue()
 
-            buf = io.BytesIO()
-            pyautogui.screenshot().save(buf, format="PNG")
-            return buf.getvalue()
+        buf = io.BytesIO()
+        save_fmt = "JPEG" if fmt == "jpeg" else fmt.upper()
+        save_kwargs: dict[str, Any] = {}
+        if fmt in ("jpeg", "webp"):
+            save_kwargs["quality"] = quality
+        pil_img.save(buf, format=save_fmt, **save_kwargs)
+        return buf.getvalue()
+
+    def list_monitors(self) -> list[dict[str, Any]]:
+        """Return a list of available monitors with their dimensions."""
+        try:
+            import mss  # noqa: PLC0415
+            with mss.mss() as sct:
+                monitors = []
+                for i, m in enumerate(sct.monitors):
+                    monitors.append({
+                        "index": i,
+                        "left": m["left"],
+                        "top": m["top"],
+                        "width": m["width"],
+                        "height": m["height"],
+                        "label": "all combined" if i == 0 else f"monitor {i}",
+                    })
+                return monitors
+        except ImportError:
+            return [{"index": 0, "label": "all combined", "left": 0, "top": 0, "width": 0, "height": 0}]
+
+    def capture_png_bytes(self) -> bytes:
+        """Backward-compatible helper that always returns PNG bytes."""
+        return self.capture_screenshot_bytes(fmt="png")
 
     def _capture_screenshot_b64(self) -> str:
-        return base64.b64encode(self.capture_png_bytes()).decode()
+        img_bytes = self.capture_screenshot_bytes()
+        self._last_screenshot_raw = img_bytes
+        return base64.b64encode(img_bytes).decode()
+
+    def _check_screenshot_change(self, png_bytes: bytes) -> bool:
+        """Compare *png_bytes* against the previous screenshot hash.
+
+        Returns ``True`` when the image changed (or this is the first capture).
+        Updates the stored hash as a side-effect.
+        """
+        current_hash = compute_image_hash(png_bytes)
+        no_change = images_are_similar(self._last_screenshot_hash, current_hash)
+        self._last_screenshot_hash = current_hash
+        return not no_change
 
     def _desktop_result(
         self,
@@ -497,16 +720,19 @@ class ComputerTool(BaseTool):
         summary: str,
         capture_result_screenshot: bool = True,
     ) -> ToolResult:
-        metadata = {
+        metadata: dict[str, Any] = {
             "frame_label": f"computer · {action}",
             "summary": summary,
         }
         if not capture_result_screenshot:
             return ToolResult(success=True, output=output, metadata=metadata)
+        screenshot_b64 = self._capture_screenshot_b64()
+        changed = self._check_screenshot_change(self._last_screenshot_raw)
+        metadata["no_change"] = not changed
         return ToolResult(
             success=True,
             output=output,
-            screenshot_b64=self._capture_screenshot_b64(),
+            screenshot_b64=screenshot_b64,
             metadata=metadata,
         )
 
