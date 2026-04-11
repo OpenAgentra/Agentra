@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import uuid
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from agentra.browser_runtime import BrowserSessionManager
 from agentra.tools.base import BaseTool, ToolResult
+from agentra.tools.visual_diff import compute_image_hash, images_are_similar
 
 _DEFAULT_FOCUS = (0.74, 0.2)
 _LIVE_REFRESH_INTERVALS = (0.2, 0.35)
@@ -35,14 +39,24 @@ class BrowserTool(BaseTool):
         browser_type: Literal["chromium", "firefox", "webkit"] = "chromium",
         identity: Literal["isolated", "chrome_profile"] = "isolated",
         profile_name: str = "Default",
+        screenshot_format: str = "png",
+        screenshot_quality: int = 85,
     ) -> None:
         self._headless = headless
         self._browser_type = browser_type
         self._identity = identity
         self._profile_name = profile_name or "Default"
+        self._screenshot_format = screenshot_format
+        self._screenshot_quality = screenshot_quality
         self._playwright: Any = None
         self._browser: Any = None
         self._page: Any = None
+        self._last_screenshot_hash: str | None = None
+        self._recording: bool = False
+        self._recording_frames: list[bytes] = []
+        self._recording_task: asyncio.Task[None] | None = None
+        self._recording_fps: int = 4
+        self._workspace_dir: Path | None = None
         self._browser_sessions: BrowserSessionManager | None = None
         self._thread_id: str | None = None
 
@@ -126,6 +140,8 @@ class BrowserTool(BaseTool):
                         "forward",
                         "new_tab",
                         "close_tab",
+                        "start_recording",
+                        "stop_recording",
                     ],
                     "description": "Browser action to perform.",
                 },
@@ -147,6 +163,22 @@ class BrowserTool(BaseTool):
                 "timeout": {
                     "type": "number",
                     "description": "Timeout in milliseconds (default 5000).",
+                },
+                "region_x": {
+                    "type": "number",
+                    "description": "Left edge of capture region (pixels). Optional, for screenshot action.",
+                },
+                "region_y": {
+                    "type": "number",
+                    "description": "Top edge of capture region (pixels). Optional, for screenshot action.",
+                },
+                "region_width": {
+                    "type": "number",
+                    "description": "Width of capture region (pixels). Optional, for screenshot action.",
+                },
+                "region_height": {
+                    "type": "number",
+                    "description": "Height of capture region (pixels). Optional, for screenshot action.",
                 },
             },
             "required": ["action"],
@@ -214,7 +246,7 @@ class BrowserTool(BaseTool):
                         capture_follow_up_screenshots=capture_follow_up_screenshots,
                     )
                 if action == "screenshot":
-                    return await self._screenshot()
+                    return await self._screenshot(**kwargs)
                 if action == "get_text":
                     return await self._get_text(kwargs.get("selector"))
                 if action == "get_html":
@@ -263,6 +295,10 @@ class BrowserTool(BaseTool):
                         focus=self._default_focus(),
                         burst=True,
                     )
+                if action == "start_recording":
+                    return await self._start_recording()
+                if action == "stop_recording":
+                    return await self._stop_recording()
                 return ToolResult(success=False, error=f"Unknown action: {action!r}")
             except Exception as exc:  # noqa: BLE001
                 recovered = await self._recover_after_browser_loss(exc)
@@ -525,12 +561,96 @@ class BrowserTool(BaseTool):
             capture_follow_up_screenshots=capture_follow_up_screenshots,
         )
 
-    async def _screenshot(self) -> ToolResult:
+    async def _screenshot(self, **kwargs: Any) -> ToolResult:
+        clip = self._extract_clip(kwargs)
         return await self._capture_visual_state(
             output=f"Screenshot captured. Current URL: {self._page.url}",
             frame_label="browser · screenshot",
             summary="Capturing a screenshot",
             focus=self._default_focus(),
+            clip=clip,
+        )
+
+    @staticmethod
+    def _extract_clip(kwargs: dict[str, Any]) -> dict[str, float] | None:
+        rx = kwargs.get("region_x")
+        ry = kwargs.get("region_y")
+        rw = kwargs.get("region_width")
+        rh = kwargs.get("region_height")
+        if all(v is not None for v in (rx, ry, rw, rh)):
+            return {"x": float(rx), "y": float(ry), "width": float(rw), "height": float(rh)}
+        return None
+
+    async def _start_recording(self) -> ToolResult:
+        if self._recording:
+            return ToolResult(success=False, error="Recording is already in progress.")
+        self._recording = True
+        self._recording_frames = []
+
+        async def _capture_loop() -> None:
+            interval = 1.0 / self._recording_fps
+            while self._recording:
+                try:
+                    frame = await self._page.screenshot(type="png")
+                    self._recording_frames.append(frame)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(interval)
+
+        self._recording_task = asyncio.create_task(_capture_loop())
+        return ToolResult(
+            success=True,
+            output=f"Browser recording started at {self._recording_fps} FPS.",
+            metadata={"frame_label": "browser · start_recording", "summary": "Started browser recording"},
+        )
+
+    async def _stop_recording(self) -> ToolResult:
+        if not self._recording:
+            return ToolResult(success=False, error="No recording in progress.")
+        self._recording = False
+        if self._recording_task is not None:
+            self._recording_task.cancel()
+            try:
+                await self._recording_task
+            except asyncio.CancelledError:
+                pass
+            self._recording_task = None
+
+        frames = self._recording_frames
+        self._recording_frames = []
+        if not frames:
+            return ToolResult(success=False, error="No frames were captured during recording.")
+
+        from PIL import Image as _Image  # noqa: PLC0415
+
+        images = [_Image.open(io.BytesIO(f)) for f in frames]
+        buf = io.BytesIO()
+        duration = int(1000 / self._recording_fps)
+        images[0].save(
+            buf,
+            format="GIF",
+            save_all=True,
+            append_images=images[1:],
+            duration=duration,
+            loop=0,
+        )
+        gif_bytes = buf.getvalue()
+
+        save_dir = self._workspace_dir or Path.cwd() / "workspace"
+        recordings_dir = save_dir / ".memory" / "recordings"
+        recordings_dir.mkdir(parents=True, exist_ok=True)
+        gif_path = recordings_dir / f"{uuid.uuid4().hex[:12]}.gif"
+        gif_path.write_bytes(gif_bytes)
+
+        return ToolResult(
+            success=True,
+            output=f"Recording saved: {gif_path} ({len(frames)} frames, {len(gif_bytes)} bytes)",
+            metadata={
+                "frame_label": "browser · stop_recording",
+                "summary": "Stopped browser recording and saved GIF",
+                "recording_path": str(gif_path),
+                "frame_count": len(frames),
+            },
         )
 
     async def _action_result(
@@ -578,6 +698,29 @@ class BrowserTool(BaseTool):
             html = await self._page.content()
         return ToolResult(success=True, output=html[:8000])
 
+    async def _capture_browser_screenshot(
+        self,
+        clip: dict[str, float] | None = None,
+    ) -> bytes:
+        """Capture a browser screenshot in the configured format.
+
+        *clip* is an optional ``{"x": ..., "y": ..., "width": ..., "height": ...}`` dict.
+        """
+        fmt = self._screenshot_format
+        ss_kwargs: dict[str, Any] = {}
+        if clip:
+            ss_kwargs["clip"] = clip
+        if fmt == "jpeg":
+            return await self._page.screenshot(type="jpeg", quality=self._screenshot_quality, **ss_kwargs)
+        png_bytes = await self._page.screenshot(type="png", **ss_kwargs)
+        if fmt == "webp":
+            from PIL import Image as _Image  # noqa: PLC0415
+            img = _Image.open(io.BytesIO(png_bytes))
+            buf = io.BytesIO()
+            img.save(buf, format="WEBP", quality=self._screenshot_quality)
+            return buf.getvalue()
+        return png_bytes
+
     async def _capture_visual_state(
         self,
         *,
@@ -586,13 +729,17 @@ class BrowserTool(BaseTool):
         summary: str,
         focus: tuple[float, float],
         burst: bool = False,
+        clip: dict[str, float] | None = None,
     ) -> ToolResult:
-        png_bytes = await self._page.screenshot(type="png")
+        img_bytes = await self._capture_browser_screenshot(clip=clip)
         focus_x, focus_y = self._normalize_focus(*focus)
+        current_hash = compute_image_hash(img_bytes)
+        no_change = images_are_similar(self._last_screenshot_hash, current_hash)
+        self._last_screenshot_hash = current_hash
         return ToolResult(
             success=True,
             output=output,
-            screenshot_b64=base64.b64encode(png_bytes).decode(),
+            screenshot_b64=base64.b64encode(img_bytes).decode(),
             extra_screenshots=await self._capture_follow_up_frames(
                 frame_label=frame_label,
                 summary=summary,
@@ -605,6 +752,8 @@ class BrowserTool(BaseTool):
                 "focus_y": focus_y,
                 "frame_label": frame_label,
                 "summary": summary,
+                "no_change": no_change,
+                "image_format": self._screenshot_format,
             },
         )
 
