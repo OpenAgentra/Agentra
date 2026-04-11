@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import uuid
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -52,6 +53,9 @@ class BrowserTool(BaseTool):
         self._browser: Any = None
         self._page: Any = None
         self._last_screenshot_hash: str | None = None
+        self._frame_context: Any = None
+        self._last_dialog: dict[str, str] | None = None
+        self._pending_dialog: Any = None
         self._recording: bool = False
         self._recording_frames: list[bytes] = []
         self._recording_task: asyncio.Task[None] | None = None
@@ -80,6 +84,7 @@ class BrowserTool(BaseTool):
         launcher = getattr(self._playwright, self._browser_type)
         self._browser = await launcher.launch(headless=self._headless)
         self._page = await self._browser.new_page()
+        self._page.on("dialog", self._on_dialog)
 
     async def stop(self) -> None:
         """Close the browser and Playwright context."""
@@ -142,6 +147,18 @@ class BrowserTool(BaseTool):
                         "close_tab",
                         "start_recording",
                         "stop_recording",
+                        "hover",
+                        "double_click",
+                        "right_click",
+                        "select_option",
+                        "file_upload",
+                        "evaluate_js",
+                        "switch_frame",
+                        "switch_main_frame",
+                        "handle_dialog",
+                        "get_cookies",
+                        "set_cookie",
+                        "clear_cookies",
                     ],
                     "description": "Browser action to perform.",
                 },
@@ -162,8 +179,25 @@ class BrowserTool(BaseTool):
                 "delta_y": {"type": "number", "description": "Pixels to scroll vertically."},
                 "timeout": {
                     "type": "number",
-                    "description": "Timeout in milliseconds (default 5000).",
+                    "description": "Timeout in ms. Defaults: navigate=30000, click/type/get_text=5000.",
                 },
+                "value": {"type": "string", "description": "Option value for select_option."},
+                "label": {"type": "string", "description": "Visible label for select_option."},
+                "option_index": {"type": "integer", "description": "Zero-based index for select_option."},
+                "filepath": {"type": "string", "description": "File path for file_upload."},
+                "expression": {"type": "string", "description": "JavaScript expression for evaluate_js."},
+                "frame_selector": {"type": "string", "description": "CSS selector for iframe (switch_frame)."},
+                "frame_index": {"type": "integer", "description": "Zero-based frame index (switch_frame)."},
+                "dialog_action": {
+                    "type": "string",
+                    "enum": ["accept", "dismiss"],
+                    "description": "Accept or dismiss the dialog (handle_dialog).",
+                },
+                "prompt_text": {"type": "string", "description": "Text for prompt dialog (handle_dialog)."},
+                "cookie_name": {"type": "string", "description": "Cookie name (set_cookie)."},
+                "cookie_value": {"type": "string", "description": "Cookie value (set_cookie)."},
+                "cookie_domain": {"type": "string", "description": "Cookie domain (set_cookie)."},
+                "cookie_url": {"type": "string", "description": "URL scope for cookie (set_cookie)."},
                 "region_x": {
                     "type": "number",
                     "description": "Left edge of capture region (pixels). Optional, for screenshot action.",
@@ -204,13 +238,15 @@ class BrowserTool(BaseTool):
         for attempt in range(2):
             try:
                 await self._ensure_started()
+                timeout = kwargs.get("timeout")
                 if action == "navigate":
-                    return await self._navigate(kwargs.get("url", ""))
+                    return await self._navigate(kwargs.get("url", ""), timeout=timeout)
                 if action == "click":
                     return await self._click(
                         kwargs.get("selector"),
                         kwargs.get("x"),
                         kwargs.get("y"),
+                        timeout=timeout,
                         capture_result_screenshot=capture_result_screenshot,
                         capture_follow_up_screenshots=capture_follow_up_screenshots,
                     )
@@ -218,6 +254,7 @@ class BrowserTool(BaseTool):
                     return await self._type(
                         kwargs.get("selector"),
                         kwargs.get("text", ""),
+                        timeout=timeout,
                         capture_result_screenshot=capture_result_screenshot,
                         capture_follow_up_screenshots=capture_follow_up_screenshots,
                     )
@@ -248,9 +285,9 @@ class BrowserTool(BaseTool):
                 if action == "screenshot":
                     return await self._screenshot(**kwargs)
                 if action == "get_text":
-                    return await self._get_text(kwargs.get("selector"))
+                    return await self._get_text(kwargs.get("selector"), timeout=timeout)
                 if action == "get_html":
-                    return await self._get_html(kwargs.get("selector"))
+                    return await self._get_html(kwargs.get("selector"), timeout=timeout)
                 if action == "wait":
                     await asyncio.sleep(kwargs.get("timeout", 1000) / 1000)
                     return ToolResult(success=True, output="Waited.")
@@ -278,6 +315,7 @@ class BrowserTool(BaseTool):
                     )
                 if action == "new_tab":
                     self._page = await self._browser.new_page()
+                    self._page.on("dialog", self._on_dialog)
                     return await self._capture_visual_state(
                         output="Opened new tab.",
                         frame_label="browser · new_tab",
@@ -299,6 +337,59 @@ class BrowserTool(BaseTool):
                     return await self._start_recording()
                 if action == "stop_recording":
                     return await self._stop_recording()
+                if action == "hover":
+                    return await self._hover(
+                        kwargs.get("selector"), kwargs.get("x"), kwargs.get("y"),
+                        timeout=timeout,
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
+                    )
+                if action == "double_click":
+                    return await self._double_click(
+                        kwargs.get("selector"), kwargs.get("x"), kwargs.get("y"),
+                        timeout=timeout,
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
+                    )
+                if action == "right_click":
+                    return await self._right_click(
+                        kwargs.get("selector"), kwargs.get("x"), kwargs.get("y"),
+                        timeout=timeout,
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
+                    )
+                if action == "select_option":
+                    return await self._select_option(
+                        kwargs.get("selector", ""),
+                        value=kwargs.get("value"), label=kwargs.get("label"),
+                        option_index=kwargs.get("option_index"),
+                        timeout=timeout,
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
+                    )
+                if action == "file_upload":
+                    return await self._file_upload(
+                        kwargs.get("selector", ""), kwargs.get("filepath", ""),
+                        capture_result_screenshot=capture_result_screenshot,
+                        capture_follow_up_screenshots=capture_follow_up_screenshots,
+                    )
+                if action == "evaluate_js":
+                    return await self._evaluate_js(kwargs.get("expression", ""))
+                if action == "switch_frame":
+                    return await self._switch_frame(kwargs.get("frame_selector"), kwargs.get("frame_index"))
+                if action == "switch_main_frame":
+                    return await self._switch_main_frame()
+                if action == "handle_dialog":
+                    return await self._handle_dialog(kwargs.get("dialog_action", "accept"), kwargs.get("prompt_text"))
+                if action == "get_cookies":
+                    return await self._get_cookies()
+                if action == "set_cookie":
+                    return await self._set_cookie(
+                        kwargs.get("cookie_name", ""), kwargs.get("cookie_value", ""),
+                        cookie_domain=kwargs.get("cookie_domain"), cookie_url=kwargs.get("cookie_url"),
+                    )
+                if action == "clear_cookies":
+                    return await self._clear_cookies()
                 return ToolResult(success=False, error=f"Unknown action: {action!r}")
             except Exception as exc:  # noqa: BLE001
                 recovered = await self._recover_after_browser_loss(exc)
@@ -414,10 +505,15 @@ class BrowserTool(BaseTool):
 
     # ── private actions ────────────────────────────────────────────────────────
 
-    async def _navigate(self, url: str) -> ToolResult:
+    @property
+    def _active_frame(self) -> Any:
+        """Return the current frame context or the page itself."""
+        return self._frame_context if self._frame_context is not None else self._page
+
+    async def _navigate(self, url: str, *, timeout: int | None = None) -> ToolResult:
         if not url:
             return ToolResult(success=False, error="url is required for 'navigate'")
-        await self._page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        await self._page.goto(url, timeout=timeout or 30000, wait_until="domcontentloaded")
         title = await self._page.title()
         return await self._capture_visual_state(
             output=f"Navigated to {url!r}. Page title: {title!r}",
@@ -433,12 +529,13 @@ class BrowserTool(BaseTool):
         x: Optional[float],
         y: Optional[float],
         *,
+        timeout: int | None = None,
         capture_result_screenshot: bool = True,
         capture_follow_up_screenshots: bool = True,
     ) -> ToolResult:
         if selector:
             focus = await self._selector_focus(selector)
-            await self._page.click(selector, timeout=5000)
+            await self._active_frame.click(selector, timeout=timeout or 5000)
             return await self._action_result(
                 output=f"Clicked {selector!r}",
                 frame_label="browser · click",
@@ -466,12 +563,13 @@ class BrowserTool(BaseTool):
         selector: Optional[str],
         text: str,
         *,
+        timeout: int | None = None,
         capture_result_screenshot: bool = True,
         capture_follow_up_screenshots: bool = True,
     ) -> ToolResult:
         if selector:
             focus = await self._selector_focus(selector)
-            await self._page.fill(selector, text)
+            await self._active_frame.fill(selector, text, timeout=timeout or 5000)
             return await self._action_result(
                 output=f"Typed into {selector!r}",
                 frame_label="browser · type",
@@ -684,19 +782,234 @@ class BrowserTool(BaseTool):
             },
         )
 
-    async def _get_text(self, selector: Optional[str]) -> ToolResult:
+    async def _get_text(self, selector: Optional[str], *, timeout: int | None = None) -> ToolResult:
+        timeout_s = (timeout or 5000) / 1000
+        target = self._active_frame
         if selector:
-            text = await self._page.inner_text(selector)
+            coro = target.inner_text(selector)
         else:
-            text = await self._page.inner_text("body")
+            coro = target.inner_text("body")
+        text = await asyncio.wait_for(coro, timeout=timeout_s)
         return ToolResult(success=True, output=text[:8000])
 
-    async def _get_html(self, selector: Optional[str]) -> ToolResult:
+    async def _get_html(self, selector: Optional[str], *, timeout: int | None = None) -> ToolResult:
+        timeout_s = (timeout or 5000) / 1000
+        target = self._active_frame
         if selector:
-            html = await self._page.inner_html(selector)
+            coro = target.inner_html(selector)
         else:
-            html = await self._page.content()
+            coro = self._page.content()
+        html = await asyncio.wait_for(coro, timeout=timeout_s)
         return ToolResult(success=True, output=html[:8000])
+
+    # ── B1: new interaction actions ──────────────────────────────────────────
+
+    async def _hover(
+        self, selector: Optional[str], x: Optional[float], y: Optional[float],
+        *, timeout: int | None = None,
+        capture_result_screenshot: bool = True, capture_follow_up_screenshots: bool = True,
+    ) -> ToolResult:
+        if selector:
+            focus = await self._selector_focus(selector)
+            await self._active_frame.hover(selector, timeout=timeout or 5000)
+            return await self._action_result(
+                output=f"Hovered {selector!r}", frame_label="browser · hover",
+                summary=f"Hovering {selector}", focus=focus, burst=True,
+                capture_result_screenshot=capture_result_screenshot,
+                capture_follow_up_screenshots=capture_follow_up_screenshots,
+            )
+        if x is not None and y is not None:
+            await self._page.mouse.move(x, y)
+            return await self._action_result(
+                output=f"Hovered ({x}, {y})", frame_label="browser · hover",
+                summary="Hovering on the page", focus=(x, y), burst=True,
+                capture_result_screenshot=capture_result_screenshot,
+                capture_follow_up_screenshots=capture_follow_up_screenshots,
+            )
+        return ToolResult(success=False, error="Provide selector or x,y coordinates for hover.")
+
+    async def _double_click(
+        self, selector: Optional[str], x: Optional[float], y: Optional[float],
+        *, timeout: int | None = None,
+        capture_result_screenshot: bool = True, capture_follow_up_screenshots: bool = True,
+    ) -> ToolResult:
+        if selector:
+            focus = await self._selector_focus(selector)
+            await self._active_frame.dblclick(selector, timeout=timeout or 5000)
+            return await self._action_result(
+                output=f"Double-clicked {selector!r}", frame_label="browser · double_click",
+                summary=f"Double-clicking {selector}", focus=focus, burst=True,
+                capture_result_screenshot=capture_result_screenshot,
+                capture_follow_up_screenshots=capture_follow_up_screenshots,
+            )
+        if x is not None and y is not None:
+            await self._page.mouse.dblclick(x, y)
+            return await self._action_result(
+                output=f"Double-clicked ({x}, {y})", frame_label="browser · double_click",
+                summary="Double-clicking the page", focus=(x, y), burst=True,
+                capture_result_screenshot=capture_result_screenshot,
+                capture_follow_up_screenshots=capture_follow_up_screenshots,
+            )
+        return ToolResult(success=False, error="Provide selector or x,y coordinates for double_click.")
+
+    async def _right_click(
+        self, selector: Optional[str], x: Optional[float], y: Optional[float],
+        *, timeout: int | None = None,
+        capture_result_screenshot: bool = True, capture_follow_up_screenshots: bool = True,
+    ) -> ToolResult:
+        if selector:
+            focus = await self._selector_focus(selector)
+            await self._active_frame.click(selector, button="right", timeout=timeout or 5000)
+            return await self._action_result(
+                output=f"Right-clicked {selector!r}", frame_label="browser · right_click",
+                summary=f"Right-clicking {selector}", focus=focus, burst=True,
+                capture_result_screenshot=capture_result_screenshot,
+                capture_follow_up_screenshots=capture_follow_up_screenshots,
+            )
+        if x is not None and y is not None:
+            await self._page.mouse.click(x, y, button="right")
+            return await self._action_result(
+                output=f"Right-clicked ({x}, {y})", frame_label="browser · right_click",
+                summary="Right-clicking the page", focus=(x, y), burst=True,
+                capture_result_screenshot=capture_result_screenshot,
+                capture_follow_up_screenshots=capture_follow_up_screenshots,
+            )
+        return ToolResult(success=False, error="Provide selector or x,y coordinates for right_click.")
+
+    async def _select_option(
+        self, selector: str, *, value: str | None = None, label: str | None = None,
+        option_index: int | None = None, timeout: int | None = None,
+        capture_result_screenshot: bool = True, capture_follow_up_screenshots: bool = True,
+    ) -> ToolResult:
+        if not selector:
+            return ToolResult(success=False, error="selector is required for select_option.")
+        option_kwargs: dict[str, Any] = {}
+        if value is not None:
+            option_kwargs["value"] = value
+        elif label is not None:
+            option_kwargs["label"] = label
+        elif option_index is not None:
+            option_kwargs["index"] = option_index
+        else:
+            return ToolResult(success=False, error="Provide value, label, or option_index for select_option.")
+        focus = await self._selector_focus(selector)
+        await self._active_frame.select_option(selector, timeout=timeout or 5000, **option_kwargs)
+        desc = value or label or str(option_index)
+        return await self._action_result(
+            output=f"Selected {desc!r} in {selector!r}", frame_label="browser · select_option",
+            summary=f"Selecting option in {selector}", focus=focus, burst=True,
+            capture_result_screenshot=capture_result_screenshot,
+            capture_follow_up_screenshots=capture_follow_up_screenshots,
+        )
+
+    async def _file_upload(
+        self, selector: str, filepath: str, *,
+        capture_result_screenshot: bool = True, capture_follow_up_screenshots: bool = True,
+    ) -> ToolResult:
+        if not selector:
+            return ToolResult(success=False, error="selector is required for file_upload.")
+        if not filepath:
+            return ToolResult(success=False, error="filepath is required for file_upload.")
+        focus = await self._selector_focus(selector)
+        await self._active_frame.set_input_files(selector, filepath)
+        return await self._action_result(
+            output=f"Uploaded {filepath!r} to {selector!r}", frame_label="browser · file_upload",
+            summary=f"Uploading file to {selector}", focus=focus, burst=True,
+            capture_result_screenshot=capture_result_screenshot,
+            capture_follow_up_screenshots=capture_follow_up_screenshots,
+        )
+
+    async def _evaluate_js(self, expression: str) -> ToolResult:
+        if not expression:
+            return ToolResult(success=False, error="expression is required for evaluate_js.")
+        result = await self._active_frame.evaluate(expression)
+        output = json.dumps(result, default=str) if result is not None else "undefined"
+        return ToolResult(success=True, output=output[:8000])
+
+    # ── B2: iframe support ────────────────────────────────────────────────────
+
+    async def _switch_frame(self, frame_selector: str | None, frame_index: int | None) -> ToolResult:
+        if frame_selector:
+            self._frame_context = self._page.frame_locator(frame_selector)
+            return ToolResult(success=True, output=f"Switched to frame: {frame_selector!r}")
+        if frame_index is not None:
+            frames = self._page.frames
+            if frame_index < 0 or frame_index >= len(frames):
+                return ToolResult(
+                    success=False,
+                    error=f"Frame index {frame_index} out of range (0-{len(frames) - 1}).",
+                )
+            self._frame_context = frames[frame_index]
+            return ToolResult(success=True, output=f"Switched to frame index {frame_index}.")
+        return ToolResult(success=False, error="Provide frame_selector or frame_index.")
+
+    async def _switch_main_frame(self) -> ToolResult:
+        self._frame_context = None
+        return ToolResult(success=True, output="Switched back to main frame.")
+
+    # ── B3: dialog handling ───────────────────────────────────────────────────
+
+    def _on_dialog(self, dialog: Any) -> None:
+        self._last_dialog = {"type": dialog.type, "message": dialog.message}
+        self._pending_dialog = dialog
+        asyncio.ensure_future(self._auto_dismiss_dialog(dialog))
+
+    async def _auto_dismiss_dialog(self, dialog: Any) -> None:
+        await asyncio.sleep(5.0)
+        if self._pending_dialog is dialog:
+            try:
+                await dialog.dismiss()
+            except Exception:  # noqa: BLE001
+                pass
+            self._pending_dialog = None
+
+    async def _handle_dialog(self, dialog_action: str, prompt_text: str | None) -> ToolResult:
+        if self._pending_dialog is None:
+            info = self._last_dialog or {}
+            return ToolResult(
+                success=False, error="No pending dialog to handle.",
+                output=f"Last dialog info: {info}" if info else "",
+            )
+        dialog = self._pending_dialog
+        self._pending_dialog = None
+        if dialog_action == "dismiss":
+            await dialog.dismiss()
+            return ToolResult(success=True, output=f"Dismissed {dialog.type} dialog: {dialog.message!r}")
+        if prompt_text is not None:
+            await dialog.accept(prompt_text)
+        else:
+            await dialog.accept()
+        return ToolResult(success=True, output=f"Accepted {dialog.type} dialog: {dialog.message!r}")
+
+    # ── B4: cookie management ─────────────────────────────────────────────────
+
+    async def _get_cookies(self) -> ToolResult:
+        cookies = await self._page.context.cookies()
+        output = json.dumps(cookies, default=str)
+        return ToolResult(success=True, output=output[:8000])
+
+    async def _set_cookie(
+        self, name: str, value: str, *,
+        cookie_domain: str | None = None, cookie_url: str | None = None,
+    ) -> ToolResult:
+        if not name:
+            return ToolResult(success=False, error="cookie_name is required.")
+        cookie: dict[str, Any] = {"name": name, "value": value}
+        if cookie_url:
+            cookie["url"] = cookie_url
+        elif cookie_domain:
+            cookie["domain"] = cookie_domain
+            cookie["path"] = "/"
+        else:
+            cookie["url"] = self._page.url
+        await self._page.context.add_cookies([cookie])
+        return ToolResult(success=True, output=f"Cookie {name!r} set.")
+
+    async def _clear_cookies(self) -> ToolResult:
+        await self._page.context.clear_cookies()
+        return ToolResult(success=True, output="All cookies cleared.")
+
+    # ── visual capture ────────────────────────────────────────────────────────
 
     async def _capture_browser_screenshot(
         self,
