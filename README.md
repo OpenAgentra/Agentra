@@ -6,7 +6,7 @@
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE)
 
 ---
-
+![Animationlast-ezgif com-speed](https://github.com/user-attachments/assets/c0ae3618-2fc2-4f4c-ae33-4c351994ac2f)
 ## What is Agentra?
 
 Agentra is the open-source alternative to ChatGPT's "computer use" feature — and it goes much further:
