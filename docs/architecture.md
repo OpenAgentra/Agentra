@@ -2,7 +2,7 @@
 
 This page maps the runtime pieces that turn a goal into tool calls, UI updates, persisted artifacts, and workspace checkpoints.
 
-See also [Policies](policies.md) for execution rules, [Interfaces](interfaces.md) for reference surfaces, and [Artifacts](artifacts.md) for on-disk state.
+See also [Policies](policies.md) for execution rules, [Interfaces](interfaces.md) for reference surfaces, [Artifacts](artifacts.md) for on-disk state, and [Audit & Gaps](audit.md) for known wrong-logic and architecture-debt signals.
 
 ## System Overview
 
@@ -60,6 +60,8 @@ It:
 
 The orchestrator does not introduce a second tool system; each sub-task still runs through the normal autonomous agent machinery.
 
+Current risk: parallel sub-tasks with the same agent type share one cached `AutonomousAgent` instance. That can mix session state, tool state, memory writes, and browser or desktop resources. See [Audit & Gaps](audit.md).
+
 ### `ThreadManager`
 
 `agentra/runtime.py` is the thread-aware runtime center.
@@ -110,7 +112,7 @@ The desktop stack is split across:
 - `agentra/tools/computer.py` for raw desktop actions.
 - `agentra/tools/windows_desktop.py` for structured Windows-native app automation.
 - `agentra/desktop_automation/` for backend/session/capture/input implementations.
-- `DesktopSessionManager` in `agentra/runtime.py` for thread-scoped visible or hidden desktop sessions.
+- `DesktopSessionManager` from `agentra/desktop_automation/session_manager.py`, imported by `agentra/runtime.py`, for thread-scoped visible or hidden desktop sessions.
 
 Desktop execution modes:
 
@@ -172,6 +174,7 @@ In this path:
 - `RunReport` writes into the configured workspace's `.runs/` directory.
 - events are printed to the console through `_print_event`.
 - no thread-aware live HTTP control layer is inserted.
+- approval requests need a live `ThreadRuntimeController`; direct CLI runs currently do not pause on approval-policy decisions.
 
 ### Live App Run
 
@@ -193,7 +196,7 @@ A normal tool step looks like this:
 3. `AutonomousAgent` starts an LLM session with the system prompt, tool schemas, and relevant memory.
 4. The model emits a thought or tool call.
 5. Tool guardrails inspect the proposed tool call before execution.
-6. If needed, `ApprovalPolicyEngine` converts the step into an `approval_requested` event and waits for user input.
+6. In the live app path, `ApprovalPolicyEngine` converts sensitive steps into `approval_requested` events and waits for user input.
 7. The tool runs and returns `ToolResult` data, including optional screenshots and metadata.
 8. The agent writes observations into working memory and long-term memory.
 9. `RunReport` and `RunStore` persist the event stream, frame data, and rendered HTML.
@@ -209,8 +212,18 @@ Agentra keeps different kinds of state in different places:
 - browser state lives in `BrowserSessionManager` and its sessions.
 - persisted run state lives in `.runs/<run-id>/`.
 - persisted thread state lives in `.threads/<thread-id>/ledger.json` and `audit.jsonl`.
-- semantic memory lives in `.memory/` and `.memory-global/`.
+- thread-local semantic memory lives in `.memory/` under the active workspace.
+- project-wide long-term memory lives in `.memory-global/` under the base workspace.
 - workspace file state lives in the git-tracked workspace directory.
+
+## Current Architecture Debt
+
+These are documented so contributors can remove or fix them deliberately instead of treating them as intended architecture:
+
+- `agentra/live_app.py` still contains `LiveRunSession` and `LiveRunManager`, but `create_live_app()` uses `ThreadManager` as the active runtime boundary. Treat the older live-run manager as a stale-code candidate.
+- Goal routing logic is duplicated between `agentra/task_routing.py` and `agentra/agents/autonomous.py`. The routing module handles Turkish dotless `ı` normalization, while the local copy in the agent does not.
+- The direct CLI and live app share `AutonomousAgent`, but only the live app binds the runtime controller required for approvals, questions, pause/resume, and manual actions.
+- `WorkspaceManager` currently uses `git commit --allow-empty` for checkpoints, so a checkpoint may be reported as committed even when there were no file changes.
 
 ## Where To Look When Debugging
 

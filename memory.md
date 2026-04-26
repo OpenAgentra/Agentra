@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 * **Project Name:** Agentra
-* **Purpose:** Open-source autonomous AI agent runtime for real computer-use workflows: browser automation, desktop control, filesystem/terminal operations, memory, approvals, and live visual playback.
+* **Purpose:** Source-available autonomous AI agent runtime for real computer-use workflows: browser automation, desktop control, filesystem/terminal operations, memory, approvals, and live visual playback.
 * **Tech Stack:** Python 3.10+, Click CLI, Rich terminal UI, FastAPI live app, Playwright, Pydantic, provider adapters for OpenAI/Anthropic/Gemini/Ollama, pytest, Ruff, Black.
 * **Core Architectural Pattern:** Thread-aware Python monolith with pluggable providers, tools, runtime sessions, and report/live UI layers.
 
@@ -34,6 +34,7 @@
 * `agentra/memory/`: Embedding memory, providers, and workspace-related memory utilities.
 * `tests/`: Runtime, live app, browser, approval, memory, report, and provider test coverage.
 * `README.md`: Main product and setup documentation.
+* `docs/audit.md`: Current dead-code, missing coverage, wrong-logic, and architecture-debt register.
 * `TEACHER_BRIEF.md`: Presentation/demo narrative for explaining the project externally.
 
 ## 5. Development Workflow

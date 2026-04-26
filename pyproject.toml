@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentra"
 version = "0.1.0"
-description = "Open-source autonomous AI agent with full computer access — browser, desktop, filesystem, terminal"
+description = "Source-available autonomous AI agent with full computer access — browser, desktop, filesystem, terminal"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "BUSL-1.1" }
@@ -47,6 +47,7 @@ windows-desktop = [
     "uiautomation>=2.0.29; platform_system == 'Windows'",
 ]
 dev = [
+    "aiohttp>=3.9.0",
     "pytest>=8.2.0",
     "pytest-asyncio>=0.23.0",
     "pytest-mock>=3.14.0",

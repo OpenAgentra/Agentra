@@ -3,6 +3,8 @@
 Date: 2026-03-23
 Workspace: `/mnt/c/Users/ariba/OneDrive/Documenti/Software Projects/AI Projects/Agentra/Agentra`
 
+Status: historical handoff. For the current architecture map and known gaps, use `docs/architecture.md` and `docs/audit.md`. Some next-work notes below have since been implemented or superseded.
+
 ## What We Changed
 
 We implemented the new permission model and live UI updates discussed in this thread.

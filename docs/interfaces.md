@@ -2,7 +2,7 @@
 
 This page is the contributor reference for the public and semi-public surfaces that the repository currently exposes.
 
-For lifecycle context, read [Architecture](architecture.md). For behavior constraints, read [Policies](policies.md). For persisted output, read [Artifacts](artifacts.md).
+For lifecycle context, read [Architecture](architecture.md). For behavior constraints, read [Policies](policies.md). For persisted output, read [Artifacts](artifacts.md). For stale or risky interfaces, read [Audit & Gaps](audit.md).
 
 ## Python Exports
 
@@ -144,8 +144,10 @@ Subcommands:
 | `GET` | `/runs/{run_id}/events` | SSE event stream |
 | `GET` | `/runs/{run_id}/assets/{asset_name}` | Serve stored report assets |
 | `GET` | `/runs/{run_id}/report` | Serve the HTML run report |
+| `GET` | `/runs/{run_id}/debug-images/{asset_path:path}` | Serve archived live/debug images under a run |
 | `GET` | `/logs` | HTML log view |
 | `GET` | `/threads` | List threads |
+| `POST` | `/threads/clear` | Clear persisted thread state |
 | `GET` | `/threads/{thread_id}` | Get a thread snapshot |
 | `PATCH` | `/threads/{thread_id}` | Update thread settings |
 | `GET` | `/threads/{thread_id}/live-frame` | Single browser frame snapshot |
@@ -195,6 +197,7 @@ Fields:
 
 - `tool`
 - `args`
+- `return_snapshot`
 
 ### `ThreadSettingsUpdateRequest`
 
@@ -209,7 +212,7 @@ The model-facing tools are implemented under `agentra/tools/`.
 
 | Tool | Schema shape | Supported actions or fields | Notes |
 | --- | --- | --- | --- |
-| `browser` | `action` enum plus action-specific args | `navigate`, `click`, `type`, `key`, `drag`, `scroll`, `screenshot`, `get_text`, `get_html`, `wait`, `back`, `forward`, `new_tab`, `close_tab` | Can bind to shared thread browser sessions |
+| `browser` | `action` enum plus action-specific args | `navigate`, `click`, `type`, `key`, `drag`, `scroll`, `screenshot`, `get_text`, `extract_links`, `get_html`, `list_feed_items`, `click_feed_item_control`, `wait`, `back`, `forward`, `new_tab`, `close_tab` | Can bind to shared thread browser sessions |
 | `computer` | `action` enum plus coordinates/text | `screenshot`, `click`, `double_click`, `right_click`, `move`, `type`, `key`, `scroll`, `drag` | Backend-selected desktop control surface for visible or hidden sessions |
 | `windows_desktop` | `action` enum plus Windows app args | `launch_app`, `focus_window`, `wait_for_window`, `list_windows`, `list_controls`, `invoke_control`, `set_text`, `type_keys`, `read_window_text`, `read_status` | Structured Windows app automation; uses the thread desktop session context |
 | `filesystem` | `action` enum plus `path`, `content`, `destination`, `recursive` | `read`, `write`, `append`, `list`, `mkdir`, `delete`, `exists`, `copy`, `move`, `cwd` | Path resolution can be workspace-relative |
@@ -230,9 +233,11 @@ Main types:
 - `StatelessLLMSession`
 - `LLMProvider`
 
-Every provider must implement:
+Every provider class exposes:
 
 - `complete(messages, tools, temperature, max_tokens)`
 - `embed(text)`
 
 Providers can also override `start_session()` when they need a custom session implementation, as Gemini does with `GeminiSession`.
+
+Current embedding support is uneven: OpenAI and Ollama are the intended embedding-capable providers, while Anthropic and Gemini raise `NotImplementedError` for embeddings in this repository. Memory stores catch embedding failures and fall back to trivial local embeddings, which keeps writes working but degrades semantic retrieval quality.

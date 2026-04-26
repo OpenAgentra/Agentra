@@ -2,7 +2,7 @@
 
 This page documents the current guardrails and routing rules that shape how Agentra executes work.
 
-Use [Features](features.md) for the capability inventory and [Interfaces](interfaces.md) for the exact command, endpoint, and schema surfaces that these policies apply to.
+Use [Features](features.md) for the capability inventory, [Interfaces](interfaces.md) for the exact command, endpoint, and schema surfaces that these policies apply to, and [Audit & Gaps](audit.md) for known policy enforcement gaps.
 
 ## Permission Modes
 
@@ -50,6 +50,8 @@ In `full` mode, approvals are narrower but still required for:
 
 This is why full mode can use a real browser profile but still pauses for high-risk actions.
 
+Current enforcement boundary: approval requests are only actionable when `AutonomousAgent` is bound to a runtime controller, which happens in the live app path. Direct `agentra run ...` CLI execution currently creates an agent without that controller, so policy decisions do not pause the CLI run for approval.
+
 ## Goal Routing Policy
 
 `choose_live_execution_policy()` in `agentra/task_routing.py` derives three runtime choices from the goal text:
@@ -67,7 +69,7 @@ The current policy model is:
 - local folder/document goals can switch to `under_the_hood` execution when the goal wording implies path-driven or background local work
 - mixed web + local goals can still use `under_the_hood` local handling if the local portion looks like a file-resolution or document-open task
 
-The policy also sets a `control_surface_hint` of either `browser` or `desktop` for the live UI.
+The policy also sets a `control_surface_hint` of either `browser` or `desktop` for the live UI. Goals requesting real browser context, a user's Chrome profile, or account-specific browser state can infer `full` browser identity in the live runtime unless the request explicitly chooses default mode.
 
 ## Local Execution Modes
 
@@ -107,6 +109,8 @@ Agent guidance in this mode:
 - only use `terminal` when `filesystem` or `local_system` cannot resolve the task directly
 
 The desktop fallback in this mode is `pause_and_ask` rather than visible control.
+
+Under-the-hood mode disables hidden desktop session routing for that local portion. It is intended for path/file/document operations that can be resolved through `local_system` and `filesystem`, not for GUI session automation.
 
 ## Path Handling Policy
 
@@ -155,10 +159,12 @@ Runtime coordination rules from `agentra/runtime.py`:
 
 - only one thread can hold visible real-desktop control at a time
 - multiple hidden desktop threads can run concurrently with isolated session locks
+- browser and non-desktop tool calls do not use the visible desktop lock
 - a thread can be paused into `paused_for_user`
 - approval or question events move the thread into `blocked_waiting_user`
 - responding to an approval or question returns the thread to `running` when appropriate
 - manual human actions are recorded as run events and thread audit entries
+- live thread selection can reuse an existing thread for similar browser titles instead of creating a new isolated thread every time
 
 ## Hidden Desktop Safety Policy
 

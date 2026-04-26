@@ -2,7 +2,7 @@
 
 This page lists implemented capabilities only. It is intentionally scoped to what the current repository already exposes through code and tests.
 
-Use [Interfaces](interfaces.md) as the source of truth for commands, routes, fields, and tool schemas, and [Policies](policies.md) for guardrail behavior.
+Use [Interfaces](interfaces.md) as the source of truth for commands, routes, fields, and tool schemas, [Policies](policies.md) for guardrail behavior, and [Audit & Gaps](audit.md) for known incomplete or risky areas.
 
 ## Operator Surfaces
 
@@ -77,7 +77,10 @@ The browser tool supports implemented actions for:
 - scrolling
 - screenshots
 - text extraction
+- link extraction
 - HTML extraction
+- visible feed-card listing
+- marked feed-control clicking
 - waits
 - tab navigation and tab management
 
@@ -105,7 +108,7 @@ In that flow:
 - `Interact` routes clicks, keys, drags, and wheel input into the worker session rather than the user's visible desktop
 - incompatible or unsafe surfaces pause and ask instead of silently switching to visible control
 
-This is the default execution path for eligible local Windows app goals.
+This is the default execution path for eligible local Windows app goals. Current hidden-session capture is strongest for standard windowed Windows apps; the Windows Graphics Capture path exists as an adapter boundary but is not configured in this build.
 
 ### Under-The-Hood Local Execution
 
@@ -146,6 +149,8 @@ Memory entries can include:
 
 Long-term memory retrieval is filtered by goal relevance and is skipped for desktop-local-only goals.
 
+If the configured provider cannot produce embeddings, memory writes fall back to a trivial local embedding function. That preserves the memory pipeline but gives lower-quality semantic retrieval.
+
 ## Persistence And Observability
 
 ### HTML Run Reports
@@ -171,7 +176,7 @@ Audit entries include run start and finish events, approval and question activit
 
 ### Git-Tracked Workspace
 
-Agentra workspaces are intended to be git-tracked. The workspace manager can initialize repositories, create checkpoints, expose history, and restore previous states.
+Agentra workspaces are intended to be git-tracked. The workspace manager can initialize repositories, create checkpoints, expose history, and restore previous states. Current checkpoint code can create empty commits, so checkpoint counts should not be treated as proof that files changed.
 
 ## Provider Support
 
@@ -199,3 +204,5 @@ The repository includes targeted tests for:
 - memory persistence and retrieval behavior
 - run-report persistence and rendering
 - tool behavior across browser, desktop, filesystem, terminal, local-system, and git surfaces
+
+Known gaps include direct CLI approval enforcement, CLI command tests, provider tests for OpenAI/Anthropic/Ollama, and static lint cleanup. See [Audit & Gaps](audit.md).

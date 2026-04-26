@@ -1,5 +1,5 @@
 """
-Agentra — open-source autonomous AI agent with full computer access.
+Agentra — source-available autonomous AI agent with full computer access.
 
 Gives an LLM the ability to control a web browser, the desktop,
 the filesystem and a terminal — all coordinated through a ReAct

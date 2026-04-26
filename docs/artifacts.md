@@ -2,7 +2,7 @@
 
 This page documents what Agentra writes to disk and where contributors should look for runtime state.
 
-Read [Architecture](architecture.md) for how these artifacts are produced and [Interfaces](interfaces.md) for the commands and routes that expose them.
+Read [Architecture](architecture.md) for how these artifacts are produced, [Interfaces](interfaces.md) for the commands and routes that expose them, and [Audit & Gaps](audit.md) for generated artifacts that should not be treated as source.
 
 ## Two Common Layouts
 
@@ -30,6 +30,7 @@ Typical layout:
       events.json
       index.html
       assets/
+      debug-images/
 ```
 
 Notes:
@@ -67,6 +68,7 @@ Typical layout:
             events.json
             index.html
             assets/
+            debug-images/
 ```
 
 Notes:
@@ -92,6 +94,8 @@ Each run directory contains:
   - rendered report view for the run
 - `assets/`
   - captured screenshot files such as `screenshot-001.png`
+- `debug-images/`
+  - archived debug/live frames such as `run-screenshots/` and `live-browser/`
 
 `events.json` is the most complete on-disk record for a single run report.
 
@@ -166,6 +170,7 @@ Thread and run snapshots can also expose desktop session metadata such as mode, 
 Persisted visual artifacts appear when:
 
 - a run report stores screenshots in `.runs/<run-id>/assets/`
+- the live app archives live/debug frames in `.runs/<run-id>/debug-images/`
 - memory writes save screenshots into `.memory/screenshots/` or `.memory-global/screenshots/`
 
 ## Workspace Git State
@@ -181,10 +186,17 @@ Persistent effects include:
 
 In the live runtime, checkpoint summaries are also mirrored into `workspace_checkpoint` and `workspace_diff` audit entries.
 
+Current caveat: checkpoint code uses `git commit --allow-empty`, so a checkpoint commit can exist even when no files changed. Use `changed_files` and `diff_stats` in the run or ledger data before treating a checkpoint as proof of workspace modification.
+
+## Tracked Generated Artifacts
+
+This repository currently has some generated/runtime paths under version control, including `tmp-live-workspace`, `tmp-runtime-debug`, `tmp-smoke-under-the-hood`, `workspace`, `workspace-windows-demo`, `workspace-windows-demo-2`, and `@AutomationLog.txt`. Treat them as existing historical artifacts unless a task explicitly asks to refresh fixtures. New run output should not be added to normal documentation or code commits.
+
 ## Where To Inspect Artifacts During Debugging
 
 - run event history: `.runs/<run-id>/events.json`
 - rendered timeline: `.runs/<run-id>/index.html`
+- archived debug images: `.runs/<run-id>/debug-images/`
 - thread snapshot: `.threads/<thread-id>/ledger.json`
 - thread audit trail: `.threads/<thread-id>/audit.jsonl`
 - hidden desktop compatibility/debug state: thread snapshot desktop session payload

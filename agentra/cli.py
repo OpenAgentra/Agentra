@@ -107,7 +107,7 @@ def _print_event(event: dict) -> None:
 
 @click.group()
 def main() -> None:
-    """Agentra - open-source autonomous AI agent with full computer access."""
+    """Agentra - source-available autonomous AI agent with full computer access."""
 
 
 @main.command()

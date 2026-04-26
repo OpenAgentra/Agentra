@@ -10,6 +10,7 @@ This documentation set describes Agentra as it exists in the current repository.
 - [Policies](policies.md) documents permission modes, routing rules, guardrails, and completion rules.
 - [Interfaces](interfaces.md) is the reference for Python exports, config, CLI commands, HTTP endpoints, and tool schemas.
 - [Artifacts](artifacts.md) shows what Agentra writes to disk and where runtime state lives.
+- [Audit & Gaps](audit.md) records current dead-code signals, missing coverage, stale artifacts, wrong-logic risks, and architecture debt.
 
 ## Core Terms
 
@@ -30,6 +31,27 @@ This documentation set describes Agentra as it exists in the current repository.
 - `agentra/agents/autonomous.py` implements the main ReAct loop and tool guardrails.
 - `agentra/agents/orchestrator.py` implements multi-agent planning and dependency-aware sub-task execution.
 
+## Contributor Workflow
+
+Recommended local setup:
+
+```bash
+pip install -e ".[dev]"
+python -m playwright install chromium
+```
+
+Useful checks:
+
+```bash
+pytest tests -v
+pytest tests/test_runtime.py tests/test_live_app.py -q
+pytest tests/test_live_app_browser.py -q
+ruff check .
+vulture agentra tests --min-confidence 80
+```
+
+The browser-level live-app tests launch real Playwright Chromium and can skip or fail when the browser runtime is unavailable. Generated workspaces, `.runs/`, `.threads/`, `.memory*`, and debug images are runtime artifacts; do not add new ones to documentation commits unless a fixture explicitly needs them.
+
 ## Suggested Reading Order
 
 1. Read [Architecture](architecture.md) for the runtime map.
@@ -38,6 +60,7 @@ This documentation set describes Agentra as it exists in the current repository.
 4. Use [Interfaces](interfaces.md) when modifying CLI flags, config fields, HTTP routes, or tool schemas.
 5. Use [Artifacts](artifacts.md) when debugging reports, thread state, or workspace persistence.
 6. Use [Features](features.md) when you need a high-level inventory of what is already implemented.
+7. Use [Audit & Gaps](audit.md) before removing code or changing architecture boundaries.
 
 ## Scope Of This Docs Set
 

@@ -10,13 +10,15 @@ The design targets:
 
 - standard Windows desktop apps
 - Electron, WPF, WinForms, Qt, and similar windowed apps
-- windowed or editor-style DirectX-heavy apps such as Unreal Editor
+- windowed or editor-style DirectX-heavy apps as a future adapter target
 
 The hard safety guarantee is:
 
 - no focus stealing from the real desktop
 - no typing into the user's current foreground app
 - no silent downgrade from hidden mode to visible mode
+
+Current implementation limit: the Windows Graphics Capture adapter exists as a boundary but returns `fallback_required` in this build. The implemented capture path is `PrintWindow` for normal windowed Windows apps, with unsupported windows pausing for explicit fallback.
 
 ## Worker Model
 
@@ -58,8 +60,8 @@ Compatibility tiers:
 
 Adapter order:
 
-1. GPU/window capture path for windowed DirectX-heavy surfaces when available
-2. standard window capture path for normal desktop apps
+1. Windows Graphics Capture adapter boundary, currently not configured in this build
+2. `PrintWindow` client-area capture for normal desktop apps
 3. unsupported/fallback state when neither is safe enough
 
 Exclusive-fullscreen, raw-input-only, or similar incompatible surfaces must report `fallback_required` and pause for explicit visible/manual takeover.

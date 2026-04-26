@@ -134,7 +134,7 @@ class WorkspaceManager:
             readme.write_text(
                 "# Agentra Workspace\n\n"
                 "This directory is managed by the Agentra autonomous agent.\n"
-                "Every task is committed as a git snapshot.\n",
+                "Agentra initializes and checkpoints this workspace when GitPython is available.\n",
                 encoding="utf-8",
             )
 
