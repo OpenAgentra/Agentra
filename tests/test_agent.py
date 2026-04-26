@@ -14,14 +14,17 @@ from agentra.agents.autonomous import (
     _goal_has_local_desktop_component,
     _goal_mentions_web_target,
     _goal_is_browser_only,
+    _goal_requires_manual_browser_surface,
 )
 from agentra.config import AgentConfig
 from agentra.llm.base import LLMMessage, LLMProvider, LLMResponse
 from agentra.task_routing import (
     goal_has_local_desktop_component as routing_goal_has_local_desktop_component,
     goal_mentions_web_target as routing_goal_mentions_web_target,
+    goal_requests_real_browser_context,
 )
 from agentra.tools.base import BaseTool, ToolResult
+from agentra.tools.browser import BrowserTool
 
 
 class FakeLLM(LLMProvider):
@@ -324,6 +327,111 @@ async def test_agent_calls_tool_then_finishes(config, tmp_workspace):
 
 
 @pytest.mark.asyncio
+async def test_agent_retries_transient_empty_model_response(config, tmp_workspace):
+    llm = FakeLLM(
+        [
+            LLMResponse(content="", finish_reason="stop"),
+            LLMResponse(content="DONE: recovered after empty response.", finish_reason="stop"),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[EchoTool()])
+
+    events = []
+    gen = await agent.run("Recover from an empty response")
+    async for event in gen:
+        events.append(event)
+
+    assert any(
+        event["type"] == "thought" and "retrying with a clarification prompt" in event["content"]
+        for event in events
+    )
+    done_event = next(event for event in events if event["type"] == "done")
+    assert done_event["content"] == "DONE: recovered after empty response."
+
+
+@pytest.mark.asyncio
+async def test_agent_uses_fast_browser_defaults_for_repetitive_actions(config, tmp_workspace):
+    browser = BrowserTool(headless=True)
+    browser.execute = AsyncMock(return_value=ToolResult(success=True, output="browser ok"))
+    agent = AutonomousAgent(config=config, llm=FakeLLM([]), tools=[browser])
+
+    result = await agent._call_tool("browser", {"action": "click", "selector": "#like"}, bypass_pause=True)
+
+    assert result.success is True
+    browser.execute.assert_awaited_once_with(
+        action="click",
+        selector="#like",
+        capture_result_screenshot=False,
+        capture_follow_up_screenshots=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_keeps_navigation_screenshot_but_disables_follow_up_frames(config, tmp_workspace):
+    browser = BrowserTool(headless=True)
+    browser.execute = AsyncMock(return_value=ToolResult(success=True, output="browser ok"))
+    agent = AutonomousAgent(config=config, llm=FakeLLM([]), tools=[browser])
+
+    result = await agent._call_tool("browser", {"action": "navigate", "url": "https://example.com"}, bypass_pause=True)
+
+    assert result.success is True
+    browser.execute.assert_awaited_once_with(
+        action="navigate",
+        url="https://example.com",
+        capture_follow_up_screenshots=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_aliases_browser_action_tool_names(config, tmp_workspace):
+    browser = BrowserTool(headless=True)
+    browser.execute = AsyncMock(return_value=ToolResult(success=True, output="browser ok"))
+    agent = AutonomousAgent(config=config, llm=FakeLLM([]), tools=[browser])
+
+    result = await agent._call_tool("extract_links", {"selector": "main", "limit": 3}, bypass_pause=True)
+
+    assert result.success is True
+    browser.execute.assert_awaited_once_with(
+        action="extract_links",
+        selector="main",
+        limit=3,
+        capture_follow_up_screenshots=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_emits_browser_tool_call_for_browser_action_alias(config, tmp_workspace):
+    browser = BrowserTool(headless=True)
+    browser.execute = AsyncMock(return_value=ToolResult(success=True, output="clicked"))
+    browser.preview = AsyncMock(return_value=None)
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "1", "name": "click", "arguments": {"selector": "#go"}}],
+            ),
+            LLMResponse(content="DONE: Clicked.", finish_reason="stop"),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[browser])
+
+    events = []
+    gen = await agent.run("Click the visible browser button")
+    async for event in gen:
+        events.append(event)
+
+    tool_call = next(event for event in events if event["type"] == "tool_call")
+    assert tool_call["tool"] == "browser"
+    assert tool_call["args"] == {"selector": "#go", "action": "click"}
+    browser.execute.assert_awaited_once_with(
+        action="click",
+        selector="#go",
+        capture_result_screenshot=False,
+        capture_follow_up_screenshots=False,
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_stops_async_tools_on_exit(config, tmp_workspace):
     """Async tool cleanup should run after the agent finishes."""
 
@@ -379,9 +487,11 @@ async def test_agent_respects_max_iterations(config, tmp_workspace):
     async for event in gen:
         events.append(event)
 
-    # Should end with a done event (iteration limit)
     types = [e["type"] for e in events]
-    assert "done" in types
+    assert "done" not in types
+    assert events[-1]["type"] == "thought"
+    assert "Reached iteration limit (3)." in events[-1]["content"]
+    assert "Task is not fully complete." in events[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -747,6 +857,295 @@ def test_browser_goal_with_desktop_guardrail_stays_browser_only():
     assert routing_goal_has_local_desktop_component(goal) is False
 
 
+def test_gmail_attachment_goal_prefers_manual_browser_surface():
+    goal = '"C:\\Users\\ariba\\Downloads\\bes_scenarios.csv" dosyasini aribaskagan@gmail.com adresine gonder'
+
+    assert _goal_requires_manual_browser_surface(goal) is True
+    assert _goal_has_local_desktop_component(goal) is True
+
+
+def test_github_account_goal_prefers_real_browser_context_without_manual_surface():
+    goal = "github hesaplarından kagankakao hesabına gir ve repoları tek tek incele"
+
+    assert _goal_requires_manual_browser_surface(goal) is False
+    assert goal_requests_real_browser_context(goal) is True
+    assert _goal_is_browser_only(goal) is True
+
+
+def test_github_repo_review_guidance_prefers_browser_extraction(config):
+    agent = AutonomousAgent(
+        config=config,
+        llm=FakeLLM([LLMResponse(content="DONE: ok")]),
+        tools=[NamedTool("browser", "Web browser control.")],
+    )
+
+    guidance = agent._goal_guidance("github hesaplarından kagankakao hesabına gir ve repoları tek tek incele")
+
+    assert "extract_links" in guidance
+    assert "get_text" in guidance
+    assert "endless scrolling" in guidance
+    assert "Do not start at `/login`" in guidance
+    assert "Do not depend on a literal `Pinned` text selector" in guidance
+
+
+def test_github_repo_review_guardrail_blocks_browser_wandering(config):
+    agent = AutonomousAgent(
+        config=config,
+        llm=FakeLLM([LLMResponse(content="DONE: ok")]),
+        tools=[NamedTool("browser", "Web browser control.")],
+    )
+    goal = "github hesaplarından kagankakao hesabına gir ve repoları tek tek incele"
+    tool_history = [
+        {"tool": "browser", "success": True, "args": {"action": "click"}},
+        {"tool": "browser", "success": True, "args": {"action": "scroll"}},
+        {"tool": "browser", "success": True, "args": {"action": "scroll"}},
+        {"tool": "browser", "success": True, "args": {"action": "back"}},
+        {"tool": "browser", "success": True, "args": {"action": "scroll"}},
+        {"tool": "browser", "success": True, "args": {"action": "click"}},
+    ]
+
+    error = agent._tool_guardrail_error(
+        goal,
+        "browser",
+        {"action": "scroll"},
+        {"browser"},
+        tool_history,
+    )
+
+    assert error is not None
+    assert "extract_links" in error
+    assert "get_text" in error
+
+
+def test_github_repo_review_guardrail_blocks_repeated_same_page_navigation(config):
+    agent = AutonomousAgent(
+        config=config,
+        llm=FakeLLM([LLMResponse(content="DONE: ok")]),
+        tools=[NamedTool("browser", "Web browser control.")],
+    )
+    goal = "github hesaplarından kagankakao hesabına gir ve repoları tek tek incele"
+    tool_history = [
+        {
+            "tool": "browser",
+            "success": True,
+            "args": {"action": "navigate", "url": "https://github.com/Kagankakao"},
+        },
+        {
+            "tool": "browser",
+            "success": True,
+            "args": {"action": "navigate", "url": "https://github.com/Kagankakao"},
+        },
+        {
+            "tool": "browser",
+            "success": True,
+            "args": {"action": "navigate", "url": "https://github.com/Kagankakao"},
+        },
+    ]
+
+    error = agent._tool_guardrail_error(
+        goal,
+        "browser",
+        {"action": "navigate", "url": "https://github.com/Kagankakao"},
+        {"browser"},
+        tool_history,
+    )
+
+    assert error is not None
+    assert "same GitHub/GitLab page" in error
+    assert "get_text" in error
+
+
+def test_github_repo_review_guardrail_blocks_repeated_pinned_selector_probing(config):
+    agent = AutonomousAgent(
+        config=config,
+        llm=FakeLLM([LLMResponse(content="DONE: ok")]),
+        tools=[NamedTool("browser", "Web browser control.")],
+    )
+    goal = "github hesaplarından kagankakao hesabına gir ve repoları tek tek incele"
+    tool_history = [
+        {
+            "tool": "browser",
+            "success": False,
+            "args": {"action": "get_text", "selector": "text=Pinned"},
+        }
+    ]
+
+    error = agent._tool_guardrail_error(
+        goal,
+        "browser",
+        {"action": "scroll", "delta_y": 500},
+        {"browser"},
+        tool_history,
+    )
+
+    assert error is not None
+    assert "Pinned" in error
+    assert "extract_links" in error
+
+
+def test_linkedin_feed_guidance_avoids_popup_bruteforce(config):
+    agent = AutonomousAgent(
+        config=config,
+        llm=FakeLLM([LLMResponse(content="DONE: ok")]),
+        tools=[NamedTool("browser", "Web browser control.")],
+    )
+
+    guidance = agent._goal_guidance("LinkedIn'deki postlara git beğen vs. ve altlarına uygun yorumlar yaz.")
+
+    assert "list_feed_items" in guidance
+    assert "click_feed_item_control" in guidance
+    assert "messaging drawer" in guidance
+    assert "get_html" in guidance
+    assert "top-right coordinate clicks" in guidance
+
+
+def test_social_feed_guardrail_blocks_popup_dismissal_guessing(config):
+    agent = AutonomousAgent(
+        config=config,
+        llm=FakeLLM([LLMResponse(content="DONE: ok")]),
+        tools=[NamedTool("browser", "Web browser control.")],
+    )
+    goal = "LinkedIn'deki postlara git beğen vs. ve altlarına uygun yorumlar yaz."
+    tool_history = [
+        {
+            "tool": "browser",
+            "success": False,
+            "args": {"action": "click", "selector": "button[aria-label*='Close chat window']"},
+            "result": 'ERROR: Selector "button[aria-label*=\'Close chat window\']" is not visible or ready yet.',
+        },
+        {
+            "tool": "browser",
+            "success": False,
+            "args": {"action": "click", "selector": "button[aria-label*='Close the chat window']"},
+            "result": 'ERROR: Selector "button[aria-label*=\'Close the chat window\']" is not visible or ready yet.',
+        },
+    ]
+
+    error = agent._tool_guardrail_error(
+        goal,
+        "browser",
+        {"action": "click", "x": 1500, "y": 25},
+        {"browser"},
+        tool_history,
+    )
+
+    assert error is not None
+    assert "get_html" in error
+    assert "manual close" in error
+
+
+def test_social_feed_guardrail_allows_progress_after_overlay_inspection(config):
+    agent = AutonomousAgent(
+        config=config,
+        llm=FakeLLM([LLMResponse(content="DONE: ok")]),
+        tools=[NamedTool("browser", "Web browser control.")],
+    )
+    goal = "LinkedIn'deki postlara git beğen vs. ve altlarına uygun yorumlar yaz."
+    tool_history = [
+        {
+            "tool": "browser",
+            "success": False,
+            "args": {"action": "click", "selector": "button[aria-label*='Close chat window']"},
+            "result": 'ERROR: Selector "button[aria-label*=\'Close chat window\']" is not visible or ready yet.',
+        },
+        {
+            "tool": "browser",
+            "success": False,
+            "args": {"action": "click", "selector": "button[aria-label*='Close the chat window']"},
+            "result": 'ERROR: Selector "button[aria-label*=\'Close the chat window\']" is not visible or ready yet.',
+        },
+        {
+            "tool": "browser",
+            "success": True,
+            "args": {"action": "get_html", "selector": "body"},
+            "result": "<div>inspected</div>",
+        },
+    ]
+
+    error = agent._tool_guardrail_error(
+        goal,
+        "browser",
+        {"action": "click", "selector": "button[aria-label='Minimize messaging drawer']"},
+        {"browser"},
+        tool_history,
+    )
+
+    assert error is None
+
+
+def test_browser_blank_page_guardrail_requires_navigation(config):
+    agent = AutonomousAgent(
+        config=config,
+        llm=FakeLLM([LLMResponse(content="DONE: ok")]),
+        tools=[NamedTool("browser", "Web browser control.")],
+    )
+    goal = "LinkedIn'deki postlara git beğen vs. ve altlarına uygun yorumlar yaz."
+    tool_history = [
+        {
+            "tool": "browser",
+            "success": False,
+            "args": {"action": "type", "selector": 'input[name="session_key"]', "text": "YOUR_EMAIL"},
+            "result": "ERROR: Cannot 'type' because the current browser page is blank (about:blank). Navigate to a real website first.",
+        }
+    ]
+
+    error = agent._tool_guardrail_error(
+        goal,
+        "browser",
+        {"action": "type", "selector": 'input[name="session_key"]', "text": "YOUR_EMAIL"},
+        set(),
+        tool_history,
+    )
+
+    assert error is not None
+    assert "blank" in error
+    assert "navigate" in error
+
+
+def test_sensitive_browser_takeover_waits_for_real_page_context(config):
+    config = config.model_copy(update={"browser_headless": False})
+    agent = AutonomousAgent(
+        config=config,
+        llm=FakeLLM([LLMResponse(content="DONE: ok")]),
+        tools=[NamedTool("browser", "Web browser control.")],
+    )
+
+    no_page_event = agent._prepare_sensitive_takeover_event(
+        "browser",
+        {"action": "type", "selector": 'input[name="session_password"]', "text": "secret"},
+        [],
+    )
+    blank_page_event = agent._prepare_sensitive_takeover_event(
+        "browser",
+        {"action": "type", "selector": 'input[name="session_password"]', "text": "secret"},
+        [
+            {
+                "tool": "browser",
+                "success": True,
+                "args": {"action": "screenshot"},
+                "metadata": {"active_url": "about:blank"},
+            }
+        ],
+    )
+    real_page_event = agent._prepare_sensitive_takeover_event(
+        "browser",
+        {"action": "type", "selector": 'input[name="session_password"]', "text": "secret"},
+        [
+            {
+                "tool": "browser",
+                "success": True,
+                "args": {"action": "navigate", "url": "https://www.linkedin.com/login"},
+                "metadata": {"active_url": "https://www.linkedin.com/login"},
+            }
+        ],
+    )
+
+    assert no_page_event is None
+    assert blank_page_event is None
+    assert real_page_event is not None
+    assert real_page_event["pause_kind"] == "sensitive_browser_takeover"
+
+
 def test_real_local_desktop_step_survives_guardrail_filter():
     goal = (
         "github.com/login sayfasini ac, sonra masaustumdeki RDR2 kisayolunu ac, "
@@ -755,6 +1154,77 @@ def test_real_local_desktop_step_survives_guardrail_filter():
 
     assert _goal_has_local_desktop_component(goal) is True
     assert routing_goal_has_local_desktop_component(goal) is True
+
+
+@pytest.mark.asyncio
+async def test_agent_blocks_browser_automation_for_manual_browser_surface_goal(config, tmp_workspace):
+    browser = NamedTool("browser", "Web browser control.")
+    computer = NamedTool("computer", "Desktop control.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "1",
+                        "name": "browser",
+                        "arguments": {"action": "navigate", "url": "https://mail.google.com/mail/u/0/#inbox?compose=new"},
+                    }
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "2", "name": "computer", "arguments": {"action": "click"}}],
+            ),
+            LLMResponse(content="DONE: Gmail window is under visible desktop control."),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[browser, computer])
+
+    events = []
+    gen = await agent.run('"C:\\Users\\ariba\\Downloads\\bes_scenarios.csv" dosyasini aribaskagan@gmail.com adresine gonder')
+    async for event in gen:
+        events.append(event)
+
+    browser_result = next(
+        event
+        for event in events
+        if event["type"] == "tool_result" and event["tool"] == "browser"
+    )
+    assert browser_result["success"] is False
+    assert "real visible browser window" in browser_result["result"]
+    assert browser.calls == []
+    assert computer.calls == [{"action": "click"}]
+
+
+@pytest.mark.asyncio
+async def test_agent_allows_computer_for_browser_only_manual_browser_surface_goal(config, tmp_workspace):
+    browser = NamedTool("browser", "Web browser control.")
+    computer = NamedTool("computer", "Desktop control.")
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[{"id": "1", "name": "computer", "arguments": {"action": "click"}}],
+            ),
+            LLMResponse(content="DONE: GitHub account is under visible browser control."),
+        ]
+    )
+    agent = AutonomousAgent(config=config, llm=llm, tools=[browser, computer])
+
+    events = []
+    gen = await agent.run("gmail hesabina gir ve mailleri kontrol et")
+    async for event in gen:
+        events.append(event)
+
+    computer_result = next(
+        event
+        for event in events
+        if event["type"] == "tool_result" and event["tool"] == "computer"
+    )
+    assert computer_result["success"] is True
+    assert browser.calls == []
+    assert computer.calls == [{"action": "click"}]
 
 
 def test_browser_negation_does_not_turn_desktop_goal_into_web_goal():
@@ -1537,3 +2007,36 @@ async def test_long_term_memory_requires_goal_overlap(config, tmp_workspace):
     assert memory_message is not None
     assert "example.com" in memory_message.content
     assert "github.com/kagankakao" not in memory_message.content
+
+
+@pytest.mark.asyncio
+async def test_long_term_memory_skips_same_thread_failures_and_old_assistant_thoughts(config, tmp_workspace):
+    agent = AutonomousAgent(config=config, llm=FakeLLM([]), tools=[EchoTool()])
+    agent._run_id = "run-current"
+    agent._thread_id = "thread-current"
+    await agent.long_term_memory.add(
+        "I apologize for the repeated issues. I will try again.",
+        role="assistant",
+        metadata={
+            "run_id": "run-older",
+            "thread_id": "thread-current",
+            "source_type": "assistant_thought",
+        },
+    )
+    await agent.long_term_memory.add(
+        "Navigated to https://github.com/Kagankakao/ipekgpt and inspected README.md",
+        metadata={
+            "run_id": "run-other",
+            "thread_id": "thread-other",
+            "source_type": "tool_result",
+            "summary": "Opened ipekgpt README",
+        },
+    )
+
+    memory_message = await agent._long_term_memory_message(
+        "github hesaplarından kagankakao hesabına gir ve repoları tek tek incele"
+    )
+
+    assert memory_message is not None
+    assert "ipekgpt" in memory_message.content.lower()
+    assert "repeated issues" not in memory_message.content.lower()

@@ -31,6 +31,7 @@ from agentra.memory.embedding_memory import LongTermMemoryStore, ThreadWorkingMe
 from agentra.memory.workspace import WorkspaceManager
 from agentra.task_routing import (
     goal_mentions_web_target as routing_goal_mentions_web_target,
+    goal_requires_manual_browser_surface as routing_goal_requires_manual_browser_surface,
     goal_prefers_native_windows_desktop_execution as routing_goal_prefers_native_windows_desktop_execution,
 )
 from agentra.tools.base import BaseTool, ToolResult
@@ -48,6 +49,27 @@ from agentra.windows_apps import (
 )
 
 logger = logging.getLogger(__name__)
+_BROWSER_ACTION_ALIASES = frozenset(
+    {
+        "navigate",
+        "click",
+        "type",
+        "key",
+        "drag",
+        "scroll",
+        "screenshot",
+        "get_text",
+        "extract_links",
+        "get_html",
+        "list_feed_items",
+        "click_feed_item_control",
+        "wait",
+        "back",
+        "forward",
+        "new_tab",
+        "close_tab",
+    }
+)
 
 _SYSTEM_PROMPT = """\
 You are Agentra, an autonomous AI agent with full access to a computer.
@@ -64,6 +86,8 @@ You are Agentra, an autonomous AI agent with full access to a computer.
 
 ## Tool routing rules
 - Use `browser` only for websites, web apps, URLs, and web pages.
+- For high-friction authenticated browser flows like Gmail, email compose/send, uploads, or native file pickers, prefer visible on-screen browser control over fragile selector-driven automation.
+- For GitHub/GitLab account or repo review tasks, prefer `browser` extraction actions like `extract_links`, `get_text`, and `get_html` plus direct repo URLs over repeated scrolling, screenshots, and backtracking. Treat public profiles and repositories as readable without login; only initiate login when the current page explicitly requires authentication or the user asks for a private account area.
 - Use `local_system` to resolve known local folders and open confirmed local files or folders with the OS default handler.
 - Use `windows_desktop` first for standard Windows apps such as Calculator, Notepad, Explorer, common dialogs, buttons, and text inputs.
 - Use `computer` only for visible desktop/UI tasks that truly require on-screen interaction.
@@ -216,6 +240,58 @@ _PAYMENT_PAGE_TERMS = (
     "expiry",
     "pay ",
 )
+_REPO_COLLECTION_TERMS = (
+    "repo",
+    "repository",
+    "repositories",
+    "repolari",
+)
+_REPO_REVIEW_TERMS = (
+    "review",
+    "inspect",
+    "analyze",
+    "analyse",
+    "check",
+    "look through",
+    "go through",
+    "tek tek",
+    "incele",
+    "inceleme",
+    "kontrol et",
+)
+_SOCIAL_FEED_SITE_TERMS = (
+    "linkedin",
+    "x.com",
+    "twitter",
+    "facebook",
+    "instagram",
+    "reddit",
+)
+_SOCIAL_FEED_ENGAGEMENT_TERMS = (
+    "post",
+    "posts",
+    "feed",
+    "comment",
+    "comments",
+    "like",
+    "gonderi",
+    "gonderiler",
+    "yorum",
+    "yorumlar",
+    "begen",
+    "begeni",
+)
+_DISMISSAL_SELECTOR_TERMS = (
+    "close",
+    "dismiss",
+    "popup",
+    "modal",
+    "chat window",
+    "drawer",
+    "not now",
+    "skip",
+    "cancel",
+)
 _DESKTOP_GUARDRAIL_PATTERNS = (
     r"(?:^|[;,.]|\band\b|\bbut\b|\bama\b)\s*(?:masaustu(?:mdeki|ndeki)?|desktop|diger|baska|other|any)[^.;,]{0,120}?(?:pencere|uygulama|window|app)[^.;,]{0,120}?(?:dokunma|dokunmadan|elleme|mudahale etme|touch(?:ing)?|interact(?: with)?|mess with|use)",
     r"(?:^|[;,.]|\band\b|\bbut\b|\bama\b)\s*(?:hicbir|diger|baska|other|any)[^.;,]{0,80}?(?:pencere|uygulama|window|app)[^.;,]{0,120}?(?:dokunma|dokunmadan|elleme|mudahale etme|touch(?:ing)?|interact(?: with)?|mess with|use)",
@@ -262,12 +338,20 @@ _GOAL_STOPWORDS = {
     "site",
     "sayfa",
 }
+_BLANK_BROWSER_URL_PREFIXES = ("about:blank", "data:,", "chrome://newtab", "chrome://new-tab-page", "edge://newtab")
 
 
 def _normalized_text(text: str) -> str:
     folded = unicodedata.normalize("NFKD", text.casefold())
     stripped = "".join(char for char in folded if not unicodedata.combining(char))
     return re.sub(r"\s+", " ", stripped).strip()
+
+
+def _browser_page_needs_navigation(url: str) -> bool:
+    raw = str(url or "").strip().casefold().rstrip("/")
+    if not raw:
+        return True
+    return raw.startswith(_BLANK_BROWSER_URL_PREFIXES)
 
 
 def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
@@ -293,6 +377,10 @@ def _goal_mentions_web_target(goal: str) -> bool:
 
 def _goal_prefers_native_windows_desktop_execution(goal: str) -> bool:
     return routing_goal_prefers_native_windows_desktop_execution(goal)
+
+
+def _goal_requires_manual_browser_surface(goal: str) -> bool:
+    return routing_goal_requires_manual_browser_surface(goal)
 
 
 def _goal_mentions_desktop_surface(goal: str) -> bool:
@@ -349,11 +437,56 @@ def _goal_mentions_sensitive_web_entry(goal: str) -> bool:
     return _contains_any_phrase(normalized, phrases)
 
 
+def _goal_requests_repo_review(goal: str) -> bool:
+    normalized = _normalized_text(goal)
+    if not _contains_any_phrase(normalized, ("github", "gitlab")):
+        return False
+    if not _contains_any_phrase(normalized, _REPO_COLLECTION_TERMS):
+        return False
+    return _contains_any_phrase(normalized, _REPO_REVIEW_TERMS)
+
+
+def _goal_is_social_feed_engagement(goal: str) -> bool:
+    normalized = _normalized_text(goal)
+    if not _contains_any_phrase(normalized, _SOCIAL_FEED_SITE_TERMS):
+        return False
+    return _contains_any_phrase(normalized, _SOCIAL_FEED_ENGAGEMENT_TERMS)
+
+
 def _latest_successful_browser_entry(tool_history: list[dict[str, Any]]) -> dict[str, Any] | None:
     for entry in reversed(tool_history):
         if entry.get("tool") == "browser" and entry.get("success"):
             return entry
     return None
+
+
+def _browser_context_ready_for_sensitive_step(tool_history: list[dict[str, Any]]) -> bool:
+    entry = _latest_successful_browser_entry(tool_history)
+    if entry is None:
+        return False
+    metadata = entry.get("metadata") or {}
+    active_url = str(metadata.get("active_url", "") or "")
+    return not _browser_page_needs_navigation(active_url)
+
+
+def _recent_browser_blank_page_failure(tool_history: list[dict[str, Any]], *, limit: int = 8) -> bool:
+    browser_entries_seen = 0
+    for entry in reversed(tool_history):
+        if entry.get("tool") != "browser":
+            continue
+        browser_entries_seen += 1
+        if browser_entries_seen > limit:
+            break
+        if entry.get("success"):
+            metadata = entry.get("metadata") or {}
+            active_url = str(metadata.get("active_url", "") or "")
+            if not _browser_page_needs_navigation(active_url):
+                return False
+            continue
+        result_text = str(entry.get("result", "") or "").casefold()
+        if "current browser page is blank" in result_text:
+            return True
+    return False
 
 
 def _browser_manual_takeover_recorded(tool_history: list[dict[str, Any]]) -> bool:
@@ -392,6 +525,145 @@ def _browser_page_takeover_kind(goal: str, tool_history: list[dict[str, Any]]) -
     if _contains_any_phrase(page_text, _AUTH_PAGE_TERMS):
         return "secret"
     return None
+
+
+def _successful_browser_actions(tool_history: list[dict[str, Any]], *, limit: int = 12) -> list[str]:
+    actions: list[str] = []
+    for entry in reversed(tool_history):
+        if entry.get("tool") != "browser" or not entry.get("success"):
+            continue
+        actions.append(str((entry.get("args") or {}).get("action", "")).lower())
+        if len(actions) >= limit:
+            break
+    return actions
+
+
+def _has_successful_browser_extraction(tool_history: list[dict[str, Any]], *, limit: int = 12) -> bool:
+    return any(action in {"get_text", "get_html", "extract_links"} for action in _successful_browser_actions(tool_history, limit=limit))
+
+
+def _has_excessive_browser_repo_wandering(
+    tool_args: dict[str, Any],
+    tool_history: list[dict[str, Any]],
+    *,
+    threshold: int = 6,
+) -> bool:
+    action = str(tool_args.get("action", "")).lower()
+    if action not in {"click", "scroll", "back", "forward", "screenshot"}:
+        return False
+    if _has_successful_browser_extraction(tool_history):
+        return False
+
+    wandering_actions = 0
+    for prior_action in _successful_browser_actions(tool_history, limit=14):
+        if prior_action in {"get_text", "get_html", "extract_links"}:
+            return False
+        if prior_action in {"click", "scroll", "back", "forward", "screenshot"}:
+            wandering_actions += 1
+        if wandering_actions >= threshold:
+            return True
+    return False
+
+
+def _has_repeated_browser_navigation_to_same_url(
+    tool_args: dict[str, Any],
+    tool_history: list[dict[str, Any]],
+    *,
+    threshold: int = 3,
+    limit: int = 10,
+) -> bool:
+    action = str(tool_args.get("action", "")).lower()
+    target_url = str(tool_args.get("url", "") or "").strip().rstrip("/")
+    if action != "navigate" or not target_url:
+        return False
+    if _has_successful_browser_extraction(tool_history):
+        return False
+
+    repeated_navigations = 0
+    browser_entries_seen = 0
+    for entry in reversed(tool_history):
+        if entry.get("tool") != "browser" or not entry.get("success"):
+            continue
+        browser_entries_seen += 1
+        if browser_entries_seen > limit:
+            break
+        args = entry.get("args") or {}
+        prior_action = str(args.get("action", "")).lower()
+        if prior_action in {"get_text", "get_html", "extract_links"}:
+            return False
+        if prior_action != "navigate":
+            continue
+        prior_url = str(args.get("url", "") or "").strip().rstrip("/")
+        if prior_url != target_url:
+            continue
+        repeated_navigations += 1
+        if repeated_navigations >= threshold:
+            return True
+    return False
+
+
+def _looks_like_dismissal_selector(selector: str) -> bool:
+    normalized = _normalized_text(selector)
+    return bool(normalized) and _contains_any_phrase(normalized, _DISMISSAL_SELECTOR_TERMS)
+
+
+def _has_repeated_failed_browser_dismissal_guessing(
+    tool_history: list[dict[str, Any]],
+    *,
+    threshold: int = 2,
+    limit: int = 12,
+) -> bool:
+    browser_entries_seen = 0
+    dismiss_failures = 0
+    for entry in reversed(tool_history):
+        if entry.get("tool") != "browser":
+            continue
+        browser_entries_seen += 1
+        if browser_entries_seen > limit:
+            break
+        args = entry.get("args") or {}
+        action = str(args.get("action", "")).lower()
+        if entry.get("success") and action in {"get_text", "get_html", "extract_links"}:
+            return False
+        if action != "click":
+            continue
+        selector = str(args.get("selector", "") or "")
+        if not _looks_like_dismissal_selector(selector):
+            continue
+        if not entry.get("success"):
+            dismiss_failures += 1
+        if dismiss_failures >= threshold:
+            return True
+    return False
+
+
+def _has_recent_failed_browser_selector_probe(
+    tool_history: list[dict[str, Any]],
+    selector_terms: set[str],
+    *,
+    threshold: int = 1,
+    limit: int = 12,
+) -> bool:
+    browser_entries_seen = 0
+    matching_failures = 0
+    for entry in reversed(tool_history):
+        if entry.get("tool") != "browser":
+            continue
+        browser_entries_seen += 1
+        if browser_entries_seen > limit:
+            break
+        if entry.get("success"):
+            continue
+        args = entry.get("args") or {}
+        selector = _normalized_text(str(args.get("selector", "") or ""))
+        if not selector:
+            continue
+        if not any(term in selector for term in selector_terms):
+            continue
+        matching_failures += 1
+        if matching_failures >= threshold:
+            return True
+    return False
 
 
 def _goal_is_desktop_local_only(goal: str) -> bool:
@@ -645,6 +917,8 @@ class AutonomousAgent:
 
         async def _generator() -> AsyncIterator[dict[str, Any]]:
             nonlocal iteration
+            empty_response_retries = 0
+            max_empty_response_retries = 2
             try:
                 while iteration < self.config.max_iterations and not self._interrupt.is_set():
                     await self._wait_until_resumed()
@@ -658,7 +932,10 @@ class AutonomousAgent:
                     }
 
                     extra_messages: list[LLMMessage] = []
-                    screenshots = self.working_memory.recent_screenshots()
+                    screenshot_filters = {"run_id": self._run_id} if self._run_id else None
+                    screenshots = self.working_memory.recent_screenshots(
+                        metadata_filters=screenshot_filters
+                    )
                     if screenshots:
                         extra_messages.append(
                             LLMMessage(
@@ -676,6 +953,9 @@ class AutonomousAgent:
                         temperature=self.config.temperature,
                         max_tokens=self.config.max_tokens,
                     )
+
+                    if response.content or response.tool_calls:
+                        empty_response_retries = 0
 
                     if response.content:
                         yield {"type": "thought", "content": response.content}
@@ -755,8 +1035,10 @@ class AutonomousAgent:
                         tool_results: list[LLMToolResult] = []
                         for tool_call in response.tool_calls:
                             await self._wait_until_resumed()
-                            tool_name: str = tool_call["name"]
-                            tool_args: dict[str, Any] = tool_call["arguments"]
+                            tool_name, tool_args = self._normalize_tool_call(
+                                tool_call["name"],
+                                tool_call["arguments"],
+                            )
                             execution_args: dict[str, Any] = dict(tool_args)
                             tool_call_id: str = tool_call.get("id", tool_name)
 
@@ -801,7 +1083,11 @@ class AutonomousAgent:
                                 )
                                 continue
 
-                            takeover_event = self._prepare_sensitive_takeover_event(tool_name, execution_args)
+                            takeover_event = self._prepare_sensitive_takeover_event(
+                                tool_name,
+                                execution_args,
+                                tool_history,
+                            )
                             if takeover_event is not None:
                                 yield takeover_event
                                 await self.take_control()
@@ -977,19 +1263,55 @@ class AutonomousAgent:
                         continue
 
                     if not response.content and not response.tool_calls:
+                        empty_response_retries += 1
+                        finish_reason = response.finish_reason or "unknown"
+                        logger.warning(
+                            "Empty LLM response provider=%s model=%s iteration=%d retry=%d/%d finish_reason=%s usage=%s",
+                            self.config.llm_provider,
+                            self.config.llm_model,
+                            iteration,
+                            empty_response_retries,
+                            max_empty_response_retries,
+                            finish_reason,
+                            response.usage,
+                        )
+                        if empty_response_retries <= max_empty_response_retries:
+                            self._session.append(
+                                LLMMessage(
+                                    role="user",
+                                    content=(
+                                        "Your previous response was empty: it contained no text and no tool call. "
+                                        "Continue the same task now. Respond with either a valid tool call, a concise "
+                                        "question for the user, or DONE: when the task is complete."
+                                    ),
+                                )
+                            )
+                            yield {
+                                "type": "thought",
+                                "content": (
+                                    "Model returned an empty response; retrying with a clarification prompt."
+                                ),
+                                "summary": "Model yanıtı boş geldi; tekrar deneniyor.",
+                            }
+                            continue
                         yield {
                             "type": "error",
-                            "content": "Model returned an empty response. Stopping.",
+                            "content": (
+                                "Model returned an empty response after retries. "
+                                f"Provider={self.config.llm_provider}, model={self.config.llm_model}, "
+                                f"finish_reason={finish_reason}."
+                            ),
+                            "summary": "Model tekrar boş yanıt döndürdü.",
                         }
                         return
 
                 if self._thread_id is None:
                     self.workspace.snapshot("chore: iteration limit reached")
                 yield {
-                    "type": "done",
+                    "type": "thought",
                     "content": (
                         f"Reached iteration limit ({self.config.max_iterations}). "
-                        "Partial results saved to workspace."
+                        "Task is not fully complete. Partial results saved to workspace."
                     ),
                 }
             except Exception as exc:  # noqa: BLE001
@@ -1129,15 +1451,30 @@ class AutonomousAgent:
         *,
         bypass_pause: bool = False,
     ) -> ToolResult:
+        name, args = self._normalize_tool_call(name, args)
         tool = self.tools.get(name)
         if tool is None:
             return ToolResult(success=False, error=f"Unknown tool: {name!r}")
+        execution_args = self._optimize_tool_args_for_speed(tool, args)
         if not bypass_pause:
             await self._wait_until_resumed()
         async with self._reserve_tool(tool):
-            return await tool.execute(**args)
+            return await tool.execute(**execution_args)
+
+    @staticmethod
+    def _optimize_tool_args_for_speed(tool: BaseTool, args: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(tool, BrowserTool):
+            return args
+        action = str(args.get("action", "") or "").strip().lower()
+        optimized = dict(args)
+        if "capture_follow_up_screenshots" not in optimized:
+            optimized["capture_follow_up_screenshots"] = False
+        if action in {"click", "type", "key", "drag", "scroll", "click_feed_item_control"}:
+            optimized.setdefault("capture_result_screenshot", False)
+        return optimized
 
     async def _preview_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+        name, args = self._normalize_tool_call(name, args)
         tool = self.tools.get(name)
         if tool is None:
             return None
@@ -1154,6 +1491,21 @@ class AutonomousAgent:
         if not isinstance(preview, dict):
             return None
         return preview
+
+    def _normalize_tool_call(self, name: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        raw_name = str(name or "").strip()
+        normalized_args = dict(args or {})
+        if not raw_name:
+            return raw_name, normalized_args
+        if raw_name in self.tools:
+            return raw_name, normalized_args
+        lowered = raw_name.lower()
+        if lowered in self.tools:
+            return lowered, normalized_args
+        if lowered in _BROWSER_ACTION_ALIASES and "browser" in self.tools:
+            normalized_args.setdefault("action", lowered)
+            return "browser", normalized_args
+        return raw_name, normalized_args
 
     async def _wait_until_resumed(self) -> None:
         await self._resume_event.wait()
@@ -1205,8 +1557,15 @@ class AutonomousAgent:
             "response_kind": request.response_kind,
         }
 
-    def _prepare_sensitive_takeover_event(self, tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any] | None:
+    def _prepare_sensitive_takeover_event(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_history: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
         if tool_name != "browser" or self.config.browser_headless:
+            return None
+        if not _browser_context_ready_for_sensitive_step(tool_history):
             return None
         takeover_kind = browser_sensitive_takeover_kind(
             tool_args,
@@ -1398,6 +1757,16 @@ class AutonomousAgent:
                         "keyboard shortcuts through `windows_desktop` instead of visible clicking."
                     )
                 return guidance
+            if _goal_requires_manual_browser_surface(goal):
+                guidance = (
+                    "This goal depends on a real visible browser window and on-screen browser "
+                    "interaction. Use `computer` to drive the Chrome profile window directly for "
+                    "navigation, compose/login flows, file picking, uploads, and send/share steps. "
+                    "Avoid `browser` automation for Gmail, email, upload, or other high-friction "
+                    "authenticated web flows because the site may challenge automation."
+                )
+                guidance += " " + self._desktop_path_guidance()
+                return guidance
             if _goal_has_mixed_web_and_local_desktop_components(goal):
                 guidance = (
                     "This goal has both web and visible local desktop steps. Use `browser` for the "
@@ -1445,18 +1814,55 @@ class AutonomousAgent:
                 "desktop/UI step, and only use `browser` for an explicitly requested website."
             )
         if _goal_mentions_web_target(goal):
+            if _goal_requires_manual_browser_surface(goal):
+                return (
+                    "This goal should run in the real visible browser window, not through browser "
+                    "automation. Use `computer` to control the already-open Chrome profile window "
+                    "directly for navigation and on-screen interaction."
+                )
             guidance = (
                 "This goal is web-oriented. Use `browser` for the website actions and do not "
                 "switch to `computer` or other local desktop tools unless the user explicitly "
                 "asks for a local app, folder, or on-screen desktop step. Ignore unrelated "
                 "desktop or previous-run context."
             )
+            guidance += (
+                " If the current browser tab is blank or on a new-tab page, use `browser` "
+                "`navigate` to the intended site or search engine before any click, type, key, "
+                "drag, or scroll action."
+            )
+            if _goal_is_social_feed_engagement(goal):
+                guidance += (
+                    " For LinkedIn or other social-feed tasks, first use `browser` "
+                    "`list_feed_items` to inspect the visible feed cards and their controls, then "
+                    "use `browser` `click_feed_item_control` with a specific item_index or item_text "
+                    "to act inside one post. Do not use raw whole-page Like, Comment, or Close "
+                    "selectors when you have not grounded a specific feed item yet. A side messaging "
+                    "drawer or chat tray is not automatically a blocker. If the post controls are "
+                    "still visible, ignore it. If an overlay really blocks the target, inspect it "
+                    "first with `browser` `get_html` or `get_text`, then use one confident dismiss "
+                    "action. Do not guess repeated Close selectors or raw top-right coordinate "
+                    "clicks. After one or two failed dismissal attempts, stop and ask the user for "
+                    "a one-time manual close instead of brute forcing."
+                )
             if _goal_is_browser_only(goal) and _goal_mentions_sensitive_web_entry(goal):
                 guidance += (
                     " When the user asks you to reach a login/payment page, find a repo/account page, "
                     "or attempt a sensitive entry, the task is complete once you reach the requested "
                     "page and the user manually completes, skips, or declines the sensitive step. Do not "
                     "keep iterating after that point."
+                )
+            if _goal_requests_repo_review(goal):
+                guidance += (
+                    " For GitHub or GitLab repo review tasks, do not visually inspect repositories by "
+                    "endless scrolling or by bouncing back and forth between pages. If the account handle "
+                    "is known, go straight to the repositories page, then use `browser` `extract_links` "
+                    "to collect repo URLs quickly. After opening a repo, prefer `browser` `get_text` or "
+                    "`get_html` on the main content to read README/details instead of more scrolling. "
+                    "Do not start at `/login` for a public profile or public repository unless the page "
+                    "actually blocks access and requires authentication. Do not depend on a literal "
+                    "`Pinned` text selector; prefer `extract_links` on the current page and filter "
+                    "repo URLs from the DOM you can actually inspect."
                 )
             return guidance
         return (
@@ -1564,6 +1970,8 @@ class AutonomousAgent:
         successful_tools_used: set[str],
         tool_history: list[dict[str, Any]],
     ) -> str | None:
+        if tool_name == "computer" and _goal_requires_manual_browser_surface(goal):
+            return None
         if tool_name == "computer" and _goal_is_browser_only(goal):
             return (
                 "This is a browser-only website task. Do not use the computer tool or visible "
@@ -1571,11 +1979,67 @@ class AutonomousAgent:
                 "explain the blocker or ask the user instead of taking over the desktop."
             )
         if tool_name == "browser":
+            action = str(tool_args.get("action", "")).lower()
+            if action != "navigate" and _recent_browser_blank_page_failure(tool_history):
+                return (
+                    "The current browser tab is blank. Stop trying to type, click, or submit on "
+                    "about:blank. Use `browser` `navigate` to open the requested website first, "
+                    "then continue interacting with the real page."
+                )
+            if (
+                _goal_is_social_feed_engagement(goal)
+                and action in {"click", "scroll"}
+                and _has_repeated_failed_browser_dismissal_guessing(tool_history)
+            ):
+                return (
+                    "Stop brute-forcing popup or chat dismissal on this social feed. Do not keep "
+                    "guessing generic Close or Dismiss selectors, raw top-right clicks, or more "
+                    "scrolling after those failures. First inspect the visible overlay with "
+                    "`browser` `get_html` or `get_text`. If the side panel is not actually blocking "
+                    "the post controls, ignore it. If it really blocks the target and you still "
+                    "cannot identify one confident dismiss control after inspection, ask the user "
+                    "for a one-time manual close instead of guessing."
+                )
+            if (
+                _goal_requires_manual_browser_surface(goal)
+                and "computer" not in successful_tools_used
+                and action in {"navigate", "click", "type", "scroll", "drag", "back", "forward", "new_tab"}
+            ):
+                return (
+                    "This goal should be handled in the real visible browser window because "
+                    "email/account/upload flows can trigger bot protection or native pickers. Use "
+                    "`computer` to drive the Chrome profile window directly instead of `browser` "
+                    "automation."
+                )
+            if _goal_requests_repo_review(goal) and _has_excessive_browser_repo_wandering(tool_args, tool_history):
+                return (
+                    "You are visually wandering through GitHub/GitLab with repeated browser clicks, "
+                    "scrolls, or back actions. Stop exploring the page manually. Use `browser` "
+                    "`extract_links` on the repositories page to gather repo URLs, then use direct repo "
+                    "URLs plus `browser` `get_text` or `get_html` to inspect each repository."
+                )
+            if _goal_requests_repo_review(goal) and _has_repeated_browser_navigation_to_same_url(tool_args, tool_history):
+                return (
+                    "You already navigated to this same GitHub/GitLab page several times without "
+                    "making progress. Stop reopening the same page. Inspect the current page with "
+                    "`browser` `get_text` or `get_html`, or switch to a different direct repo URL "
+                    "from `extract_links`."
+                )
+            if (
+                _goal_requests_repo_review(goal)
+                and action in {"scroll", "click", "get_text", "get_html"}
+                and _has_recent_failed_browser_selector_probe(tool_history, {"pinned"})
+            ):
+                return (
+                    "Stop probing GitHub/GitLab with brittle `Pinned` selectors after they already "
+                    "failed. Use `browser` `extract_links` on the current page to collect repo URLs, "
+                    "or use `browser` `get_html` on `main` and inspect the actual DOM before trying "
+                    "another selector."
+                )
             if "computer" in successful_tools_used:
                 return None
             if not _goal_is_desktop_local_only(goal):
                 return None
-            action = str(tool_args.get("action", "")).lower()
             if action in {"navigate", "click", "type", "scroll", "drag", "back", "forward", "new_tab"}:
                 if self._uses_under_the_hood_local_execution(goal):
                     return (
@@ -1842,6 +2306,11 @@ class AutonomousAgent:
         seen: set[str] = set()
         for item in results:
             if item.metadata.get("run_id") == self._run_id:
+                continue
+            source_type = str(item.metadata.get("source_type", "") or "").strip().lower()
+            if source_type in {"assistant_thought", "screenshot", "goal"}:
+                continue
+            if self._thread_id is not None and item.metadata.get("thread_id") == self._thread_id:
                 continue
             snippet = item.text.strip()
             if not snippet:

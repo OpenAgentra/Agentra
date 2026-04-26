@@ -69,10 +69,11 @@ class GeminiSession(LLMSession):
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        parsed = self._provider._parse_response(response)
         content = self._provider._extract_candidate_content(response)
-        if content is not None:
+        if content is not None and (parsed.content or parsed.tool_calls):
             self._history.append(content)
-        return self._provider._parse_response(response)
+        return parsed
 
     async def aclose(self) -> None:
         await self._provider.aclose()
@@ -373,22 +374,13 @@ class GeminiProvider(LLMProvider):
             )
         )
 
-    @staticmethod
-    def _extract_candidate_content(response: Any) -> Any:
+    def _extract_candidate_content(self, response: Any) -> Any:
         if not getattr(response, "candidates", None):
             return None
         return response.candidates[0].content
 
     def _parse_response(self, response: Any) -> LLMResponse:
-        tool_calls: list[dict[str, Any]] = []
-        for function_call in response.function_calls or []:
-            tool_calls.append(
-                {
-                    "id": function_call.id or function_call.name,
-                    "name": function_call.name,
-                    "arguments": dict(function_call.args or {}),
-                }
-            )
+        tool_calls = self._response_function_calls(response)
 
         finish_reason = "stop"
         if getattr(response, "candidates", None):
@@ -410,6 +402,53 @@ class GeminiProvider(LLMProvider):
             finish_reason=finish_reason.lower(),
             usage=usage,
         )
+
+    def _response_function_calls(self, response: Any) -> list[dict[str, Any]]:
+        tool_calls: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add(function_call: Any) -> None:
+            if function_call is None:
+                return
+            if isinstance(function_call, dict):
+                name = function_call.get("name")
+                args = function_call.get("args") or function_call.get("arguments") or {}
+                call_id = function_call.get("id") or name
+            else:
+                name = getattr(function_call, "name", None)
+                args = getattr(function_call, "args", None) or {}
+                call_id = getattr(function_call, "id", None) or name
+            if not name:
+                return
+            arguments = dict(args or {})
+            key = (str(call_id or ""), str(name), repr(arguments))
+            if key in seen:
+                return
+            seen.add(key)
+            tool_calls.append(
+                {
+                    "id": call_id or name,
+                    "name": name,
+                    "arguments": arguments,
+                }
+            )
+
+        for function_call in getattr(response, "function_calls", None) or []:
+            add(function_call)
+
+        for candidate in getattr(response, "candidates", None) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", []) or []:
+                function_call = getattr(part, "function_call", None)
+                if function_call is None:
+                    function_call = getattr(part, "functionCall", None)
+                if function_call is None:
+                    model_dump = getattr(part, "model_dump", None)
+                    if callable(model_dump):
+                        part_data = model_dump()
+                        function_call = part_data.get("function_call") or part_data.get("functionCall")
+                add(function_call)
+        return tool_calls
 
     @staticmethod
     def _response_text(response: Any) -> str:

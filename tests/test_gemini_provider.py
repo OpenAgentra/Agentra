@@ -235,6 +235,40 @@ async def test_gemini_provider_serializes_multimodal_user_messages(monkeypatch, 
     assert response.content == "DONE: I can see the screenshot."
 
 
+@pytest.mark.asyncio
+async def test_gemini_provider_extracts_function_calls_from_candidate_parts(monkeypatch, tmp_path):
+    tool_call = types.FunctionCall(
+        id="call-1",
+        name="browser",
+        args={"action": "navigate", "url": "https://github.com/weli-byte/remixify"},
+    )
+    candidate_content = types.Content(
+        role="model",
+        parts=[types.Part(functionCall=tool_call)],
+    )
+    _install_fake_client(
+        monkeypatch,
+        [
+            _make_response(
+                candidate_content=candidate_content,
+                function_calls=[],
+            )
+        ],
+    )
+
+    provider = GeminiProvider(_config(tmp_path))
+    response = await provider.complete([LLMMessage(role="user", content="Open repo")])
+
+    assert response.content == ""
+    assert response.tool_calls == [
+        {
+            "id": "call-1",
+            "name": "browser",
+            "arguments": {"action": "navigate", "url": "https://github.com/weli-byte/remixify"},
+        }
+    ]
+
+
 def test_gemini_provider_backfills_missing_aiohttp_dns_error_alias(monkeypatch, tmp_path) -> None:
     import aiohttp
 
