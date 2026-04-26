@@ -41,11 +41,9 @@ Correct architecture: either keep Python 3.10 support and rewrite the f-string e
 
 ## Medium-Risk Architecture Debt
 
-### Stale live runtime classes
+### Stale live runtime classes (resolved)
 
-`agentra/live_app.py` still defines `LiveRunSession` and `LiveRunManager`, but `create_live_app()` uses `ThreadManager` for the active live runtime. These classes look like a superseded single-run runtime.
-
-Correct architecture: keep `ThreadManager` as the single live runtime boundary and remove or migrate stale live-run manager code after confirming no external import depends on it.
+Previously, `agentra/live_app.py` still defined `LiveRunSession` and `LiveRunManager` even though `create_live_app()` already used `ThreadManager` for the active live runtime. The dead classes plus their orphaned imports and the duplicate `_default_agent_factory` have been removed; `ThreadManager` is now the single live runtime boundary.
 
 ### Routing logic drift
 
@@ -69,13 +67,14 @@ Correct architecture: document degraded retrieval, expose embedding provider cho
 
 Static checks found no broad unused module tree, but they did identify targeted cleanup candidates:
 
-- `LiveRunSession` and `LiveRunManager` in `agentra/live_app.py` are stale-code candidates.
-- Vulture reported unused `shlex` in `agentra/tools/terminal.py`.
+- ~~`LiveRunSession` and `LiveRunManager` in `agentra/live_app.py` are stale-code candidates.~~ Removed.
+- ~~Vulture reported unused `shlex` in `agentra/tools/terminal.py`.~~ Removed.
 - Vulture reported unused `MagicMock` imports in `tests/test_agent.py` and `tests/test_orchestrator.py`.
 - Vulture reported unused variables `interval` and `waitTime` in `tests/test_tools.py`.
-- `numpy`, `sentence-transformers`, and `chromadb` are declared dependencies but are not imported by package code in the current tree.
+- ~~`numpy`, `sentence-transformers`, and `chromadb` are declared dependencies but are not imported by package code in the current tree.~~ Removed from `pyproject.toml` after confirming no `agentra/` module imports them.
+- `MemoryEntry` re-export removed from `agentra/memory/__init__.py`; the `MemoryEntry = MemoryRecord` alias in `embedding_memory.py` stays for `tests/test_memory.py`.
 
-Do not delete dependencies solely from this list. First confirm whether they are intended future memory backends, optional transitive requirements, or stale packaging entries.
+Do not delete dependencies solely from a Vulture/grep signal. First confirm whether they are intended future memory backends, optional transitive requirements, or stale packaging entries.
 
 ## Test And Tooling Gaps
 
@@ -111,8 +110,7 @@ These need code changes, not only docs:
 - Add CLI approval enforcement or explicit non-interactive rejection behavior.
 - Isolate orchestrator agents per parallel sub-task.
 - Fix Python 3.10/3.11 syntax compatibility or update supported Python versions.
-- Remove or migrate stale live runtime classes.
 - Consolidate duplicated routing/normalization logic.
 - Decide whether empty workspace checkpoint commits are intended.
 - Add CLI and provider coverage.
-- Resolve Ruff and Vulture findings.
+- Resolve remaining Ruff and Vulture findings (`MagicMock` test imports, `interval`/`waitTime` test variables).

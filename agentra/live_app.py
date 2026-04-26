@@ -8,7 +8,6 @@ import json
 import logging
 import threading
 import webbrowser
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -16,23 +15,16 @@ from fastapi import Request as FastAPIRequest
 from pydantic import BaseModel, Field
 
 from agentra.config import AgentConfig
-from agentra.llm.registry import get_provider_spec
 from agentra.logging_utils import (
     app_log_path,
     configure_app_logging,
-    exception_details_with_context,
     read_log_tail,
 )
 from agentra.runtime import ThreadManager
-from agentra.run_report import RunReport
-from agentra.task_routing import choose_live_execution_policy
 
-RunSnapshot = dict[str, Any]
 EventPayload = dict[str, Any]
 AgentFactory = Callable[[AgentConfig], Any]
 logger = logging.getLogger(__name__)
-
-_DEFAULT_FOCUS = (0.74, 0.2)
 
 
 class RunCreateRequest(BaseModel):
@@ -67,200 +59,6 @@ class HumanActionRequest(BaseModel):
 class ThreadSettingsUpdateRequest(BaseModel):
     permission_mode: Literal["default", "full"] | None = None
     desktop_execution_mode: Literal["desktop_visible", "desktop_native", "desktop_hidden"] | None = None
-
-
-@dataclass
-class LiveRunSession:
-    """In-memory state for a single live run."""
-
-    run_id: str
-    goal: str
-    config: AgentConfig
-    report: RunReport
-    task: asyncio.Task[None] | None = None
-    agent: Any | None = None
-    status: str = "running"
-    subscribers: set[asyncio.Queue[EventPayload]] = field(default_factory=set)
-    completed: asyncio.Event = field(default_factory=asyncio.Event)
-
-
-class LiveRunManager:
-    """Manage one active live run plus historical snapshots."""
-
-    def __init__(self, base_config: AgentConfig, agent_factory: AgentFactory | None = None) -> None:
-        self.base_config = base_config
-        self._agent_factory = agent_factory or _default_agent_factory
-        self._active_run_id: str | None = None
-        self._sessions: dict[str, LiveRunSession] = {}
-        self._lock = asyncio.Lock()
-
-    @property
-    def active_run_id(self) -> str | None:
-        return self._active_run_id
-
-    async def start_run(self, request: RunCreateRequest) -> RunSnapshot:
-        """Create and launch a live run."""
-        async with self._lock:
-            if self._active_run_id:
-                active = self._sessions.get(self._active_run_id)
-                if active and not active.completed.is_set():
-                    raise ValueError("Another run is already active.")
-
-            config = self._config_for_request(request)
-            report = RunReport(config.workspace_dir, request.goal, config.llm_provider, config.llm_model)
-            run_id = report.store.run_id
-            session = LiveRunSession(
-                run_id=run_id,
-                goal=request.goal,
-                config=config,
-                report=report,
-            )
-            self._sessions[run_id] = session
-            self._active_run_id = run_id
-            session.task = asyncio.create_task(self._run_session(run_id))
-            return self.snapshot_for_http(session)
-
-    def get_session(self, run_id: str) -> LiveRunSession:
-        session = self._sessions.get(run_id)
-        if session is None:
-            raise KeyError(run_id)
-        return session
-
-    async def stop_run(self, run_id: str) -> RunSnapshot:
-        """Request a running session to stop."""
-        session = self.get_session(run_id)
-        agent = session.agent
-        if agent is not None:
-            interrupter = getattr(agent, "interrupt", None)
-            if callable(interrupter):
-                interrupter()
-        if session.task and session.task.done():
-            await asyncio.sleep(0)
-        return self.snapshot_for_http(session)
-
-    def subscribe(self, run_id: str) -> asyncio.Queue[EventPayload]:
-        session = self.get_session(run_id)
-        queue: asyncio.Queue[EventPayload] = asyncio.Queue()
-        session.subscribers.add(queue)
-        return queue
-
-    def unsubscribe(self, run_id: str, queue: asyncio.Queue[EventPayload]) -> None:
-        session = self._sessions.get(run_id)
-        if session is not None:
-            session.subscribers.discard(queue)
-
-    def snapshot_for_http(self, session: LiveRunSession) -> RunSnapshot:
-        """Return an API-friendly snapshot with asset URLs and derived steps."""
-        snapshot = session.report.snapshot()
-        snapshot["active"] = session.run_id == self._active_run_id and not session.completed.is_set()
-        snapshot["report_url"] = f"/runs/{session.run_id}/report"
-        snapshot["events"] = [self._event_for_http(session.run_id, event) for event in snapshot["events"]]
-        snapshot["frames"] = [self._frame_for_http(session.run_id, frame) for frame in snapshot["frames"]]
-        snapshot["steps"] = _build_steps(snapshot["events"])
-        return snapshot
-
-    async def _run_session(self, run_id: str) -> None:
-        session = self.get_session(run_id)
-        status = "partial"
-        try:
-            agent = self._agent_factory(session.config)
-            session.agent = agent
-            generator = await agent.run(session.goal)
-            async for raw_event in generator:
-                stored = session.report.record(raw_event)
-                if stored["type"] == "done":
-                    status = "completed"
-                elif stored["type"] == "error":
-                    status = "error"
-                await self._broadcast(
-                    session,
-                    {
-                        "kind": "event",
-                        "event": self._event_for_http(session.run_id, stored),
-                    },
-                )
-        except Exception as exc:  # noqa: BLE001
-            status = "error"
-            details = exception_details_with_context(
-                exc,
-                provider=session.config.llm_provider,
-                model=session.config.llm_model,
-            )
-            message = str(details.get("public_message") or str(exc))
-            logger.exception("Live run crashed run_id=%s goal=%r", session.run_id, session.goal)
-            payload: dict[str, Any] = {"type": "error", "content": message, "details": details}
-            hint = str(details.get("hint") or "")
-            if hint:
-                payload["summary"] = hint
-            stored = session.report.record(payload)
-            await self._broadcast(
-                session,
-                {"kind": "event", "event": self._event_for_http(session.run_id, stored)},
-            )
-        finally:
-            session.status = status
-            session.report.finalize(status)
-            session.completed.set()
-            snapshot = self.snapshot_for_http(session)
-            await self._broadcast(session, {"kind": "status", "status": status, "snapshot": snapshot})
-            await self._broadcast(session, {"kind": "complete", "status": status})
-            async with self._lock:
-                if self._active_run_id == session.run_id:
-                    self._active_run_id = None
-
-    async def _broadcast(self, session: LiveRunSession, payload: EventPayload) -> None:
-        stale: list[asyncio.Queue[EventPayload]] = []
-        for queue in session.subscribers:
-            try:
-                queue.put_nowait(payload)
-            except asyncio.QueueFull:
-                stale.append(queue)
-        for queue in stale:
-            session.subscribers.discard(queue)
-
-    def _event_for_http(self, run_id: str, event: dict[str, Any]) -> dict[str, Any]:
-        payload = dict(event)
-        image_path = payload.get("image_path")
-        if image_path:
-            payload["image_url"] = self._asset_url(run_id, str(image_path))
-        payload["display_label"] = _display_label_for_event(payload)
-        payload["display_summary"] = _display_summary_for_event(payload)
-        return payload
-
-    def _frame_for_http(self, run_id: str, frame: dict[str, Any]) -> dict[str, Any]:
-        payload = dict(frame)
-        image_path = payload.get("image_path")
-        if image_path:
-            payload["image_url"] = self._asset_url(run_id, str(image_path))
-        payload["display_label"] = _display_label_for_frame(payload)
-        payload["display_summary"] = _display_summary_for_frame(payload)
-        return payload
-
-    @staticmethod
-    def _asset_url(run_id: str, image_path: str) -> str:
-        return f"/runs/{run_id}/assets/{Path(image_path).name}"
-
-    def _config_for_request(self, request: RunCreateRequest) -> AgentConfig:
-        overrides: dict[str, Any] = self.base_config.model_dump()
-        policy = choose_live_execution_policy(request.goal, requested_headless=request.headless)
-        overrides["local_execution_mode"] = policy.local_execution_mode
-        overrides["desktop_fallback_policy"] = policy.desktop_fallback_policy
-        overrides["desktop_execution_mode"] = policy.desktop_execution_mode
-        overrides["desktop_backend_preference"] = policy.desktop_backend_preference
-        if request.provider:
-            overrides["llm_provider"] = request.provider
-            if not request.model:
-                overrides["llm_model"] = get_provider_spec(request.provider).default_model
-        if request.model:
-            overrides["llm_model"] = request.model
-        overrides["browser_headless"] = policy.browser_headless
-        if request.workspace:
-            workspace_dir = Path(request.workspace)
-            overrides["workspace_dir"] = workspace_dir
-            overrides["memory_dir"] = workspace_dir / ".memory"
-        if request.max_iterations is not None:
-            overrides["max_iterations"] = request.max_iterations
-        return AgentConfig(**overrides)
 
 
 def _generic_tool_label(tool: str) -> str:
@@ -881,6 +679,10 @@ def create_live_app(
     async def list_threads() -> JSONResponse:
         return JSONResponse({"threads": manager.list_threads_for_http()})
 
+    @app.post("/threads/clear")
+    async def clear_threads() -> JSONResponse:
+        return JSONResponse(await manager.clear_all_threads())
+
     @app.get("/threads/{thread_id}")
     async def get_thread(thread_id: str) -> JSONResponse:
         try:
@@ -1063,12 +865,6 @@ def create_live_app(
 def open_live_app(url: str) -> None:
     """Open the live app in the user's browser after the server starts."""
     threading.Timer(0.6, lambda: webbrowser.open(url, new=1)).start()
-
-
-def _default_agent_factory(config: AgentConfig):
-    from agentra.agents.autonomous import AutonomousAgent
-
-    return AutonomousAgent(config=config)
 
 
 def _sse_payload(payload: EventPayload) -> str:
@@ -2105,13 +1901,16 @@ def _app_styles_side() -> str:
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 70px;
-  padding: 5px 9px;
+  min-width: 64px;
+  max-width: 100%;
+  padding: 4px 8px;
   border-radius: 999px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
-  font-size: 11px;
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
 }
 .status-pill.idle,
 .status-pill.partial,
@@ -4222,6 +4021,25 @@ async function refreshThreads(options = {}) {
   }
 }
 
+async function clearAllThreads() {
+  if (!window.confirm("Tüm threadleri silmek istiyor musun? Bu işlem kayıtlı thread geçmişini temizler.")) {
+    return;
+  }
+  try {
+    setError("thread", "");
+    await fetchJson("/threads/clear", { method: "POST" });
+    state.threads = [];
+    state.activeThread = null;
+    state.activeThreadId = null;
+    clearRunState();
+    render();
+    await refreshThreads();
+  } catch (error) {
+    setError("thread", error.message);
+    render();
+  }
+}
+
 function scheduleThreadPolling() {
   if (state.threadPollTimer) window.clearInterval(state.threadPollTimer);
   state.threadPollTimer = window.setInterval(() => {
@@ -4783,6 +4601,7 @@ async function handleConsoleClick(event) {
   const threadAction = event.target.closest("[data-thread-action]");
   if (threadAction) {
     const action = threadAction.getAttribute("data-thread-action");
+    if (action === "clear-all") return clearAllThreads();
     if (action === "pause") return pauseActiveThread();
     if (action === "resume") return resumeActiveThread();
     if (action === "save-permission") return updateThreadPermissionMode();
@@ -4852,7 +4671,10 @@ function mount() {
             </section>
 
             <section class="console-section" hidden>
-              <div class="section-title">Threadler</div>
+              <div class="section-head">
+                <div class="section-title">Threadler</div>
+                <button type="button" class="ghost-button" data-thread-action="clear-all">Tümünü Temizle</button>
+              </div>
               <div id="thread-list" class="thread-list"></div>
             </section>
 
@@ -4902,8 +4724,8 @@ function mount() {
                       <div class="timeline-progress" id="timeline-progress"></div>
                       <div class="timeline-handle" id="timeline-handle"></div>
                     </div>
-                    <span id="tv-status">HAZIR</span>
-                    <span>CANLI</span>
+                    <span id="tv-status" style="font-size:11px; letter-spacing:0.04em;">HAZIR</span>
+                    <span style="font-size:11px; letter-spacing:0.04em; opacity:0.92;">CANLI</span>
                   </div>
                 </div>
                 <div id="stage-manual-dock"></div>

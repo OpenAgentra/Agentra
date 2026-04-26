@@ -220,7 +220,6 @@ Agentra keeps different kinds of state in different places:
 
 These are documented so contributors can remove or fix them deliberately instead of treating them as intended architecture:
 
-- `agentra/live_app.py` still contains `LiveRunSession` and `LiveRunManager`, but `create_live_app()` uses `ThreadManager` as the active runtime boundary. Treat the older live-run manager as a stale-code candidate.
 - Goal routing logic is duplicated between `agentra/task_routing.py` and `agentra/agents/autonomous.py`. The routing module handles Turkish dotless `ı` normalization, while the local copy in the agent does not.
 - The direct CLI and live app share `AutonomousAgent`, but only the live app binds the runtime controller required for approvals, questions, pause/resume, and manual actions.
 - `WorkspaceManager` currently uses `git commit --allow-empty` for checkpoints, so a checkpoint may be reported as committed even when there were no file changes.
