@@ -1,0 +1,49 @@
+{
+  "run_id": "20260315-120049-open-python-org-and-explain-it",
+  "goal": "Open python.org and explain it",
+  "provider": "gemini",
+  "model": "gemini-3-flash-preview",
+  "status": "partial",
+  "started_at": "2026-03-15T12:00:49",
+  "finished_at": "2026-03-15T12:00:49",
+  "report_path": "C:\\Users\\ariba\\OneDrive\\Documenti\\Software Projects\\AI Projects\\Agentra\\Agentra\\tmp-live-workspace\\.runs\\20260315-120049-open-python-org-and-explain-it\\index.html",
+  "events": [
+    {
+      "type": "thought",
+      "content": "Planning for Open python.org and explain it",
+      "timestamp": "2026-03-15T12:00:49",
+      "summary": "Planning for Open python.org and explain it"
+    },
+    {
+      "type": "tool_call",
+      "tool": "browser",
+      "args": {
+        "action": "navigate",
+        "url": "https://www.python.org"
+      },
+      "timestamp": "2026-03-15T12:00:49",
+      "summary": "Opening www.python.org"
+    },
+    {
+      "type": "screenshot",
+      "focus_x": 0.5,
+      "focus_y": 0.4,
+      "frame_label": "browser ? navigate",
+      "summary": "Opening python.org",
+      "timestamp": "2026-03-15T12:00:49",
+      "image_path": "assets/screenshot-001.png",
+      "frame_id": "frame-001"
+    }
+  ],
+  "frames": [
+    {
+      "id": "frame-001",
+      "timestamp": "2026-03-15T12:00:49",
+      "image_path": "assets/screenshot-001.png",
+      "label": "browser ? navigate",
+      "summary": "Opening python.org",
+      "focus_x": 0.5,
+      "focus_y": 0.4
+    }
+  ]
+}

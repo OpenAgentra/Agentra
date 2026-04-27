@@ -1,0 +1,29 @@
+[
+  {
+    "thread_id": "thread-linkedine-gir",
+    "title": "linkedine gir",
+    "status": "error",
+    "permission_mode": "default",
+    "created_at": "2026-04-27T13:28:02",
+    "current_run_id": null,
+    "workspace_dir": "C:\\Users\\gungo\\Downloads\\Compressed\\Agentra-main\\Agentra-main\\workspace\\.threads\\thread-linkedine-gir\\workspace"
+  },
+  {
+    "thread_id": "thread-instagrama-gir",
+    "title": "instagrama gir",
+    "status": "error",
+    "permission_mode": "default",
+    "created_at": "2026-04-27T13:29:11",
+    "current_run_id": null,
+    "workspace_dir": "C:\\Users\\gungo\\Downloads\\Compressed\\Agentra-main\\Agentra-main\\workspace\\.threads\\thread-instagrama-gir\\workspace"
+  },
+  {
+    "thread_id": "thread-instagrama-gir-2",
+    "title": "instagrama gir",
+    "status": "error",
+    "permission_mode": "default",
+    "created_at": "2026-04-27T13:30:09",
+    "current_run_id": null,
+    "workspace_dir": "C:\\Users\\gungo\\Downloads\\Compressed\\Agentra-main\\Agentra-main\\workspace\\.threads\\thread-instagrama-gir-2\\workspace"
+  }
+]
