@@ -13,7 +13,22 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 from agentra.tools.base import BaseTool, ToolResult
-from agentra.tools.visual_diff import compute_image_hash, images_are_similar
+from agentra.tools.visual_diff import (
+    compute_image_hash,
+    compute_structural_hash,
+    images_are_similar,
+    images_structurally_similar,
+)
+
+
+_VALID_KEY_NAMES = frozenset({
+    "ctrl", "shift", "alt", "win", "command", "cmd", "option", "meta",
+    "enter", "return", "escape", "esc", "tab", "backspace", "back", "delete", "del",
+    "home", "end", "left", "right", "up", "down",
+    "space", "insert", "ins", "pageup", "pgup", "pagedown", "pgdn",
+    "capslock", "numlock", "scrolllock", "printscreen", "pause",
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+})
 
 
 class ComputerTool(BaseTool):
@@ -102,6 +117,8 @@ class ComputerTool(BaseTool):
                         "list_monitors",
                         "start_recording",
                         "stop_recording",
+                        "extract_text",
+                        "find_template",
                     ],
                     "description": "Desktop action to perform.",
                 },
@@ -139,6 +156,18 @@ class ComputerTool(BaseTool):
                 "monitor": {
                     "type": "integer",
                     "description": "Monitor index (0=all combined, 1=primary, 2=secondary...). Optional, for screenshot action.",
+                },
+                "lang": {
+                    "type": "string",
+                    "description": "OCR language hint (e.g. 'eng', 'tur', 'eng+tur'). Optional, for extract_text action.",
+                },
+                "template_path": {
+                    "type": "string",
+                    "description": "Path to template image to find on screen. Required for find_template action.",
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "Match confidence threshold 0-1 (default 0.8). Optional, for find_template action.",
                 },
             },
             "required": ["action"],
@@ -180,6 +209,10 @@ class ComputerTool(BaseTool):
         try:
             if action == "list_monitors":
                 result = self._list_monitors()
+            elif action == "extract_text":
+                result = self._extract_text(**kwargs)
+            elif action == "find_template":
+                result = self._find_template(**kwargs)
             elif action == "start_recording":
                 return await self._start_recording()
             elif action == "stop_recording":
@@ -319,12 +352,19 @@ class ComputerTool(BaseTool):
         window = self._foreground_window_snapshot()
         if cursor is None and window is None:
             return None
-        return {
+        observation: dict[str, Any] = {
             "window_handle": int((window or {}).get("window_handle", 0) or 0),
             "window_title": str((window or {}).get("window_title", "") or ""),
             "cursor_x": int((cursor or {}).get("x", 0) or 0),
             "cursor_y": int((cursor or {}).get("y", 0) or 0),
         }
+        try:
+            png_bytes = self.capture_screenshot_bytes(fmt="png")
+            observation["structural_hash"] = compute_structural_hash(png_bytes)
+        except Exception:  # noqa: BLE001
+            # Pixel-level drift detection is best-effort; skip on capture failures.
+            pass
+        return observation
 
     @staticmethod
     def _observation_looks_like_agentra(observation: dict[str, Any] | None) -> bool:
@@ -348,7 +388,15 @@ class ComputerTool(BaseTool):
             return True
         delta_x = int(current.get("cursor_x", 0) or 0) - int(previous.get("cursor_x", 0) or 0)
         delta_y = int(current.get("cursor_y", 0) or 0) - int(previous.get("cursor_y", 0) or 0)
-        return math.hypot(delta_x, delta_y) >= 32
+        if math.hypot(delta_x, delta_y) >= 32:
+            return True
+        current_hash = current.get("structural_hash")
+        previous_hash = previous.get("structural_hash")
+        if current_hash and previous_hash and not images_structurally_similar(
+            str(current_hash), str(previous_hash)
+        ):
+            return True
+        return False
 
     @staticmethod
     def _cursor_position() -> dict[str, int] | None:
@@ -411,6 +459,156 @@ class ComputerTool(BaseTool):
             success=True,
             output=json.dumps(monitors, indent=2),
             metadata={"frame_label": "computer · list_monitors", "summary": "Listing available monitors"},
+        )
+
+    # ── C1: OCR text extraction (optional dependency) ─────────────────────────
+
+    def _extract_text(self, **kwargs: Any) -> ToolResult:
+        """Extract visible text from screen using OCR. Tries easyocr → pytesseract."""
+        region = self._extract_region(kwargs)
+        monitor_idx = int(kwargs.get("monitor", 0) or 0)
+        lang = str(kwargs.get("lang", "eng") or "eng")
+        try:
+            png_bytes = self.capture_screenshot_bytes(fmt="png", region=region, monitor=monitor_idx)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, error=f"Screenshot capture failed: {exc}")
+
+        # Try easyocr first
+        try:
+            import easyocr  # type: ignore  # noqa: PLC0415
+            import numpy as _np  # noqa: PLC0415
+            from PIL import Image as _Image  # noqa: PLC0415
+
+            langs = lang.split("+") if "+" in lang else [lang]
+            # easyocr uses different lang codes (e.g. 'en' not 'eng')
+            normalized = [self._normalize_easyocr_lang(language) for language in langs]
+            reader = easyocr.Reader(normalized, gpu=False, verbose=False)
+            img = _Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            arr = _np.array(img)
+            results = reader.readtext(arr)
+            blocks = []
+            text_parts = []
+            for bbox, text, conf in results:
+                xs = [p[0] for p in bbox]
+                ys = [p[1] for p in bbox]
+                blocks.append({
+                    "text": text,
+                    "bbox": [int(min(xs)), int(min(ys)), int(max(xs) - min(xs)), int(max(ys) - min(ys))],
+                    "confidence": float(conf),
+                })
+                text_parts.append(text)
+            return ToolResult(
+                success=True,
+                output="\n".join(text_parts),
+                metadata={
+                    "frame_label": "computer · extract_text",
+                    "summary": f"Extracted text via easyocr ({len(blocks)} blocks)",
+                    "text_blocks": blocks,
+                    "ocr_backend": "easyocr",
+                },
+            )
+        except ImportError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, error=f"easyocr failed: {exc}")
+
+        # Fall back to pytesseract
+        try:
+            import pytesseract  # type: ignore  # noqa: PLC0415
+            from PIL import Image as _Image  # noqa: PLC0415
+
+            img = _Image.open(io.BytesIO(png_bytes))
+            text = pytesseract.image_to_string(img, lang=lang)
+            return ToolResult(
+                success=True,
+                output=text.strip(),
+                metadata={
+                    "frame_label": "computer · extract_text",
+                    "summary": "Extracted text via pytesseract",
+                    "ocr_backend": "pytesseract",
+                },
+            )
+        except ImportError:
+            return ToolResult(
+                success=False,
+                error=(
+                    "No OCR backend available. Install one of: "
+                    "'pip install easyocr' or 'pip install pytesseract' "
+                    "(pytesseract also requires Tesseract binary)."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, error=f"pytesseract failed: {exc}")
+
+    @staticmethod
+    def _normalize_easyocr_lang(lang: str) -> str:
+        """Map common 3-letter codes to easyocr 2-letter codes."""
+        mapping = {"eng": "en", "tur": "tr", "deu": "de", "fra": "fr", "spa": "es"}
+        return mapping.get(lang.strip().lower(), lang.strip().lower())
+
+    # ── C2: visual element detection (optional dependency) ────────────────────
+
+    def _find_template(self, **kwargs: Any) -> ToolResult:
+        """Find a template image on screen via OpenCV template matching."""
+        template_path = str(kwargs.get("template_path", "") or "")
+        if not template_path:
+            return ToolResult(success=False, error="template_path is required for find_template.")
+        if not Path(template_path).exists():
+            return ToolResult(success=False, error=f"Template not found: {template_path}")
+
+        confidence_threshold = float(kwargs.get("confidence", 0.8) or 0.8)
+        region = self._extract_region(kwargs)
+        monitor_idx = int(kwargs.get("monitor", 0) or 0)
+
+        try:
+            import cv2  # type: ignore  # noqa: PLC0415
+            import numpy as _np  # noqa: PLC0415
+        except ImportError:
+            return ToolResult(
+                success=False,
+                error="OpenCV not installed. Install with 'pip install opencv-python'.",
+            )
+
+        try:
+            png_bytes = self.capture_screenshot_bytes(fmt="png", region=region, monitor=monitor_idx)
+            from PIL import Image as _Image  # noqa: PLC0415
+            haystack_pil = _Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            haystack = cv2.cvtColor(_np.array(haystack_pil), cv2.COLOR_RGB2BGR)
+            template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+            if template is None:
+                return ToolResult(success=False, error=f"Could not load template: {template_path}")
+
+            t_h, t_w = template.shape[:2]
+            result = cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED)
+            locations = _np.where(result >= confidence_threshold)
+            matches = []
+            seen: set[tuple[int, int]] = set()
+            for pt in zip(*locations[::-1]):
+                # Deduplicate nearby matches
+                key = (int(pt[0]) // max(t_w // 2, 1), int(pt[1]) // max(t_h // 2, 1))
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append({
+                    "x": int(pt[0]),
+                    "y": int(pt[1]),
+                    "width": int(t_w),
+                    "height": int(t_h),
+                    "confidence": float(result[pt[1], pt[0]]),
+                })
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, error=f"Template matching failed: {exc}")
+
+        import json  # noqa: PLC0415
+        return ToolResult(
+            success=True,
+            output=json.dumps(matches, indent=2),
+            metadata={
+                "frame_label": "computer · find_template",
+                "summary": f"Found {len(matches)} match(es) for template",
+                "matches": matches,
+                "template_path": template_path,
+            },
         )
 
     async def _start_recording(self) -> ToolResult:
@@ -555,6 +753,10 @@ class ComputerTool(BaseTool):
         )
 
     def _type(self, text: str, *, capture_result_screenshot: bool = True) -> ToolResult:
+        if not text:
+            return ToolResult(success=False, error="text is required for 'type' and cannot be empty.")
+        if len(text) > 10000:
+            return ToolResult(success=False, error="text too long (>10000 chars). Split into smaller chunks.")
         import pyautogui  # noqa: PLC0415
 
         pyautogui.typewrite(text, interval=0.02)
@@ -566,15 +768,42 @@ class ComputerTool(BaseTool):
         )
 
     def _key(self, key: str, *, capture_result_screenshot: bool = True) -> ToolResult:
+        valid, error = self._validate_key_sequence(key)
+        if not valid:
+            return ToolResult(success=False, error=f"Invalid key sequence {key!r}: {error}")
         import pyautogui  # noqa: PLC0415
 
-        pyautogui.hotkey(*key.split("+"))
+        try:
+            pyautogui.hotkey(*key.split("+"))
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, error=f"Failed to press {key!r}: {exc}")
         return self._desktop_result(
             action="key",
             output=f"Pressed key: {key!r}",
             summary=f"Pressing {key}" if key else "Pressing a key",
             capture_result_screenshot=capture_result_screenshot,
         )
+
+    @staticmethod
+    def _validate_key_sequence(key: str) -> tuple[bool, str | None]:
+        """Validate a hotkey string like 'CTRL+S' or 'a' or 'F5'.
+
+        Returns ``(True, None)`` if valid, ``(False, reason)`` otherwise.
+        """
+        if not key or not key.strip():
+            return False, "key is empty"
+        parts = key.split("+")
+        if any(not p.strip() for p in parts):
+            return False, "empty segment between '+'"
+        for part in parts:
+            normalized = part.strip().lower()
+            if normalized in _VALID_KEY_NAMES:
+                continue
+            if len(normalized) == 1 and (normalized.isalnum() or not normalized.isalpha()):
+                # Single char (letter, digit, or punctuation)
+                continue
+            return False, f"unknown key {part!r}"
+        return True, None
 
     def _scroll(
         self,

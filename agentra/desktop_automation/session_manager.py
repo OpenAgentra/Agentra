@@ -281,6 +281,31 @@ class _WindowMessageInputAdapter:
 
     def __init__(self, worker: "_Win32HiddenDesktopWorker") -> None:
         self._worker = worker
+        self._pressed_keys: dict[int, set[int]] = {}
+
+    def _is_window_responsive(self, handle: int) -> bool:
+        """Return True when the handle still maps to a live window."""
+        if not handle:
+            return False
+        try:
+            return bool(ctypes.windll.user32.IsWindow(int(handle)))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _release_stuck_modifiers(self, handle: int) -> None:
+        """Send WM_KEYUP for any modifier still tracked as pressed for *handle*."""
+        pressed = self._pressed_keys.pop(int(handle), set())
+        if not pressed:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            for vk in pressed:
+                try:
+                    user32.PostMessageW(int(handle), _WM_KEYUP, int(vk), 1)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
 
     def click(self, handle: int, x: int, y: int, *, button: str = "left", double: bool = False) -> None:
         user32 = ctypes.windll.user32
@@ -323,22 +348,34 @@ class _WindowMessageInputAdapter:
             time.sleep(0.005)
 
     def key_sequence(self, handle: int, text: str) -> None:
+        if not self._is_window_responsive(handle):
+            raise RuntimeError(f"Window {handle} is not responsive")
         target = self._keyboard_target(handle)
-        for entry in self._parse_key_sequence(text):
-            kind = str(entry["kind"])
-            if kind == "char":
-                ctypes.windll.user32.PostMessageW(target, _WM_CHAR, int(entry["char"]), 1)
-                time.sleep(0.005)
-                continue
-            modifiers = list(entry.get("modifiers", []))
-            key_vk = int(entry["vk"])
-            for modifier in modifiers:
-                ctypes.windll.user32.PostMessageW(target, _WM_KEYDOWN, modifier, 1)
-            ctypes.windll.user32.PostMessageW(target, _WM_KEYDOWN, key_vk, 1)
-            ctypes.windll.user32.PostMessageW(target, _WM_KEYUP, key_vk, 1)
-            for modifier in reversed(modifiers):
-                ctypes.windll.user32.PostMessageW(target, _WM_KEYUP, modifier, 1)
-            time.sleep(0.01)
+        tracked = self._pressed_keys.setdefault(int(handle), set())
+        try:
+            for entry in self._parse_key_sequence(text):
+                kind = str(entry["kind"])
+                if kind == "char":
+                    ctypes.windll.user32.PostMessageW(target, _WM_CHAR, int(entry["char"]), 1)
+                    time.sleep(0.005)
+                    continue
+                modifiers = list(entry.get("modifiers", []))
+                key_vk = int(entry["vk"])
+                for modifier in modifiers:
+                    ctypes.windll.user32.PostMessageW(target, _WM_KEYDOWN, modifier, 1)
+                    tracked.add(modifier)
+                ctypes.windll.user32.PostMessageW(target, _WM_KEYDOWN, key_vk, 1)
+                tracked.add(key_vk)
+                ctypes.windll.user32.PostMessageW(target, _WM_KEYUP, key_vk, 1)
+                tracked.discard(key_vk)
+                for modifier in reversed(modifiers):
+                    ctypes.windll.user32.PostMessageW(target, _WM_KEYUP, modifier, 1)
+                    tracked.discard(modifier)
+                time.sleep(0.01)
+            self._pressed_keys.pop(int(handle), None)
+        except Exception:
+            self._release_stuck_modifiers(handle)
+            raise
 
     def _target_window_for_point(self, handle: int, x: int, y: int) -> int:
         user32 = ctypes.windll.user32
@@ -375,27 +412,34 @@ class _WindowMessageInputAdapter:
                 continue
             closing = raw.find("}", index + 1)
             if closing == -1:
-                events.append({"kind": "char", "char": ord(raw[index])})
-                index += 1
-                continue
+                raise ValueError(f"Unclosed brace in key sequence near position {index}")
             token = raw[index + 1 : closing].strip()
             index = closing + 1
             if not token:
-                continue
+                raise ValueError("Empty key token: '{}'")
             if "+" in token:
                 parts = [part.strip() for part in token.split("+") if part.strip()]
-                if len(parts) >= 2:
-                    modifiers = [self._SPECIAL_KEYS.get(part.upper()) for part in parts[:-1]]
-                    key_vk = self._key_to_vk(parts[-1])
-                    if key_vk and all(modifiers):
-                        events.append({"kind": "key", "vk": key_vk, "modifiers": modifiers})
-                        continue
+                if len(parts) < 2:
+                    raise ValueError(f"Invalid key combination: '{token}'")
+                modifiers = []
+                for part in parts[:-1]:
+                    mod = self._SPECIAL_KEYS.get(part.upper())
+                    if not mod:
+                        raise ValueError(f"Unknown modifier: '{part}'")
+                    modifiers.append(mod)
+                key_vk = self._key_to_vk(parts[-1])
+                if not key_vk:
+                    raise ValueError(f"Unknown key: '{parts[-1]}'")
+                events.append({"kind": "key", "vk": key_vk, "modifiers": modifiers})
+                continue
             key_vk = self._key_to_vk(token)
             if key_vk:
                 events.append({"kind": "key", "vk": key_vk, "modifiers": []})
                 continue
             if len(token) == 1:
                 events.append({"kind": "char", "char": ord(token)})
+                continue
+            raise ValueError(f"Unknown key: '{token}'")
         return events
 
     def _key_to_vk(self, token: str) -> int:
