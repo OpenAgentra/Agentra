@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentra"
+version = "0.1.0"
+description = "Source-available autonomous AI agent with full computer access — browser, desktop, filesystem, terminal"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BUSL-1.1" }
+keywords = ["ai", "agent", "autonomous", "computer-use", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "openai>=1.30.0",
+    "anthropic>=0.28.0",
+    "google-genai>=1.67.0",
+    "httpx>=0.27.0",
+    "playwright>=1.44.0",
+    "pyautogui>=0.9.54",
+    "Pillow>=10.3.0",
+    "mss>=9.0.1",
+    "gitpython>=3.1.43",
+    "click>=8.1.7",
+    "rich>=13.7.1",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+windows-desktop = [
+    "pywin32>=306; platform_system == 'Windows'",
+    "uiautomation>=2.0.29; platform_system == 'Windows'",
+]
+dev = [
+    "aiohttp>=3.9.0",
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.14.0",
+    "black>=24.4.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+agentra = "agentra.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agentra*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
